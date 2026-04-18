@@ -1,0 +1,62 @@
+---
+import { getCollection, type CollectionEntry } from 'astro:content';
+
+interface Props {
+  activeCollection?: string;
+}
+const { activeCollection } = Astro.props;
+
+const collections = ['playbooks', 'snippets', 'concepts', 'lab', 'stack'] as const;
+type CollectionName = typeof collections[number];
+
+const icons: Record<CollectionName, string> = {
+  playbooks: '📋',
+  snippets:  '⚡',
+  concepts:  '💡',
+  lab:       '🧪',
+  stack:     '🗂️',
+};
+
+// Tipo explícito para el objeto resultante
+type AllEntries = {
+  [K in CollectionName]: CollectionEntry<K>[];
+};
+
+const allEntries = Object.fromEntries(
+  await Promise.all(
+    collections.map(async (col) => {
+      const entries = await getCollection(col);
+      return [col, entries.filter(e => e.data.status !== 'archived')] as const;
+    })
+  )
+) as AllEntries;
+---
+
+<aside class="w-64 min-h-screen bg-zinc-900 border-r border-zinc-800 p-4 shrink-0">
+  <a href="/" class="block text-lg font-bold text-teal-400 mb-6 hover:text-teal-300">
+    🧠 dev-brain
+  </a>
+
+  {collections.map(col => (
+    <div class="mb-4">
+      <p class={`text-xs font-semibold uppercase tracking-wider mb-2 ${
+        activeCollection === col ? 'text-teal-400' : 'text-zinc-400'
+      }`}>
+        {icons[col]} {col}
+      </p>
+
+      <ul class="space-y-1">
+        {allEntries[col]?.map(entry => (
+          <li>
+            <a
+              href={`/${col}/${entry.id}`}
+              class="block text-sm text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 rounded px-2 py-1 transition-colors truncate"
+            >
+              {entry.data.title}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  ))}
+</aside>
