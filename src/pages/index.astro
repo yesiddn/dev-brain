@@ -1,17 +1,37 @@
 ---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../layouts/BaseLayout.astro';
+import SideBar from '../components/SideBar.astro';
 
+const recent = [
+  ...await getCollection('playbooks', ({ data }) => data.status === 'active')
+].sort((a, b) =>
+  new Date(b.data.updatedAt).getTime() - new Date(a.data.updatedAt).getTime()
+).slice(0, 8);
 ---
 
-<html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<link rel="icon" href="/favicon.ico" />
-		<meta name="viewport" content="width=device-width" />
-		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
-	</head>
-	<body>
-		<h1>Astro</h1>
-	</body>
-</html>
+<BaseLayout title="Home">
+  <div class="flex min-h-screen">
+    <SideBar />
+    <main class="flex-1 p-8">
+      <h1 class="text-3xl font-bold text-teal-400 mb-2">🧠 dev-brain</h1>
+      <p class="text-zinc-400 mb-8">Base de conocimiento técnica personal</p>
+
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-zinc-500 mb-4">
+        Actualizadas recientemente
+      </h2>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {recent.map(entry => (
+          <a
+            href={`/${entry.collection}/${entry.id}`}
+            class="block bg-zinc-900 border border-zinc-800 rounded-lg p-4 hover:border-teal-800 hover:bg-zinc-800 transition-colors"
+          >
+            <p class="text-xs text-teal-500 mb-1">{entry.collection}</p>
+            <p class="font-medium text-zinc-100 truncate">{entry.data.title}</p>
+            <p class="text-sm text-zinc-500 mt-1 truncate">{entry.data.summary ?? entry.data.description}</p>
+          </a>
+        ))}
+      </div>
+    </main>
+  </div>
+</BaseLayout>
