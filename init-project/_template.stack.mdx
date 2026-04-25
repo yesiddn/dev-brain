@@ -1,0 +1,59 @@
+---
+name: "React"
+icon: "react"
+color: "#61DAFB"
+version: "19.x"
+status: "active"
+description: "Librería principal de trabajo. Senior Frontend Developer en Gosocket desde marzo 2026."
+docs: "https://react.dev"
+tags: ["frontend", "ui", "hooks", "typescript"]
+updatedAt: 2026-04-15
+---
+
+{/*
+  PLANTILLA: Página índice de stack
+  Esta página es el "hub" de una tecnología. 
+  Linkeá todo lo que tenés sobre ella en este brain.
+*/}
+
+## Estado actual
+
+**Nivel:** Senior  
+**Uso:** Diario en producción (Gosocket)  
+**Contexto:** Micro-frontends, gosocket-library-ui, feature-based architecture
+
+---
+
+## Playbooks relacionados
+
+- [Iniciar proyecto React con Vite + TypeScript](/playbooks/react/vite-typescript-starter)
+- [Configurar ESLint + Prettier en React](/playbooks/react/eslint-prettier-setup)
+- [Armar arquitectura feature-based desde cero](/playbooks/react/feature-based-architecture)
+
+## Snippets frecuentes
+
+- [useDebounce hook](/snippets/react/use-debounce)
+- [usePagination hook](/snippets/react/use-pagination)
+- [Virtual scroll con react-virtual](/snippets/react/virtual-scroll)
+- [Axios interceptor con refresh token](/snippets/react/axios-auth-interceptor)
+
+## Conceptos clave
+
+- [React rendering y reconciliation](/concepts/frontend/react-rendering)
+- [Patrones avanzados: Compound Components](/concepts/frontend/compound-components)
+- [Context vs Zustand vs React Query](/concepts/frontend/state-management-comparacion)
+
+## Labs y experimentos
+
+- [Probando React 19 use() hook](/lab/react/react-19-use-hook)
+- [Server Components en Vite (experimental)](/lab/react/server-components-vite)
+
+---
+
+## Notas personales
+
+> Cosas que me cuestan, trucos que descubrí, o contexto específico de mi trabajo actual.
+
+- En Gosocket usamos `gosocket-library-ui` que tiene sus propias versiones de Table, Form y Button. Antes de usar un componente de MUI o shadcn, revisar si ya está en la librería interna.
+- La arquitectura feature-based que acordamos: `features/[nombre]/components/`, `hooks/`, `services/` con barrel en root solo.
+- El MCP de Cursor está configurado para leer los componentes de la librería — no hay que memorizar las props.

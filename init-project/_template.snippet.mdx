@@ -1,0 +1,97 @@
+---
+title: "useDebounce hook en React"
+description: "Hook reutilizable para debounce de valores en inputs de búsqueda"
+tech: ["react", "typescript"]
+tags: ["hooks", "performance", "search", "input"]
+language: "typescript"
+level: "medio"
+status: "active"
+copyReady: true
+context: "frontend"
+updatedAt: 2026-04-15
+summary: "Retrasa la actualización de un valor hasta que el usuario deja de escribir"
+related: []
+---
+
+{/* 
+  PLANTILLA: Snippet de código
+  Mantené el snippet corto y directo. Si necesita mucha explicación, 
+  considerá hacer un playbook o un concepto en su lugar.
+*/}
+
+## Qué hace
+
+Hook que retrasa la actualización de un valor `n` milisegundos después del último cambio.
+Útil para evitar llamadas excesivas a una API mientras el usuario escribe en un input.
+
+## Código
+
+```typescript
+import { useState, useEffect } from "react";
+
+export function useDebounce<T>(value: T, delay: number = 300): T {
+  const [debouncedValue, setDebouncedValue] = useState<T>(value);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedValue(value);
+    }, delay);
+
+    return () => clearTimeout(timer);
+  }, [value, delay]);
+
+  return debouncedValue;
+}
+```
+
+## Cómo usarlo
+
+```typescript
+// En un componente de búsqueda
+function SearchInput() {
+  const [query, setQuery] = useState("");
+  const debouncedQuery = useDebounce(query, 500); // 500ms de delay
+
+  useEffect(() => {
+    if (debouncedQuery) {
+      // Solo llama a la API cuando el usuario dejó de escribir 500ms
+      fetchResults(debouncedQuery);
+    }
+  }, [debouncedQuery]);
+
+  return (
+    <input
+      value={query}
+      onChange={(e) => setQuery(e.target.value)}
+      placeholder="Buscar..."
+    />
+  );
+}
+```
+
+## Variante: con callback
+
+```typescript
+// Si necesitás ejecutar una función en lugar de retornar un valor
+export function useDebouncedCallback(callback: () => void, delay: number) {
+  const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
+
+  return useCallback((...args: unknown[]) => {
+    clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => {
+      callback(...args);
+    }, delay);
+  }, [callback, delay]);
+}
+```
+
+## Notas
+
+- El delay por defecto es `300ms`, suficiente para la mayoría de inputs
+- Si el componente se desmonta antes de que pase el delay, el cleanup del `useEffect` cancela el timeout automáticamente
+- Para inputs con mucha frecuencia de cambio (drag, resize), considerá aumentar el delay a `500ms`
+
+## Cuándo NO usarlo
+
+- En inputs donde necesitás respuesta inmediata (calculadoras, editores de texto)
+- Cuando ya tenés `React Query` o `SWR` que manejan el debounce internamente con `keepPreviousData`

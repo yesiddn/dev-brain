@@ -1,0 +1,90 @@
+---
+title: "Probando Content Collections de Astro con MDX"
+description: "Experimento para entender cómo funcionan las content collections en Astro 5"
+tech: ["astro", "typescript"]
+tags: ["content-collections", "mdx", "astro5"]
+level: "medio"
+status: "active"
+result: "Las content collections funcionan perfecto con glob loader. El schema Zod da IntelliSense en VS Code automáticamente."
+success: true
+updatedAt: 2026-04-15
+summary: "Práctica directa con content collections + schema Zod + rendering de MDX"
+related: []
+---
+
+{/*
+  PLANTILLA: Lab / Experimento
+  Documentá qué probaste, qué salió, qué no salió y qué aprendiste.
+  No tiene que ser perfecto — es un diario técnico.
+*/}
+
+## Objetivo del experimento
+
+Entender cómo funcionan las content collections en Astro 5 con el nuevo `glob()` loader
+y validar que el schema Zod da errores útiles cuando el frontmatter está mal.
+
+## Qué hice
+
+1. Creé una colección `posts` con schema Zod básico
+2. Agregué 3 archivos MDX con frontmatter variado
+3. Probé qué pasa cuando falta un campo obligatorio
+4. Renderizé el contenido en una página dinámica con `[...slug].astro`
+
+## Código probado
+
+```typescript
+// content.config.ts
+const posts = defineCollection({
+  loader: glob({ pattern: "**/*.mdx", base: "./src/content/posts" }),
+  schema: z.object({
+    title: z.string(),
+    date: z.coerce.date(),
+  }),
+});
+```
+
+```astro
+---
+// src/pages/posts/[...slug].astro
+import { getCollection, render } from 'astro:content';
+
+export async function getStaticPaths() {
+  const posts = await getCollection('posts');
+  return posts.map(post => ({
+    params: { slug: post.id },
+    props: { post },
+  }));
+}
+
+const { post } = Astro.props;
+const { Content } = await render(post);
+---
+<Content />
+```
+
+## Resultado
+
+✅ Funcionó. El schema Zod detectó el campo faltante con un mensaje claro:
+```
+[ERROR] Invalid frontmatter: "title" is required
+  → src/content/posts/mi-post.mdx
+```
+
+✅ VS Code mostró autocompletado en el frontmatter después de correr `astro dev` una vez.
+
+## Lo que no esperaba
+
+- El `id` se genera automáticamente del filename (sin extensión): `mi-post.mdx` → id `mi-post`
+- Si tenés carpetas anidadas, el id incluye el path: `dotnet/webapi-starter.mdx` → `dotnet/webapi-starter`
+- Para filtrar por subcarpeta en `getCollection()`:
+  ```typescript
+  const dotnetPosts = await getCollection('playbooks', 
+    ({ id }) => id.startsWith('dotnet/')
+  );
+  ```
+
+## Próximos pasos
+
+- [ ] Probar `reference()` para relacionar entradas entre colecciones
+- [ ] Agregar componentes React personalizados dentro del MDX
+- [ ] Ver cómo funciona image optimization con `z.image()` en el schema

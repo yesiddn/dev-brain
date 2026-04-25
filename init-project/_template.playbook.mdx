@@ -1,0 +1,139 @@
+---
+title: "Cómo iniciar un proyecto en [Tecnología]"
+description: "Guía de reentrada para montar un proyecto [X] funcional desde cero en 15 minutos"
+goal: "Tener un proyecto [Tecnología] corriendo localmente con estructura base lista"
+tech: ["dotnet", "csharp"]       # cambiá según la tecnología
+tags: ["starter", "setup", "webapi"]
+level: "basico"
+status: "draft"                   # cambiá a "active" cuando esté lista
+prerequisites:
+  - "[Tecnología] SDK instalado (versión X.X)"
+  - "Visual Studio Code o IDE equivalente"
+  - "Terminal con acceso a CLI"
+estimatedTime: "15 min"
+updatedAt: 2026-04-15
+createdAt: 2026-04-15
+summary: "Pasos mínimos para arrancar un proyecto [X] y no perder tiempo buscando el primer comando"
+related: []
+---
+
+import { Code } from 'astro:components';
+
+{/* 
+  PLANTILLA: Playbook de reentrada
+  Completá cada sección. No dejes secciones vacías — borrá las que no apliquen.
+  El objetivo es que en 6 meses puedas leer esto y arrancar en < 15 minutos.
+*/}
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando hace tiempo que no tocás [Tecnología] y necesitás arrancar un proyecto rápido, ya sea para un proyecto real, una prueba técnica o practicar.
+
+Qué vas a poder hacer al terminar:
+- ✅ Crear la estructura base del proyecto
+- ✅ Levantar el servidor de desarrollo
+- ✅ Hacer una request de prueba exitosa
+
+---
+
+## Prerequisitos
+
+Verificá que tenés todo instalado antes de empezar:
+
+```bash
+# Verificar versión de [Tecnología]
+dotnet --version     # debe ser >= 8.0
+# ó
+python --version     # debe ser >= 3.11
+```
+
+Si no tenés la versión, instalá desde: [link a docs oficiales]
+
+---
+
+## Paso 1: Crear el proyecto
+
+```bash
+# Comando mínimo para iniciar
+dotnet new webapi -n MiProyecto --use-controllers
+cd MiProyecto
+```
+
+> ⚠️ **Truco que siempre olvido:** [algo específico que se te olvida cada vez, ej: "--use-controllers es necesario si no querés minimal API"]
+
+---
+
+## Paso 2: Estructura del proyecto
+
+Qué genera el comando anterior y para qué sirve cada parte:
+
+```
+MiProyecto/
+├─ Controllers/          # Controladores HTTP
+├─ Program.cs            # Entry point y configuración de servicios
+├─ appsettings.json      # Config de entorno
+└─ MiProyecto.csproj     # Archivo de proyecto (como package.json)
+```
+
+---
+
+## Paso 3: Levantar y verificar
+
+```bash
+dotnet run
+# ó con hot reload
+dotnet watch run
+```
+
+Probá que funciona:
+
+```bash
+curl http://localhost:5000/weatherforecast
+# Deberías recibir un JSON con datos de prueba
+```
+
+---
+
+## Paso 4: Primera feature real
+
+Lo mínimo para agregar un endpoint propio:
+
+```csharp
+// Controllers/HealthController.cs
+[ApiController]
+[Route("[controller]")]
+public class HealthController : ControllerBase
+{
+    [HttpGet]
+    public IActionResult Get() => Ok(new { status = "ok", timestamp = DateTime.UtcNow });
+}
+```
+
+---
+
+## Errores comunes
+
+| Error | Causa | Solución |
+|-------|-------|----------|
+| `Port already in use` | Puerto ocupado | Cambiá el puerto en `launchSettings.json` |
+| `Build failed` | Falta paquete | Correr `dotnet restore` primero |
+| [otro error frecuente] | [causa] | [solución] |
+
+---
+
+## Qué revisar la próxima vez
+
+Lista personal de lo que siempre se te olvida o querés explorar más:
+
+- [ ] Configurar Swagger/OpenAPI correctamente
+- [ ] Agregar Entity Framework + PostgreSQL
+- [ ] Configurar autenticación JWT
+- [ ] [Algo que quedó pendiente de entender]
+
+---
+
+## Links útiles
+
+- [Documentación oficial](https://docs.microsoft.com/dotnet)
+- [Notas relacionadas en este brain](#) *(agregar links a concepts/ o snippets/ relevantes)*

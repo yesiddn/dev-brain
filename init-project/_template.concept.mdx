@@ -1,0 +1,101 @@
+---
+title: "Dependency Injection en .NET"
+description: "Qué es DI, cómo funciona el contenedor de .NET y cuándo usarlo"
+tech: ["dotnet", "csharp"]
+tags: ["di", "ioc", "arquitectura", "solid"]
+level: "medio"
+status: "active"
+updatedAt: 2026-04-15
+summary: "DI es el patrón donde las dependencias de una clase vienen de afuera en lugar de crearse dentro"
+related: []
+---
+
+{/* 
+  PLANTILLA: Concepto técnico
+  Mantené un balance entre teoría y código. 
+  Si hay mucha teoría sin código, la nota no va a ser útil cuando volvás a leerla.
+*/}
+
+## En una línea
+
+> **Dependency Injection** es pasarle las dependencias a una clase desde afuera (inyectarlas) en vez de que ella misma las cree.
+
+## Por qué importa
+
+Sin DI:
+```csharp
+public class OrderService {
+  private readonly EmailService _email = new EmailService(); // ❌ acoplado
+}
+```
+
+Con DI:
+```csharp
+public class OrderService {
+  private readonly IEmailService _email;
+  public OrderService(IEmailService email) { _email = email; } // ✅ desacoplado
+}
+```
+
+La diferencia: con DI podés cambiar `EmailService` por `MockEmailService` en tests sin tocar `OrderService`.
+
+## Cómo funciona el contenedor en .NET
+
+```csharp
+// Program.cs — registrar servicios
+builder.Services.AddScoped<IOrderService, OrderService>();
+builder.Services.AddTransient<IEmailService, EmailService>();
+builder.Services.AddSingleton<ICache, MemoryCache>();
+```
+
+### Lifetimes: cuándo usar cada una
+
+| Lifetime | Se crea... | Cuándo usar |
+|----------|-----------|-------------|
+| `Singleton` | Una vez por app | Servicios stateless (cache, config, loggers) |
+| `Scoped` | Una vez por request HTTP | La mayoría de servicios (repositories, business logic) |
+| `Transient` | Cada vez que se pide | Servicios livianos y stateless |
+
+> ⚠️ **Error frecuente:** Inyectar un `Scoped` dentro de un `Singleton` → el `Scoped` vive más de lo esperado y puede tener estado viejo. .NET te lanza una excepción en desarrollo.
+
+## Ejemplo real completo
+
+```csharp
+// 1. Interfaz
+public interface IProductRepository {
+  Task<Product?> GetByIdAsync(int id);
+}
+
+// 2. Implementación
+public class ProductRepository : IProductRepository {
+  private readonly AppDbContext _db;
+  public ProductRepository(AppDbContext db) { _db = db; }
+  
+  public Task<Product?> GetByIdAsync(int id) => 
+    _db.Products.FindAsync(id).AsTask();
+}
+
+// 3. Registro en Program.cs
+builder.Services.AddScoped<IProductRepository, ProductRepository>();
+
+// 4. Inyección en controlador
+public class ProductsController : ControllerBase {
+  public ProductsController(IProductRepository repo) { _repo = repo; }
+}
+```
+
+## Relación con SOLID
+
+DI es la implementación técnica del **principio D** (Dependency Inversion Principle):
+- Las clases de alto nivel no deben depender de clases de bajo nivel
+- Ambas deben depender de abstracciones (interfaces)
+
+## Cuándo NO usar DI
+
+- Clases de utilidad estáticas (`Math.Round`, helpers puros sin estado)
+- Value objects y DTOs
+- Cuando la dependencia es un tipo del framework que ya tiene DI interno
+
+---
+
+*Relacionado: [SOLID Principles](#) · [Unit Testing con Mocks](#)*
