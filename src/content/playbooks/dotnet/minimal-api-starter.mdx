@@ -1,0 +1,211 @@
+---
+title: "Minimal Web API Starter"
+description: "Guía de reentrada para dotnet minimal api"
+goal: "Crear un proyecto de dotnet minimal api listo para usar con conexión a base de datos PostgreSQL"
+tech: ["dotnet"]
+tags: ["starter"]
+level: "basico"
+status: "active"
+prerequisites: ["dotnet 10", "dotnet-ef", "Docker", "PostgreSQL"]
+estimatedTime: "15 min"
+updatedAt: 2026-05-06
+createdAt: 2026-05-06
+summary: "En esta guía se muestra cómo crear un proyecto de dotnet minimal api listo para usar con conexión a base de datos PostgreSQL."
+related: []
+---
+
+## Contexto
+
+> ¿Cuándo usar este playbook?
+> Este playbook es útil para desarrolladores que quieren iniciar un proyecto de dotnet minimal api con conexión a base de datos PostgreSQL de manera rápida y sencilla.
+
+---
+
+## Prerequisitos
+
+```bash
+dotnet --version # debe ser 10 o superior
+
+dotnet ef --version
+
+# Si no tienes dotnet-ef instalado, puedes instalarlo con el siguiente comando:
+dotnet tool install --global dotnet-ef
+# Para actualizar dotnet-ef, puedes usar el siguiente comando:
+dotnet tool update --global dotnet-ef
+```
+
+---
+
+## Pasos
+
+### 1. Crear el proyecto
+
+```bash
+dotnet new web -o <nombre-del-proyecto>
+
+# Si estas en la carpeta del proyecto, puedes usar el comando:
+
+dotnet new web -o .
+```
+
+### 2. Estructura generada
+
+```txt
+proyecto/
+└─ Program.cs
+└─ proyecto.csproj
+└─ Properties/
+└── launchSettings.json
+```
+
+### 3. Verificar que funciona
+
+```bash
+dotnet run https
+
+# Si usas Visual Studio, puedes usar el botón de "https" para iniciar la aplicación.
+```
+
+### 4. Agregar conexión a PostgreSQL
+
+En la raiz del proyecto, crea un archivo llamado `docket-compose.yml` con el siguiente contenido:
+
+```yaml
+services:
+  db:
+    image: postgres
+    container_name: postgres_db
+    environment:
+      POSTGRES_DB: motion_db
+      POSTGRES_USER: motion_user
+      POSTGRES_PASSWORD: motion_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@motion.com
+      PGADMIN_DEFAULT_PASSWORD: motion
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  postgres_data:
+  pgadmin_data:
+```
+
+Ejecuta en la terminal el siguiente comando para iniciar los contenedores:
+
+```bash
+docket compose up -d
+```
+
+Con esto, tendrás una base de datos PostgreSQL corriendo en un contenedor de Docker, y podrás acceder a ella a través de pgAdmin en `http://localhost:5050` con el usuario `admin@motion.com` y la contraseña `motion`.
+
+Luego, se agregan los paquetes necesarios para conectar la aplicación a PostgreSQL:
+
+```bash
+dotnet add package Npgsql.EntityFrameworkCore.PostgreSQL
+dotnet add package Microsoft.EntityFrameworkCore.Design
+
+# En Visual Studio, puedes usar el administrador de paquetes NuGet para instalar estos paquetes.
+```
+
+Finalmente, abre el archivo `appsettings.json` y agrega la cadena de conexión a PostgreSQL:
+
+```json
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Host=localhost;Port=5432;Database=motion_db;Username=motion_user;Password=motion_pass"
+  }
+}
+```
+
+### 5. Crear DbContext
+
+Crea una clase llamada `AppDbContext.cs` en la raíz del proyecto con el siguiente contenido:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+    // Ejemplo de un modelo o tabla en tu base de datos
+    // public DbSet<Usuario> Usuarios { get; set; }
+}
+```
+
+### 6. Configurar el DbContext en Program.cs
+
+Abre el archivo `Program.cs` y agrega la configuración para el DbContext:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using motion_api;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Obtener el connection string
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
+
+// Registrar el DbContext de PostgreSQL
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(connectionString));
+
+var app = builder.Build();
+
+app.MapGet("/", () => "Hello World!");
+
+app.Run();
+```
+
+### 7. Crear migraciones
+
+Una vez que hayas configurado el DbContext y agregado tus modelos, puedes crear las migraciones para generar la base de datos en PostgreSQL:
+
+```bash
+dotnet ef migrations add InitialCreate
+
+dotnet ef database update
+```
+
+Si te genera un warning diciendo que `The Entity Framework tools version '<version>' is older than that of the runtime '<version>'.`, puedes actualizar el tool con el siguiente comando:
+
+```bash
+dotnet tool update --global dotnet-ef
+```
+
+---
+
+## Errores comunes
+
+| Error | Causa | Solución |
+| ----- | ----- | -------- |
+| -     | -     | -        |
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Revisar diferencias entre `Microsoft.EntityFrameworkCore.Design` y `Microsoft.EntityFrameworkCore.Tools`. [Resumen](https://www.perplexity.ai/search/85605e90-cce8-4d45-815b-de3fa2d7c879#2)
+- [ ] Revisar función del método `OnModelCreating` en el DbContext. [Resumen](https://www.perplexity.ai/search/85605e90-cce8-4d45-815b-de3fa2d7c879#3)
+- [ ] Revisar documentación oficial de Entity Framework Core para PostgreSQL.
+
+---
+
+## Links útiles
+
+- [Documentación oficial](https://docs.microsoft.com/dotnet)
+- [Documentación de Entity Framework Core](https://docs.microsoft.com/ef/core/)
+- [Tutorial de Minimal APIs](https://learn.microsoft.com/en-us/aspnet/core/tutorials/min-web-api?view=aspnetcore-11.0&tabs=visual-studio)
+- [Tutorial de Entity Framework](https://learn.microsoft.com/es-es/ef/core/get-started/overview/first-app?tabs=netcore-cli)
