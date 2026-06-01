@@ -1,5 +1,5 @@
 // @ts-check
-import { defineConfig } from 'astro/config';
+import { defineConfig, envField } from 'astro/config';
 
 import tailwindcss from '@tailwindcss/vite';
 
@@ -11,5 +11,21 @@ export default defineConfig({
     plugins: [tailwindcss()]
   },
 
-  integrations: [mdx()]
+  integrations: [mdx()],
+
+  // config to allow loading images from astro.build domain, where the image is hosted
+  image: {
+    domains: ["astro.build", "localhost"],
+  },
+
+  env: {
+    schema: {
+      PUBLIC_HOST: envField.string({
+        context: 'client',
+        access: 'public',
+        url: true,
+        default: 'http://localhost:4321',
+      })
+    },
+  }
 });
