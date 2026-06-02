@@ -1,43 +1,67 @@
-# Astro Starter Kit: Minimal
+# dev-brain
 
-```sh
-pnpm create astro@latest -- --template minimal
+Base de conocimientos personal construida con **Astro 6**, **Tailwind v4** y **MDX**. Todo el contenido está redactado en español.
+
+## Inicio rápido
+
+Este proyecto utiliza **exclusivamente `pnpm`**. No hay `package-lock.json` ni `yarn.lock`.
+
+```bash
+# 1. Instalar dependencias
+pnpm install
+
+# 2. Iniciar el servidor de desarrollo en http://localhost:4321
+pnpm dev
 ```
 
-> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
+## Colecciones de Contenido
 
-## 🚀 Project Structure
+El sitio gestiona 5 colecciones de contenido definidas en `src/content.config.ts`:
 
-Inside of your Astro project, you'll see the following folders and files:
+- `playbooks`
+- `snippets`
+- `concepts`
+- `lab`
+- `stack` (⚠️ Utiliza un esquema independiente a las demás colecciones)
 
-```text
-/
-├── public/
-├── src/
-│   └── pages/
-│       └── index.astro
-└── package.json
+Todas utilizan el *glob loader* de Astro y se renderizan dinámicamente mediante la ruta `src/pages/[collection]/[...id].astro`.
+
+## Creación de notas (CLI)
+
+Utiliza el script integrado para crear nuevas notas (excepto para `stack`):
+
+```bash
+node scripts/new-note.mjs <type> <tech> <slug>
 ```
 
-Astro looks for `.astro` or `.md` files in the `src/pages/` directory. Each page is exposed as a route based on its file name.
+**Ejemplos:**
+- `node scripts/new-note.mjs playbook dotnet webapi-crud`
+- `node scripts/new-note.mjs snippet react use-debounce`
 
-There's nothing special about `src/components/`, but that's where we like to put any Astro/React/Vue/Svelte/Preact components.
+*(Para `stack`, debes crear el archivo manualmente usando `init-project/_template.stack.mdx`)*.
 
-Any static assets, like images, can be placed in the `public/` directory.
+### Ciclo de vida de los estados
 
-## 🧞 Commands
+| Estado | Comportamiento |
+|--------|----------------|
+| `draft` | Oculto en el sidebar, trabajo en progreso. |
+| `active` | Visible en todas partes (sidebar e índice). |
+| `archived` | Oculto en el sidebar, excluido de los listados. |
 
-All commands are run from the root of the project, from a terminal:
+*Nota: La colección `stack` tiene sus propios estados (`active`, `learning`, `dormant`, `archived`).*
 
-| Command                   | Action                                           |
-| :------------------------ | :----------------------------------------------- |
-| `pnpm install`             | Installs dependencies                            |
-| `pnpm dev`             | Starts local dev server at `localhost:4321`      |
-| `pnpm build`           | Build your production site to `./dist/`          |
-| `pnpm preview`         | Preview your build locally, before deploying     |
-| `pnpm astro ...`       | Run CLI commands like `astro add`, `astro check` |
-| `pnpm astro -- --help` | Get help using the Astro CLI                     |
+## Arquitectura técnica
 
-## 👀 Want to learn more?
+- **Generación Estática (SSG):** Configuración por defecto de Astro.
+- **Tailwind v4:** Configuración basada directamente en CSS (`@import "tailwindcss"`), sin archivo `tailwind.config.mjs`. El plugin de tipografía también se configura aquí.
+- **TypeScript estricto:** La verificación principal del código se hace mediante `astro check`. No hay pipelines de CI/CD ni configuración de ESLint/Prettier.
 
-Feel free to check [our documentation](https://docs.astro.build) or jump into our [Discord server](https://astro.build/chat).
+## Comandos disponibles
+
+| Comando | Descripción |
+|---------|-------------|
+| `pnpm install` | Instala las dependencias necesarias. |
+| `pnpm dev` | Levanta el entorno de desarrollo local. |
+| `pnpm astro check` | Verifica los tipos del proyecto (No usar `tsc`). |
+| `pnpm build` | Compila el sitio a archivos estáticos en `./dist/`. |
+| `pnpm preview` | Sirve la carpeta `./dist/` para probar el build localmente. |
