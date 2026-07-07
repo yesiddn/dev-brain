@@ -1,0 +1,252 @@
+---
+title: "Cómo configurar OpenAPI + Scalar en ASP.NET Core"
+description: "Guía de reentrada para dejar documentada una API con OpenAPI y Scalar como interfaz visual"
+goal: "Levantar una API ASP.NET Core con documentación OpenAPI funcional y Scalar mostrando endpoints y bodies correctamente"
+tech: ["dotnet", "csharp", "aspnet-core", "openapi"]
+tags: ["scalar", "openapi", "minimal-api", "webapi", "setup"]
+level: "basico"
+status: "active"
+prerequisites:
+  - ".NET SDK instalado"
+  - "Proyecto ASP.NET Core creado"
+  - "Acceso a terminal y al archivo Program.cs"
+estimatedTime: "20 min"
+updatedAt: 2026-07-07
+createdAt: 2026-07-07
+summary: "Pasos mínimos para configurar OpenAPI y Scalar en ASP.NET Core y evitar los errores más comunes al documentar endpoints"
+related: []
+---
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando necesite configurar o reconfigurar la documentación de una API ASP.NET Core y no quiera perder tiempo recordando paquetes, rutas o metadata necesaria para que Scalar muestre bien las respuestas.
+
+Qué voy a poder hacer al terminar:
+
+- ✅ Generar el documento OpenAPI desde ASP.NET Core
+- ✅ Visualizar la documentación en Scalar
+- ✅ Ver correctamente el body de respuesta de los endpoints
+- ✅ Repetir la configuración en otros proyectos sin empezar de cero
+
+---
+
+## Prerequisitos
+
+Verificar que el entorno esté listo:
+
+```bash
+dotnet --version
+```
+
+Confirmar también que el proyecto compila:
+
+```bash
+dotnet build
+```
+
+---
+
+## Paso 1: Instalar paquetes
+
+Instalar los paquetes base:
+
+```bash
+dotnet add package Microsoft.AspNetCore.OpenApi
+dotnet add package Scalar.AspNetCore
+```
+
+Si aparece un warning por vulnerabilidad transitiva de `Microsoft.OpenApi`, fijar una versión parchada explícita:
+
+```bash
+dotnet add package Microsoft.OpenApi --version 2.7.5
+```
+
+### Resultado esperado en el `.csproj`
+
+```xml
+<ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.8" />
+    <PackageReference Include="Microsoft.OpenApi" Version="2.7.5" />
+    <PackageReference Include="Scalar.AspNetCore" Version="2.16.10" />
+</ItemGroup>
+```
+
+> ⚠️ **Recordatorio importante:** Scalar no genera OpenAPI. Scalar solo renderiza una UI a partir de un documento OpenAPI ya expuesto por la aplicación.
+
+---
+
+## Paso 2: Registrar OpenAPI
+
+En `Program.cs`, registrar la generación del documento OpenAPI:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddOpenApi();
+```
+
+Esto permite que ASP.NET Core construya el documento OpenAPI a partir de la metadata de los endpoints.
+
+---
+
+## Paso 3: Mapear OpenAPI y Scalar
+
+Agregar el namespace:
+
+```csharp
+using Scalar.AspNetCore;
+```
+
+Después, en el pipeline:
+
+```csharp
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+    app.MapScalarApiReference("/scalar");
+}
+```
+
+### Qué hace cada llamada
+
+- `MapOpenApi()` expone el documento OpenAPI.
+- `MapScalarApiReference("/scalar")` monta la interfaz visual de Scalar en una ruta clara.
+
+---
+
+## Paso 4: Entrar a Scalar
+
+Levantar la app:
+
+```bash
+dotnet run
+```
+
+Buscar en consola una URL como esta:
+
+```text
+Now listening on: http://localhost:5170
+```
+
+Entrar a:
+
+```text
+http://localhost:5170/scalar
+```
+
+Según la configuración y la versión, algunas guías muestran rutas como `/scalar/v1`, pero con la integración actual también se puede configurar directamente un prefijo como `/scalar`. Lo importante es revisar cómo se mapeó `MapScalarApiReference(...)`.
+
+---
+
+## Paso 5: Personalización mínima
+
+Si quiero una configuración más limpia o reutilizable, puedo extraerla a extensiones.
+
+### Ejemplo
+
+```csharp
+using Scalar.AspNetCore;
+
+public static class OpenApiExtensions
+{
+    public static IServiceCollection AddOpenApiDocumentation(this IServiceCollection services)
+    {
+        services.AddOpenApi(options =>
+        {
+            options.AddDocumentTransformer((document, context, cancellationToken) =>
+            {
+                document.Info = new()
+                {
+                    Title = "My API",
+                    Version = "v1",
+                    Description = "OpenAPI documentation for this project."
+                };
+
+                return Task.CompletedTask;
+            });
+        });
+
+        return services;
+    }
+
+    public static IEndpointRouteBuilder MapOpenApiDocumentation(this IEndpointRouteBuilder app)
+    {
+        app.MapOpenApi();
+
+        app.MapScalarApiReference("/scalar", options =>
+        {
+            options.WithTitle("My API");
+        });
+
+        return app;
+    }
+}
+```
+
+Esto ayuda a no ensuciar `Program.cs` y deja una convención fácil de repetir en otros proyectos.
+
+---
+
+## Paso 6: Hacer que Scalar muestre el body
+
+Si Scalar muestra `200 OK` pero dice `No Body`, el problema normalmente no es Scalar sino la metadata OpenAPI del endpoint. En Minimal APIs, hay que describir explícitamente el tipo de respuesta con `Produces<T>()`.
+
+### Incorrecto
+
+```csharp
+app.MapGet("/health", () => Results.Ok(new { status = "ok" }))
+   .Produces(StatusCodes.Status200OK);
+```
+
+Eso documenta el status code, pero no el schema del body.
+
+### Correcto
+
+```csharp
+public record HealthResponse(string Status, DateTime Timestamp);
+
+app.MapGet("/health", () =>
+    TypedResults.Ok(new HealthResponse("ok", DateTime.UtcNow)))
+   .Produces<HealthResponse>(StatusCodes.Status200OK);
+```
+
+Con eso, OpenAPI ya tiene suficiente información para que Scalar muestre el body esperado.
+
+---
+
+## Ejemplo aplicado
+
+En un proyecto real, por ejemplo una API tipo Ceres con Minimal APIs y arquitectura por capas, esta configuración puede vivir en una extensión global como `OpenApiExtensions`, mientras los endpoints de negocio siguen organizados por módulos. Eso permite reutilizar la infraestructura de documentación sin mezclarla con `Health`, `Finance` o `Gym`.
+
+---
+
+## Errores comunes
+
+| Error | Causa | Solución |
+| ------- | ------- | ---------- |
+| Scalar no abre | No se mapeó `MapScalarApiReference(...)` | Revisar el pipeline y el entorno `Development` |
+| `/scalar` abre pero no aparecen endpoints | No se expuso `MapOpenApi()` | Agregar `app.MapOpenApi()` |
+| Aparece `No Body` en la respuesta | Se usó `.Produces(200)` sin tipo | Cambiar a `.Produces<TResponse>(200)` |
+| El documento OpenAPI no refleja bien la respuesta | El handler devuelve algo ambiguo o sin metadata | Usar `TypedResults` y `Produces<T>()` |
+| Warning por `Microsoft.OpenApi` vulnerable | Dependencia transitiva desactualizada | Fijar `Microsoft.OpenApi` en `2.7.5` |
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Personalizar `Title`, `Version` y `Description`
+- [ ] Definir una convención fija para `Produces<T>()`
+- [ ] Documentar errores con `ProducesProblem(...)`
+- [ ] Evaluar múltiples documentos OpenAPI si la API crece mucho
+- [ ] Revisar cómo documentar autenticación cuando agregue JWT
+
+---
+
+## Links útiles
+
+- [Scalar ASP.NET Core Integration](https://scalar.com/products/api-references/integrations/aspnetcore/integration)
+- [Microsoft Learn — Use the generated OpenAPI documents](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/openapi/using-openapi-documents?view=aspnetcore-10.0)
+- [Microsoft Learn — Minimal API responses](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/minimal-apis/responses?view=aspnetcore-10.0)
