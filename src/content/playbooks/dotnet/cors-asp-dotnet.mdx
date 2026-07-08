@@ -1,0 +1,232 @@
+---
+title: "Cómo configurar CORS en ASP.NET Core"
+description: "Guía de reentrada para habilitar CORS de forma correcta en una Web API con ASP.NET Core"
+goal: "Tener una policy de CORS funcional, segura para desarrollo y preparada para múltiples ambientes"
+tech: ["dotnet", "csharp", "aspnetcore"]
+tags: ["cors", "configuration", "webapi", "security"]
+level: "basico"
+status: "active"
+prerequisites:
+  - ".NET SDK instalado (preferiblemente 8.0 o superior)"
+  - "Proyecto ASP.NET Core Web API o Minimal API creado"
+  - "Conocimiento básico de Program.cs, DI y appsettings.json"
+estimatedTime: "15 min"
+updatedAt: 2026-07-07
+createdAt: 2026-07-07
+summary: "Pasos mínimos para configurar CORS en ASP.NET Core sin dejarlo abierto de más y con soporte para configuración por ambiente"
+related: []
+---
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando tenés un frontend y un backend en orígenes distintos, por ejemplo React, Vite, Angular o una app móvil web, y necesitás permitir requests cross-origin sin abrir la API más de la cuenta.
+
+Qué vas a poder hacer al terminar:
+
+- ✅ Entender qué hace CORS realmente
+- ✅ Configurar una policy nombrada en ASP.NET Core
+- ✅ Leer orígenes permitidos desde configuración
+- ✅ Fallar temprano si la configuración de CORS está mal
+- ✅ Aplicar la policy globalmente en el pipeline HTTP
+
+---
+
+## Prerequisitos
+
+Verificá que tenés todo instalado antes de empezar:
+
+```bash
+dotnet --version
+# debe ser >= 8.0
+```
+
+Si no tenés la versión, instalá desde: [Documentación oficial de .NET](https://dotnet.microsoft.com/)
+
+---
+
+## Qué es CORS
+
+CORS (**Cross-Origin Resource Sharing**) es el mecanismo que le indica al navegador qué orígenes pueden consumir recursos de tu API cuando frontend y backend viven en direcciones distintas. No es una barrera de seguridad completa del servidor por sí sola; más bien es una política que el navegador usa para permitir o bloquear acceso cross-origin a las respuestas.
+
+Ejemplo mental rápido:
+
+- Frontend: `http://localhost:5173`
+- Backend: `https://localhost:7001`
+
+Aunque ambos estén en tu máquina, esos dos valores representan orígenes distintos, así que el navegador aplica CORS.
+
+---
+
+## Idea base
+
+La forma recomendada en ASP.NET Core es:
+
+- Registrar CORS con `builder.Services.AddCors(...)`
+- Definir una **policy nombrada**
+- Permitir orígenes específicos con `WithOrigins(...)`, no `AllowAnyOrigin()` si conocés el frontend
+- Aplicar la policy con `app.UseCors(...)` en el pipeline
+
+> **Truco que siempre se olvida:** el nombre de la policy no tiene por qué salir de configuración; normalmente conviene dejarlo fijo en código porque es un identificador interno, no un valor de ambiente.
+
+---
+
+## Configuración en appsettings
+
+Si vas a soportar más de un origen, no guardes un solo string. Guardá una lista:
+
+```json
+{
+  "Cors": {
+    "AllowedOrigins": [
+      "http://localhost:5173"
+    ]
+  }
+}
+```
+
+Esto te permite agregar desarrollo, staging o producción sin tocar la lógica de CORS, solo la configuración.
+
+---
+
+## Leer múltiples orígenes
+
+En ASP.NET Core, una sección de configuración se puede bindear a un `string[]` usando `GetSection(...).Get<string[]>()`. Eso encaja perfecto con `WithOrigins(...)` porque ese método acepta `params string[]`.
+
+Ejemplo:
+
+```csharp
+var allowedOrigins =
+    builder.Configuration
+        .GetRequiredSection("Cors:AllowedOrigins")
+        .Get<string[]>() ?? [];
+```
+
+La idea importante aquí es que **no hace falta ningún spread operator** como en JavaScript; simplemente pasás el array.
+
+---
+
+## Validar la configuración
+
+Si CORS es obligatorio para que el frontend funcione, conviene fallar al arrancar la app cuando `AllowedOrigins` no exista, esté vacío o tenga valores inválidos. Eso evita perder tiempo depurando errores en el navegador cuando el problema real era configuración rota.
+
+Una validación razonable es:
+
+```csharp
+if (allowedOrigins.Length == 0 || allowedOrigins.Any(string.IsNullOrWhiteSpace))
+{
+    throw new InvalidOperationException(
+        "Cors:AllowedOrigins configuration is missing or is empty");
+}
+```
+
+La idea no es “hacerlo elegante”, sino dejar claro que la aplicación no puede iniciar correctamente sin esa configuración.
+
+---
+
+## Registrar la policy
+
+Una policy clara y simple suele permitir:
+
+- Orígenes exactos con `WithOrigins(...)`
+- Cualquier método con `AllowAnyMethod()`
+- Cualquier header con `AllowAnyHeader()`
+
+Ejemplo:
+
+```csharp
+const string CorsPolicyName = "AllowFrontend";
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(CorsPolicyName, policy =>
+    {
+        policy
+            .WithOrigins(allowedOrigins)
+            .AllowAnyHeader()
+            .AllowAnyMethod();
+    });
+});
+```
+
+Esto suele ser suficiente para desarrollo y para muchas APIs internas o de frontend propio, siempre que los orígenes estén restringidos explícitamente.
+
+---
+
+## Aplicar la policy
+
+Registrar CORS no basta; también hay que aplicarlo en el pipeline HTTP con `UseCors(...)`.
+
+Ejemplo:
+
+```csharp
+app.UseHttpsRedirection();
+
+app.UseCors(CorsPolicyName);
+
+app.MapControllers();
+```
+
+Si usás Minimal APIs, la idea es la misma: primero configurás el middleware y luego mapeás endpoints.
+
+---
+
+## Variables de entorno
+
+Si necesitás sobreescribir la configuración por ambiente, ASP.NET Core soporta claves jerárquicas usando doble guion bajo `__`. Para un array, podés apuntar a índices concretos.
+
+Ejemplos conceptuales:
+
+```env
+Cors__AllowedOrigins__0=http://localhost:5173
+Cors__AllowedOrigins__1=https://app.midominio.com
+```
+
+Eso permite tener una base en `appsettings.json` y luego personalizar por ambiente sin hardcodear producción dentro de `Program.cs`.
+
+---
+
+## Errores comunes
+
+| Error | Causa | Solución |
+| ------- | ------- | ---------- |
+| El frontend sigue mostrando error de CORS | La policy está registrada pero no aplicada con `UseCors(...)` | Verificar que `app.UseCors(...)` exista y esté en el pipeline |
+| `WithOrigins(...)` no acepta mi valor como esperaba | Se intentó leer un string simple en vez de un array | Usar `GetSection("Cors:AllowedOrigins").Get<string[]>()` |
+| La app inicia pero CORS no funciona como esperaba | `AllowedOrigins` está mal escrito o vacío | Validar la configuración al arranque y fallar temprano |
+| Se permitió demasiado acceso | Uso de `AllowAnyOrigin()` sin necesidad | Preferir `WithOrigins(...)` con allow-list explícita |
+| Un origen “correcto” no funciona | El origen configurado no coincide exactamente en esquema, host o puerto | Revisar que el valor sea exacto, por ejemplo `http://localhost:5173` |
+
+---
+
+## Qué revisar la próxima vez
+
+Lista personal de cosas para profundizar:
+
+- [ ] Diferencia entre CORS global y por endpoint
+- [ ] Cuándo conviene restringir headers en vez de usar `AllowAnyHeader()`
+- [ ] Cómo cambia CORS cuando agregue autenticación con JWT
+- [ ] Cómo documentar la configuración de ambientes en Notion
+- [ ] Cuándo usar múltiples policies en la misma API
+
+---
+
+## Ejemplo aplicado
+
+En un proyecto real con frontend en Vite, una implementación práctica fue:
+
+- Guardar `Cors:AllowedOrigins` en `appsettings.json`
+- Leer esa sección como `string[]`
+- Validar que exista al menos un origen válido
+- Crear una policy nombrada
+- Aplicar `WithOrigins(...)`, `AllowAnyHeader()` y `AllowAnyMethod()`
+- Usar `app.UseCors(...)` antes del mapeo de endpoints
+
+Ese ejemplo sirve como referencia concreta, pero la estructura del playbook está pensada para cualquier API en ASP.NET Core, no para un proyecto específico.
+
+---
+
+## Links útiles
+
+- [Documentación oficial de CORS en ASP.NET Core](https://learn.microsoft.com/en-us/aspnet/core/security/cors?view=aspnetcore-10.0)
+- [Configuración en ASP.NET Core](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/configuration/?view=aspnetcore-10.0)
+- [WithOrigins(String[]) en Microsoft Learn](https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.cors.infrastructure.corspolicybuilder.withorigins?view=aspnetcore-10.0)
