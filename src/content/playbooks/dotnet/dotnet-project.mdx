@@ -1,0 +1,158 @@
+---
+title: "Dotnet project"
+description: "Guía de creación de proyecto en dotnet."
+goal: "Crear un proyecto de dotnet listo para usar con conexión a base de datos PostgreSQL y una estructura base."
+tech: ["dotnet"]
+tags: ["starter"]
+level: "basico"
+status: "draft"
+prerequisites: ["dotnet 10", "dotnet-ef", "Docker", "PostgreSQL"]
+estimatedTime: "15 min"
+updatedAt: 2026-05-06
+createdAt: 2026-05-06
+summary: "En esta guía se muestra cómo crear un proyecto de dotnet minimal api listo para usar con conexión a base de datos PostgreSQL."
+related: []
+---
+
+## Contexto
+
+> ¿Cuándo usar este playbook?
+> Este playbook es útil para desarrolladores que quieren iniciar un proyecto de dotnet de manera rápida y sencilla.
+
+---
+
+## Prerequisitos
+
+Crear un proyecto web con minimal api ([instrucciones](/playbooks/dotnet/minimal-api-starter)).
+
+---
+
+## Pasos
+
+### 1. Crear proyectos
+
+Una vez tengas el proyecto base creado, pasamos a crear varios proyectos de tipo biblioteca de clases para separar responsabilidades.
+En este caso vamos a usar un estructura simple de cuatro proyectos:
+
+- Api (webapi): Este seria el proyecto con el que se inicia y es el encargado de los endpoints y binding.
+- Application (classLib): Se encarga de los casos de uso y lógica de negocio (DTOs y servicios).
+- Domain (classLib): Se encarga de representar conceptos de negocio (entidades).
+- Infrastructure (classLib): Se encarga de resolver detalles técnicos externos (base de datos).
+
+Para crear los proyectos se usan estos comandos:
+
+```bash
+# crear proyecto tipo webapi
+dotnet new webapi -n NombreProyecto -o CarpetaDestino
+
+# crear proyecto tipo classLib
+dotnet new classLib -n NombreProyecto -o CarpetaDestino
+```
+
+Una vez tengamos los proyectos listos, hay que agregarlos a la Solución (en mi caso mi solución se llama `ceres`).
+
+```bash
+dotnet sln ceres.sln add ceres.Api/<classLib>.Api.csproj
+```
+
+> 💡 Si estas usando un IDE como Visual Studio o Rider puedes crear los proyectos desde la UI y el editor se encaarga de agregarlos a la solución.
+
+Ahora, para poder usar las clases de un proyecto en otro proyecto, hay que referenciar el primer proyecto. Por ejemplo, si `Api` va a usar clases que viven en `Application`, como DTOs, entonces `Api`` necesita una referencia de proyecto hacia `Application`. Para hacer esto, ejecuta el siguiente comando:
+
+```bash
+dotnet add ceres.Api/<classLib>.Api.csproj reference ceres.Application/<classLib>.Application.csproj
+```
+
+### 2. Conexión a la base de datos
+
+Para este playbook usaré PostgreSQL como base de datos.
+
+#### 2.1. Instalar paquetes en `Infrastructure`
+
+Para la configuración primero hay que instalar los paquetes necesrios.
+
+```bash
+dotnet add Ceres.Infrastructure package Microsoft.EntityFrameworkCore
+dotnet add Ceres.Infrastructure package Npgsql.EntityFrameworkCore.PostgreSQL
+dotnet add Ceres.Infrastructure package Microsoft.EntityFrameworkCore.Design
+```
+
+> 💡 Si usas un IDE como Visual Studio o Rider puedes usar la UI de Nuget para buscar los paquetes e instalarlos con un click.
+
+#### 2.2. Crear un `AppDbContext.cs`
+
+En `Ceres.Infrastructure/Persistence/AppDbContext.cs`:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+
+namespace Ceres.Infrastructure.Persistence;
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options)
+    {
+    }
+}
+```
+
+#### 2.3. Agregar connection string
+
+En `Ceres.Api/appsettings.Development.json`:
+
+```json
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Host=localhost;Port=5432;Database=ceresdb;Username=postgres;Password=postgres"
+  }
+}
+```
+
+Ese es el formato típico de connection string para PostgreSQL.
+
+#### 2.4. Registra el `DbContext` en `Program.cs`
+
+En `Ceres.Api/Program.cs`:
+
+```csharp
+using Ceres.Infrastructure.Persistence;
+using Microsoft.EntityFrameworkCore;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+var app = builder.Build();
+
+app.Run();
+```
+
+`UseNpgsql` es la configuración correcta para PostgreSQL en EF Core. Si no reconoce `UseNpgsql`, revisa el paquete y el `using Microsoft.EntityFrameworkCore;`.
+
+> No olvides agregar la referencia de `Infrastructure` para poder usar el `AppDbContext`.
+
+---
+
+## Errores comunes
+
+| Error | Causa | Solución |
+| ----- | ----- | -------- |
+| -     | -     | -        |
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Revisar diferencias entre `Microsoft.EntityFrameworkCore.Design` y `Microsoft.EntityFrameworkCore.Tools`. [Resumen](https://www.perplexity.ai/search/85605e90-cce8-4d45-815b-de3fa2d7c879#2)
+- [ ] Revisar función del método `OnModelCreating` en el DbContext. [Resumen](https://www.perplexity.ai/search/85605e90-cce8-4d45-815b-de3fa2d7c879#3)
+- [ ] Revisar documentación oficial de Entity Framework Core para PostgreSQL.
+
+---
+
+## Links útiles
+
+- [Documentación oficial](https://docs.microsoft.com/dotnet)
+- [Documentación de Entity Framework Core](https://docs.microsoft.com/ef/core/)
+- [Tutorial de Minimal APIs](https://learn.microsoft.com/en-us/aspnet/core/tutorials/min-web-api?view=aspnetcore-11.0&tabs=visual-studio)
+- [Tutorial de Entity Framework](https://learn.microsoft.com/es-es/ef/core/get-started/overview/first-app?tabs=netcore-cli)
