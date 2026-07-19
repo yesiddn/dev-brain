@@ -1,0 +1,276 @@
+---
+title: "Índices y Alternate Keys en EF Core"
+description: "Qué es un índice, cuándo usar un índice único y cuándo una alternate key en Entity Framework Core"
+tech: ["dotnet", "csharp"]
+tags: ["ef-core", "database", "indexes", "modeling"]
+level: "medio"
+status: "active"
+updatedAt: 2026-07-18
+summary: "Un índice mejora búsquedas y un índice único evita duplicados; una alternate key además convierte esa propiedad en una clave candidata del modelo"
+related: []
+---
+
+## En una línea
+
+> Un **índice** acelera búsquedas en base de datos; un **índice único** además evita duplicados; una **alternate key** hace eso mismo pero con semántica de clave dentro del modelo de EF Core.
+
+## Por qué importa
+
+Es común pensar que “hacer único un campo” pertenece a la propiedad misma, pero en bases de datos relacionales esa regla normalmente se expresa con un índice o una restricción asociada a una o varias columnas.
+
+Ejemplo típico: `Email` en `User`.
+
+```csharp
+builder.Property(user => user.Email)
+    .IsRequired()
+    .HasMaxLength(255);
+```
+
+Ese código solo define la columna:
+
+- es obligatoria,
+- tiene longitud máxima,
+- pero todavía no evita repetidos.
+
+Para impedir duplicados, hace falta una regla adicional:
+
+```csharp
+builder.HasIndex(user => user.Email)
+    .IsUnique();
+```
+
+## Qué define cada cosa
+
+### Property
+
+`Property(...)` configura la columna en sí misma.
+
+Sirve para definir cosas como:
+
+- obligatoriedad (`IsRequired`)
+- longitud (`HasMaxLength`)
+- tipo de columna
+- conversiones
+- valor por defecto
+
+Ejemplo:
+
+```csharp
+builder.Property(user => user.Email)
+    .IsRequired()
+    .HasMaxLength(255);
+```
+
+Esto responde a la pregunta: **¿cómo es esta columna?**
+
+---
+
+### Index
+
+`HasIndex(...)` configura una estructura de base de datos pensada para búsqueda y, opcionalmente, para unicidad.
+
+Ejemplo:
+
+```csharp
+builder.HasIndex(user => user.Email)
+    .IsUnique();
+```
+
+Esto responde a la pregunta: **¿cómo quiero buscar o proteger esta tabla?**
+
+Un índice tiene sentido cuando:
+
+- una columna se consulta con frecuencia,
+- querés acelerar filtros,
+- querés impedir duplicados.
+
+## Qué hace un índice realmente
+
+La intuición más útil es esta: sin índice, la base puede terminar recorriendo muchas filas para encontrar un valor; con índice, tiene una estructura auxiliar para llegar más rápido al dato.
+
+Pensalo como el índice de un libro:
+
+- sin índice, lees página por página,
+- con índice, saltás directo a la sección.
+
+### Ventajas
+
+- Mejora consultas por columnas usadas en `WHERE`, `JOIN`, `ORDER BY`.
+- Un índice único protege reglas como “no puede haber dos usuarios con el mismo email”.
+- Hace explícitas reglas importantes del dominio en la base de datos.
+
+### Costo
+
+Un índice no es gratis:
+
+- ocupa espacio,
+- hay que mantenerlo en inserciones y updates,
+- demasiados índices pueden perjudicar escrituras.
+
+Por eso no se indexa “todo”, sino lo que realmente representa consultas frecuentes o reglas relevantes.
+
+## Índice único vs Alternate Key
+
+Esta es la distinción importante.
+
+### Índice único
+
+```csharp
+builder.HasIndex(user => user.Email)
+    .IsUnique();
+```
+
+Usalo cuando:
+
+- solo querés evitar duplicados,
+- querés buscar rápido por esa columna,
+- esa propiedad no necesita comportarse como identificador formal dentro del modelo.
+
+En la mayoría de sistemas, `User.Email` entra en esta categoría:
+
+- el identificador principal sigue siendo `Id`,
+- `Email` debe ser único,
+- pero no hace falta tratarlo como clave principal alternativa en relaciones.
+
+---
+
+### Alternate Key
+
+```csharp
+builder.HasAlternateKey(user => user.Email);
+```
+
+Usala cuando esa propiedad no solo es única, sino que además querés tratarla como una **clave candidata** de la entidad.
+
+Eso significa que:
+
+- identifica formalmente a la entidad además de la primary key,
+- puede ser objetivo de una foreign key,
+- tiene más peso semántico dentro del modelo.
+
+En otras palabras:
+
+- un índice único dice “no repitas este valor”,
+- una alternate key dice “este valor también identifica a la entidad”.
+
+## Ejemplo práctico
+
+### Caso simple: email único
+
+```csharp
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        builder.ToTable("Users", "identity");
+
+        builder.HasKey(user => user.Id);
+
+        builder.Property(user => user.Email)
+            .IsRequired()
+            .HasMaxLength(255);
+
+        builder.Property(user => user.PasswordHash)
+            .IsRequired()
+            .HasMaxLength(255);
+
+        builder.Property(user => user.CreatedAt)
+            .IsRequired();
+
+        builder.HasIndex(user => user.Email)
+            .IsUnique()
+            .HasDatabaseName("IX_Users_Email");
+    }
+}
+```
+
+Este caso es ideal para índice único:
+
+- `Id` sigue siendo la primary key,
+- `Email` no se puede repetir,
+- la autenticación puede consultar por email con eficiencia.
+
+---
+
+### Caso donde sí tendría sentido alternate key
+
+Supongamos que otra entidad referencia al usuario usando el email como clave de relación.
+
+```csharp
+public class LoginAttempt
+{
+    public Guid Id { get; set; }
+    public string UserEmail { get; set; } = null!;
+}
+```
+
+Si querés que `LoginAttempt.UserEmail` apunte formalmente a `User.Email`, entonces `User.Email` ya no es solo “un campo único”: también está actuando como clave alternativa.
+
+Ahí tendría sentido algo así:
+
+```csharp
+builder.HasAlternateKey(user => user.Email);
+```
+
+La idea no es que sea “mejor” que un índice único, sino que expresa otra intención.
+
+## Regla práctica
+
+Usá **índice único** por defecto cuando:
+
+- querés evitar duplicados,
+- querés búsquedas rápidas,
+- la identidad real de la entidad sigue siendo la primary key.
+
+Usá **alternate key** solo cuando:
+
+- esa propiedad también funciona como identificador formal,
+- otras entidades podrían referenciarla como clave.
+
+## Error de modelado común
+
+Confundir estas tres cosas como si fueran lo mismo:
+
+```csharp
+builder.Property(user => user.Email)
+    .IsRequired()
+    .HasMaxLength(255);
+```
+
+- `IsRequired()` no hace único el valor.
+- `HasMaxLength(255)` no evita duplicados.
+- La unicidad necesita una regla aparte.
+
+La configuración correcta, si querés email único, sería:
+
+```csharp
+builder.Property(user => user.Email)
+    .IsRequired()
+    .HasMaxLength(255);
+
+builder.HasIndex(user => user.Email)
+    .IsUnique();
+```
+
+## Criterio recomendado
+
+Si estás modelando usuarios en una aplicación común:
+
+- `Id` como primary key,
+- `Email` con índice único,
+- `PasswordHash` obligatorio,
+- `CreatedAt` obligatorio.
+
+Ese enfoque suele ser el más claro porque mantiene separadas:
+
+- la identidad interna de la entidad,
+- la regla de unicidad del negocio,
+- y la optimización de búsqueda.
+
+## Qué recordar
+
+- `Property(...)` define la columna.
+- `HasIndex(...)` define búsqueda y unicidad.
+- `HasAlternateKey(...)` define una clave candidata del modelo.
+- No toda columna única debe ser alternate key.
+- Para `Email`, normalmente alcanza con índice único.
