@@ -1,0 +1,304 @@
+---
+title: "Cómo modelar entidades con EF Core y PostgreSQL schemas"
+description: "Guía de reentrada para crear entidades, configurarlas con Fluent API y organizarlas por schemas en cualquier proyecto .NET"
+goal: "Tener una entidad persistida con configuración separada, migración lista y criterio claro para usar schemas"
+tech: ["dotnet", "csharp", "ef-core", "postgresql"]
+tags: ["starter", "entity-framework", "postgresql", "schemas"]
+level: "basico"
+status: "active"
+prerequisites:
+  - ".NET SDK instalado"
+  - "Proyecto .NET ya creado"
+  - "Entity Framework Core y proveedor de PostgreSQL ya configurados"
+  - "DbContext base ya disponible"
+  - "Terminal con acceso a CLI"
+estimatedTime: "20 min"
+updatedAt: 2026-07-16
+createdAt: 2026-07-16
+summary: "Pasos mínimos para pasar de una entidad vacía a una tabla bien mapeada, con Fluent API, clases de configuración y schemas en PostgreSQL"
+related:
+  - "Dotnet project"
+---
+
+import { Code } from "astro:components";
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando ya tenés un proyecto .NET inicializado y querés modelar entidades de forma ordenada, evitando meter toda la configuración dentro del `DbContext`.
+
+Este playbook **no** cubre la creación del proyecto ni la configuración inicial de EF Core o PostgreSQL. Para eso, apoyate en el playbook **[Dotnet Project](/playbooks/dotnet/dotnet-project)**
+
+Qué vas a poder hacer al terminar:
+
+- ✅ Crear una entidad de dominio simple
+- ✅ Separar su configuración con `IEntityTypeConfiguration<TEntity>`
+- ✅ Aplicar configuraciones automáticamente desde el assembly
+- ✅ Mapear la tabla a un schema de PostgreSQL
+- ✅ Dejar lista la migración inicial o incremental
+
+---
+
+## Prerequisitos
+
+Antes de empezar, verificá que el proyecto ya compila y que la infraestructura base ya existe.
+
+```bash
+dotnet --version
+dotnet build
+```
+
+Deberías contar al menos con:
+
+- Un proyecto .NET funcional
+- Un `DbContext` ya creado
+- EF Core instalado
+- Proveedor de PostgreSQL configurado
+
+> ⚠️ **Importante:** este playbook empieza desde la creación de la entidad. La conexión, el registro del contexto y el provider deben venir resueltos desde el setup inicial.
+
+---
+
+## Paso 1: Crear la entidad
+
+Primero definí la clase con las propiedades del dominio, sin mezclar todavía detalles de persistencia.
+
+```csharp
+public class User
+{
+    public Guid Id { get; set; }
+    public string Email { get; set; } = null!;
+    public string PasswordHash { get; set; } = null!;
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+La idea es que la entidad represente el dato que realmente se guarda. Por eso, si el valor persistido es un hash, conviene llamarlo `PasswordHash` y no `Password`.
+
+> ⚠️ **Truco que siempre conviene recordar:** nombrá la propiedad según el dato persistido, no según el dato que llega desde el request.
+
+---
+
+## Paso 2: Registrar la entidad en el DbContext
+
+Incluir un `DbSet<T>` hace que EF Core considere la clase como parte del modelo y permita consultarla y persistirla.
+
+```csharp
+public DbSet<User> Users => Set<User>();
+```
+
+Si tu contexto ya tiene otras entidades, simplemente agregá una más. No hace falta poner configuración de columnas en este punto.
+
+---
+
+## Paso 3: Crear la configuración con IEntityTypeConfiguration
+
+Cuando el proyecto crece, poner toda la configuración en `OnModelCreating` vuelve el `DbContext` difícil de leer. EF Core permite mover la configuración de cada entidad a una clase separada implementando `IEntityTypeConfiguration<TEntity>`.
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        builder.HasKey(x => x.Id);
+
+        builder.Property(x => x.Email)
+            .IsRequired()
+            .HasMaxLength(255);
+
+        builder.Property(x => x.PasswordHash)
+            .IsRequired()
+            .HasMaxLength(255);
+
+        builder.Property(x => x.CreatedAt)
+            .IsRequired();
+    }
+}
+```
+
+Esta separación tiene dos ventajas:
+
+- Mantiene el `DbContext` pequeño y enfocado.
+- Hace más fácil encontrar la configuración de una entidad puntual.
+
+---
+
+## Paso 4: Aplicar las configuraciones automáticamente
+
+EF Core puede escanear el assembly y aplicar todas las clases `IEntityTypeConfiguration<TEntity>` que encuentre, sin registrarlas una por una.
+
+```csharp
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    modelBuilder.ApplyConfigurationsFromAssembly(typeof(AppDbContext).Assembly);
+}
+```
+
+Esto significa que cuando agregues una nueva configuración como `CategoryConfiguration` o `ExpenseConfiguration`, no tendrás que tocar de nuevo `OnModelCreating` mientras esté en el mismo assembly.
+
+> ⚠️ **Error frecuente:** crear la clase `XConfiguration` pero olvidar aplicarla. Esta línea evita justamente ese problema.
+
+---
+
+## Paso 5: Usar schemas en PostgreSQL
+
+En bases relacionales, las tablas se crean en el schema por defecto a menos que se indique otro. EF Core permite mapear una entidad a un schema específico usando `ToTable("Tabla", "schema")`.
+
+```csharp
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        builder.ToTable("Users", "identity");
+
+        builder.HasKey(x => x.Id);
+
+        builder.Property(x => x.Email)
+            .IsRequired()
+            .HasMaxLength(255);
+
+        builder.Property(x => x.PasswordHash)
+            .IsRequired()
+            .HasMaxLength(255);
+
+        builder.Property(x => x.CreatedAt)
+            .IsRequired();
+
+        builder.HasIndex(x => x.Email)
+            .IsUnique();
+    }
+}
+```
+
+### Cuándo usar schemas
+
+Usá schemas cuando quieras agrupar tablas por módulo o contexto funcional. Algunos ejemplos útiles:
+
+- `identity` para usuarios, sesiones y credenciales
+- `finance` para movimientos, presupuestos y cuentas
+- `gym` para rutinas, ejercicios y progreso
+
+La idea general no es separar por capas técnicas como `services` o `repositories`, sino por áreas de negocio. Los schemas viven en la base de datos, así que suele tener más sentido que reflejen módulos del dominio.
+
+---
+
+## Paso 6: Crear la migración
+
+Una vez creada la entidad y su configuración, generá la migración.
+
+```bash
+dotnet ef migrations add AddUserEntity
+
+# o
+
+dotnet ef migrations add AddUserEntity \
+  --project ceres.infrastructure \ # dónde viven el DbContext y las migraciones
+  --startup-project ceres.api \ # dónde está la app que arranca y tiene la configuración de EF Core
+  --output-dir Persistence/Migrations # dónde se guardan los archivos de migración
+```
+
+Después aplicala:
+
+```bash
+dotnet ef database update
+
+# o
+
+dotnet ef database update \
+  --project ceres.infrastructure \
+  --startup-project ceres.api
+```
+
+Si configuraste `ToTable("Users", "identity")`, la migración debería crear tanto el schema como la tabla dentro de ese schema.
+
+---
+
+## Paso 7: Verificar el resultado
+
+Revisá que la entidad quedó bien representada en base de datos:
+
+- Existe el schema esperado.
+- Existe la tabla en ese schema.
+- Las columnas tienen el tipo correcto.
+- Los campos obligatorios quedaron como `NOT NULL`.
+- Los índices y restricciones únicas se crearon correctamente.
+
+Ejemplo esperado para este caso:
+
+- `identity.Users`
+- `Email` obligatorio y único
+- `PasswordHash` obligatorio
+- `CreatedAt` obligatorio
+
+---
+
+## Estructura sugerida
+
+Una estructura mínima y ordenada suele verse así:
+
+```text
+MiProyecto/
+├─ Domain/
+│  └─ Entities/
+│     └─ User.cs
+├─ Infrastructure/
+│  └─ Persistence/
+│     ├─ AppDbContext.cs
+│     └─ Configurations/
+│        └─ UserConfiguration.cs
+└─ Migrations/
+```
+
+No es obligatorio usar exactamente estos nombres, pero sí conviene mantener una separación clara entre:
+
+- entidad de dominio
+- contexto
+- configuración
+- migraciones
+
+---
+
+## Errores comunes
+
+| Error                                            | Causa                                                | Solución                                                         |
+| ------------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------------------------- |
+| La tabla se crea en `public` y no en otro schema | Faltó `ToTable("Tabla", "schema")`                   | Definir explícitamente el schema en la configuración             |
+| La configuración no se aplica                    | Existe la clase `Configuration`, pero no se registra | Usar `ApplyConfigurationsFromAssembly(...)` en `OnModelCreating` |
+| La entidad no aparece en migraciones             | No está incluida en el modelo                        | Agregar `DbSet<TEntity>` o mapearla explícitamente               |
+| El `DbContext` se volvió muy grande              | Toda la configuración está inline                    | Mover cada entidad a `IEntityTypeConfiguration<TEntity>`         |
+| Nombres raros o muy acoplados                    | Se nombró según el request y no según persistencia   | Ajustar nombres a la realidad del dato guardado                  |
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Relaciones entre entidades (`HasOne`, `HasMany`)
+- [ ] Convenciones de nombres para tablas y columnas
+- [ ] Índices compuestos
+- [ ] Auditoría (`CreatedAt`, `UpdatedAt`)
+- [ ] Separar múltiples módulos en distintos schemas
+- [ ] Decidir si conviene un solo `DbContext` o varios bounded contexts
+
+---
+
+## Ejemplo aplicado
+
+En un proyecto como Ceres, esta guía podría traducirse así:
+
+- `User` en schema `identity`
+- `Expense` en schema `finance`
+- `Workout` en schema `gym`
+
+Ese ejemplo sirve para visualizar el patrón, pero la misma idea aplica a cualquier sistema donde quieras que la base refleje módulos funcionales de forma clara.
+
+---
+
+## Links útiles
+
+- [Modeling in EF Core](https://learn.microsoft.com/en-us/ef/core/modeling/)
+- [IEntityTypeConfiguration\<TEntity\>](https://learn.microsoft.com/en-us/dotnet/api/microsoft.entityframeworkcore.ientitytypeconfiguration-1?view=efcore-10.0)
+- [ApplyConfigurationsFromAssembly](https://learn.microsoft.com/es-es/dotnet/api/microsoft.entityframeworkcore.modelbuilder.applyconfigurationsfromassembly?view=efcore-10.0)
+- [Entity types y schemas en EF Core](https://learn.microsoft.com/en-us/ef/core/modeling/entity-types)
