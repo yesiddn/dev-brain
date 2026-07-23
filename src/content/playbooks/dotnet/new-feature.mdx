@@ -1,0 +1,921 @@
+---
+title: "Guía general para implementar una feature backend en .NET Minimal APIs"
+description: "Playbook práctico para construir una feature completa: contrato HTTP, DTOs, repositorio, servicio, endpoint, validación y manejo global de errores"
+goal: "Tener una feature backend funcional, consistente y mantenible desde la persistencia hasta el endpoint"
+tech: ["dotnet", "csharp", "aspnetcore", "minimal-api", "efcore", "postgresql"]
+tags:
+  [
+    "backend",
+    "webapi",
+    "minimal-api",
+    "architecture",
+    "validation",
+    "error-handling",
+  ]
+level: "medio"
+status: "active"
+prerequisites:
+  - ".NET SDK instalado"
+  - "Editor o IDE con soporte para C#"
+  - "Conocimientos básicos de HTTP, DI y EF Core"
+  - "Base de datos configurada si la feature persiste información"
+estimatedTime: "45-90 min"
+updatedAt: 2026-07-22
+createdAt: 2026-07-22
+summary: "Guía paso a paso para implementar una feature backend completa en .NET Minimal APIs, desde contratos y repositorios hasta errores globales"
+related: []
+---
+
+import { Code } from "astro:components";
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando necesitás implementar una feature backend de forma ordenada y querés evitar mezclar lógica HTTP, negocio y persistencia.
+
+Esta guía sirve para casos como:
+
+- Registro de usuarios
+- Creación de categorías
+- Alta de cuentas
+- Creación de transacciones
+- Cualquier caso de uso tipo `POST`, `PUT`, `PATCH` o incluso `GET` con reglas de negocio
+
+Qué vas a poder hacer al terminar:
+
+- ✅ Diseñar el contrato HTTP de una feature
+- ✅ Separar DTOs, entidades, servicios y repositorios
+- ✅ Implementar un endpoint con Minimal APIs
+- ✅ Validar requests automáticamente
+- ✅ Responder errores de negocio con `409`
+- ✅ Responder JSON consistente ante body inválido o excepciones globales
+
+---
+
+## Principio base
+
+Antes de escribir código, definí qué responsabilidad tiene cada capa:
+
+```text
+HTTP Request
+   |
+   v
+Endpoint
+   |
+   v
+Service
+   |
+   v
+Repository
+   |
+   v
+Database
+```
+
+Regla mental:
+
+- **Endpoint**: traduce HTTP
+- **Service**: coordina el caso de uso
+- **Repository**: habla con la base de datos
+- **Entity**: representa el modelo persistente
+- **DTO**: representa contratos de entrada y salida
+
+Si una capa empieza a saber demasiado de otra, probablemente estás mezclando responsabilidades.
+
+---
+
+## Paso 1: Definir el contrato HTTP
+
+Antes de crear clases, respondé estas preguntas:
+
+1. ¿Qué ruta y método HTTP va a tener la feature?
+2. ¿Qué recibe el body?
+3. ¿Qué responde en éxito?
+4. ¿Qué errores esperados puede devolver?
+5. ¿Qué datos nunca deben salir en la respuesta?
+
+Ejemplo mental:
+
+```text
+POST /api/auth/register
+
+Request:
+- email
+- password
+
+Response 201:
+- id
+- email
+- createdAt
+
+Response 400:
+- body inválido
+- validación fallida
+
+Response 409:
+- email ya existe
+```
+
+> **Regla importante:**  
+> No devuelvas entidades de dominio directamente. Devolvé un DTO de respuesta explícito.
+
+---
+
+## Paso 2: Crear DTOs de request y response
+
+Creá DTOs separados para entrada y salida.  
+No uses la entidad de base de datos como contrato HTTP.
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+
+namespace MyApp.Application.DTOs.Auth;
+
+public sealed class RegisterRequest
+{
+    [Required(ErrorMessage = "Email is required.")]
+    [EmailAddress(ErrorMessage = "Email format is invalid.")]
+    public string? Email { get; init; }
+
+    [Required(ErrorMessage = "Password is required.")]
+    [MinLength(8, ErrorMessage = "Password must be at least 8 characters.")]
+    public string? Password { get; init; }
+}
+```
+
+```csharp
+namespace MyApp.Application.DTOs.Auth;
+
+public sealed class RegisterResponse
+{
+    public required Guid Id { get; init; }
+    public required string Email { get; init; }
+    public DateTime CreatedAt { get; init; }
+}
+```
+
+### Por qué así
+
+- `Request` representa datos externos, por eso debe validar campos.
+- `Response` representa únicamente datos públicos.
+- `string?` en el request permite que el pipeline de validación detecte faltantes y produzca un `400` claro.
+- `required` expresa intención en C#, pero no reemplaza la validación HTTP.
+
+---
+
+## Paso 3: Modelar la entidad
+
+La entidad representa lo que persiste la aplicación, no lo que el cliente envía ni recibe.
+
+```csharp
+namespace MyApp.Domain.Entities;
+
+public sealed class User
+{
+    public Guid Id { get; private set; }
+    public string Email { get; private set; } = null!;
+    public string PasswordHash { get; private set; } = null!;
+    public DateTime CreatedAt { get; private set; }
+
+    private User() { }
+
+    public User(string email, string passwordHash)
+    {
+        Email = email;
+        PasswordHash = passwordHash;
+    }
+}
+```
+
+### Qué aprender acá
+
+- La entidad guarda `PasswordHash`, no `Password`.
+- La fecha `CreatedAt` puede venir de la base de datos.
+- Un constructor o factory ayuda a proteger invariantes básicas.
+- La entidad no debería saber nada de HTTP.
+
+---
+
+## Paso 4: Decidir dónde asignar `CreatedAt`
+
+Tenés dos opciones, pero para datos de auditoría suele convenir que la base de datos sea la fuente de verdad.
+
+### Opción recomendada: generado por DB
+
+Configuración con EF Core:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using MyApp.Domain.Entities;
+
+namespace MyApp.Infrastructure.Persistence.Configurations;
+
+public sealed class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        builder.Property(user => user.CreatedAt)
+            .HasColumnType("timestamp with time zone")
+            .HasDefaultValueSql("CURRENT_TIMESTAMP")
+            .ValueGeneratedOnAdd();
+
+        builder.HasIndex(user => user.Email)
+            .IsUnique();
+    }
+}
+```
+
+### Por qué suele ser mejor
+
+- La base de datos define cuándo se creó realmente el registro.
+- Evita diferencias horarias entre servidores.
+- Protege la consistencia incluso si mañana insertás datos desde otro proceso.
+- El índice único sobre email evita duplicados concurrentes.
+
+---
+
+## Paso 5: Crear el repositorio
+
+El repositorio encapsula consultas y persistencia.  
+No devuelve `IResult`, no lanza respuestas HTTP y no hace hashing.
+
+### Interfaz
+
+```csharp
+using MyApp.Domain.Entities;
+
+namespace MyApp.Application.Interfaces;
+
+public interface IUserRepository
+{
+    Task<bool> ExistsByEmailAsync(
+        string email,
+        CancellationToken cancellationToken = default);
+
+    Task AddAsync(
+        User user,
+        CancellationToken cancellationToken = default);
+}
+```
+
+### Implementación
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using MyApp.Application.Interfaces;
+using MyApp.Domain.Entities;
+using MyApp.Infrastructure.Persistence;
+
+namespace MyApp.Infrastructure.Repositories;
+
+public sealed class UserRepository(AppDbContext dbContext) : IUserRepository
+{
+    public Task<bool> ExistsByEmailAsync(
+        string email,
+        CancellationToken cancellationToken = default)
+    {
+        return dbContext.Users
+            .AnyAsync(user => user.Email == email, cancellationToken);
+    }
+
+    public async Task AddAsync(
+        User user,
+        CancellationToken cancellationToken = default)
+    {
+        await dbContext.Users.AddAsync(user, cancellationToken);
+        await dbContext.SaveChangesAsync(cancellationToken);
+    }
+}
+```
+
+### Mejores prácticas
+
+- Diseñá métodos según el caso de uso, no con CRUD genérico por defecto.
+- Pasá siempre `CancellationToken`.
+- Dejá que la base de datos aplique la restricción única.
+- El repositorio no valida reglas de negocio como “email ya registrado”; solo consulta y persiste.
+
+---
+
+## Paso 6: Crear un mapper simple
+
+Usá mappers solo para transformar datos.  
+No metas lógica de persistencia ni lógica HTTP ahí.
+
+```csharp
+using MyApp.Application.DTOs.Auth;
+using MyApp.Domain.Entities;
+
+namespace MyApp.Application.Mappers;
+
+public static class UserMapper
+{
+    public static User ToEntity(
+        this RegisterRequest request,
+        string passwordHash)
+    {
+        return new User(
+            email: request.Email!,
+            passwordHash: passwordHash);
+    }
+
+    public static RegisterResponse ToResponse(this User user)
+    {
+        return new RegisterResponse
+        {
+            Id = user.Id,
+            Email = user.Email,
+            CreatedAt = user.CreatedAt
+        };
+    }
+}
+```
+
+### Regla importante
+
+El mapper no debe copiar `request.Password` hacia `PasswordHash`.  
+El hash lo genera el servicio y recién después se construye la entidad.
+
+---
+
+## Paso 7: Encapsular el hashing
+
+La contraseña no debe hashearse en el endpoint ni en el repositorio.  
+La responsabilidad correcta es del servicio, idealmente a través de una abstracción.
+
+### Interfaz
+
+```csharp
+namespace MyApp.Application.Interfaces;
+
+public interface IPasswordHasher
+{
+    string Hash(string password);
+    bool Verify(string password, string passwordHash);
+}
+```
+
+### Implementación con BCrypt
+
+Primero instalá el paquete:
+
+```bash
+dotnet add package BCrypt.Net-Next
+```
+
+Luego implementá el adaptador:
+
+```csharp
+using BCrypt.Net;
+using MyApp.Application.Interfaces;
+
+namespace MyApp.Infrastructure.Security;
+
+public sealed class PasswordHasher : IPasswordHasher
+{
+    private const int PasswordWorkFactor = 11;
+
+    public string Hash(string password)
+    {
+        return BCrypt.HashPassword(password, workFactor: PasswordWorkFactor);
+    }
+
+    public bool Verify(string password, string passwordHash)
+    {
+        return BCrypt.Verify(password, passwordHash);
+    }
+}
+```
+
+### Qué hay que entender
+
+- Nunca guardes el password en texto plano.
+- Nunca compares contraseñas con `==`.
+- `BCrypt` ya maneja salt.
+- El `workFactor` define cuán costoso es calcular cada hash.
+- Elegí el `workFactor` midiendo tiempos en tu entorno, no por intuición.
+
+---
+
+## Paso 8: Diseñar el resultado del caso de uso
+
+No todo error debe ser una excepción.  
+Para resultados esperados del negocio, suele ser más claro un **result type**.
+
+### Ejemplo
+
+```csharp
+namespace MyApp.Application.DTOs.Auth;
+
+public enum RegisterStatus
+{
+    Success,
+    EmailAlreadyExists
+}
+```
+
+```csharp
+namespace MyApp.Application.DTOs.Auth;
+
+public sealed record RegisterResult(
+    RegisterStatus Status,
+    RegisterResponse? User = null);
+```
+
+### Cuándo usar result type
+
+Usalo para casos esperados:
+
+- Email duplicado
+- Recurso no encontrado
+- Estado inválido del negocio predecible
+
+### Cuándo usar excepciones
+
+Usalas para casos inesperados o verdaderamente excepcionales:
+
+- La base de datos está caída
+- Hubo un timeout
+- Se rompió una regla interna no prevista
+- Ocurrió un bug
+
+> **Regla práctica:**  
+> Si el cliente puede provocar normalmente esa situación y vos esperás manejarla, probablemente no debería ser una excepción.
+
+---
+
+## Paso 9: Crear el servicio
+
+El servicio coordina el caso de uso.  
+No responde HTTP directamente.
+
+### Interfaz
+
+```csharp
+using MyApp.Application.DTOs.Auth;
+
+namespace MyApp.Application.Interfaces;
+
+public interface IAuthService
+{
+    Task<RegisterResult> RegisterAsync(
+        RegisterRequest registerRequest,
+        CancellationToken cancellationToken = default);
+}
+```
+
+### Implementación
+
+```csharp
+using MyApp.Application.DTOs.Auth;
+using MyApp.Application.Interfaces;
+using MyApp.Application.Mappers;
+
+namespace MyApp.Application.Services;
+
+public sealed class AuthService(
+    IUserRepository userRepository,
+    IPasswordHasher passwordHasher) : IAuthService
+{
+    public async Task<RegisterResult> RegisterAsync(
+        RegisterRequest registerRequest,
+        CancellationToken cancellationToken = default)
+    {
+        var exists = await userRepository.ExistsByEmailAsync(
+            registerRequest.Email!,
+            cancellationToken);
+
+        if (exists)
+        {
+            return new RegisterResult(RegisterStatus.EmailAlreadyExists);
+        }
+
+        var passwordHash = passwordHasher.Hash(registerRequest.Password!);
+
+        var user = registerRequest.ToEntity(passwordHash);
+
+        await userRepository.AddAsync(user, cancellationToken);
+
+        return new RegisterResult(
+            RegisterStatus.Success,
+            user.ToResponse());
+    }
+}
+```
+
+### Por qué este orden
+
+1. Consultar duplicado primero evita hashear innecesariamente.
+2. El servicio genera el hash porque es parte del caso de uso.
+3. La entidad se crea cuando ya tenés los datos correctos.
+4. El mapper a response se ejecuta después de guardar, cuando ya existen `Id` y `CreatedAt`.
+
+---
+
+## Paso 10: Registrar dependencias en DI
+
+Con EF Core, `DbContext` suele registrarse como `scoped`, así que repositorios y servicios que dependan de él también deben ser `scoped`.
+
+### Registro por capa
+
+```csharp
+using MyApp.Application.Interfaces;
+using MyApp.Application.Services;
+
+namespace MyApp.Api.Extensions;
+
+public static class ApplicationServiceCollectionExtensions
+{
+    public static IServiceCollection AddApplicationServices(
+        this IServiceCollection services)
+    {
+        services.AddScoped<IAuthService, AuthService>();
+
+        return services;
+    }
+}
+```
+
+```csharp
+using MyApp.Application.Interfaces;
+using MyApp.Infrastructure.Repositories;
+using MyApp.Infrastructure.Security;
+
+namespace MyApp.Infrastructure.DependencyInjection;
+
+public static class InfrastructureServiceRegistration
+{
+    public static IServiceCollection AddInfrastructureServices(
+        this IServiceCollection services)
+    {
+        services.AddScoped<IUserRepository, UserRepository>();
+        services.AddScoped<IPasswordHasher, PasswordHasher>();
+
+        return services;
+    }
+}
+```
+
+### Regla de lifetimes
+
+- `Scoped`: servicios por request, ideal para `DbContext`, repositorios y servicios de aplicación.
+- `Singleton`: solo para objetos seguros para concurrencia y sin dependencia de `DbContext`.
+- `Transient`: para servicios chicos, sin estado y sin necesidad de compartir instancia.
+
+> **Error común:**  
+> No inyectes un servicio `scoped` dentro de un `singleton`.
+
+---
+
+## Paso 11: Activar validación automática
+
+En .NET moderno, Minimal APIs puede validar automáticamente los DTOs con Data Annotations.
+
+### Program.cs
+
+```csharp
+builder.Services.AddValidation();
+```
+
+### Qué te resuelve
+
+Si el request trae:
+
+- `email` faltante
+- `email` con formato inválido
+- `password` faltante
+- `password` con menos de 8 caracteres
+
+el pipeline puede responder `400 Bad Request` automáticamente, antes de entrar al endpoint.
+
+> **Importante:**  
+> Esto valida reglas de entrada.  
+> No reemplaza reglas de negocio como “ese email ya está registrado”.
+
+---
+
+## Paso 12: Crear un contrato HTTP de error
+
+Si querés respuestas chicas y consistentes para conflictos o errores custom, definí un DTO de error.
+
+```csharp
+namespace MyApp.Api.Contracts.Common;
+
+public sealed record ErrorResponse(
+    string Error,
+    string? Field = null);
+```
+
+Esto es útil para respuestas como:
+
+```json
+{
+  "error": "Email already registered",
+  "field": "email"
+}
+```
+
+---
+
+## Paso 13: Crear el endpoint con Minimal APIs
+
+El endpoint traduce el resultado del servicio a respuestas HTTP.
+
+```csharp
+using Microsoft.AspNetCore.Http.HttpResults;
+using MyApp.Api.Contracts.Common;
+using MyApp.Application.DTOs.Auth;
+using MyApp.Application.Interfaces;
+
+namespace MyApp.Api.Endpoints.Identity;
+
+public static class AuthEndpoints
+{
+    public static RouteGroupBuilder MapAuthEndpoints(this RouteGroupBuilder api)
+    {
+        var group = api.MapGroup("/auth")
+            .WithTags("Authentication");
+
+        group.MapPost("/register", RegisterAsync)
+            .WithName("Register")
+            .Produces<RegisterResponse>(StatusCodes.Status201Created)
+            .Produces(StatusCodes.Status400BadRequest)
+            .Produces<ErrorResponse>(StatusCodes.Status409Conflict)
+            .WithSummary("Registers a new user")
+            .WithDescription("Registers a new user");
+
+        return api;
+    }
+
+    private static async Task<Results<
+        Created<RegisterResponse>,
+        Conflict<ErrorResponse>>>
+        RegisterAsync(
+            RegisterRequest request,
+            IAuthService authService,
+            CancellationToken cancellationToken)
+    {
+        var result = await authService.RegisterAsync(
+            request,
+            cancellationToken);
+
+        return result.Status switch
+        {
+            RegisterStatus.Success => TypedResults.Created(
+                "/api/auth/register",
+                result.User!),
+
+            RegisterStatus.EmailAlreadyExists => TypedResults.Conflict(
+                new ErrorResponse(
+                    Error: "Email already registered",
+                    Field: "email")),
+
+            _ => throw new InvalidOperationException(
+                $"Unknown registration status: {result.Status}")
+        };
+    }
+}
+```
+
+### Qué debe hacer el endpoint
+
+- Recibir el DTO
+- Inyectar el servicio
+- Delegar el caso de uso
+- Traducir el resultado a HTTP
+- Nada más
+
+### Qué no debe hacer
+
+- Hashear
+- Consultar la base de datos
+- Crear `DbContext`
+- Armar SQL
+- Validar duplicados directamente
+
+---
+
+## Paso 14: Mapear endpoints en Program.cs
+
+Una forma limpia es agrupar todos los endpoints bajo `/api`.
+
+```csharp
+var api = app.MapGroup("/api");
+
+api.MapAuthEndpoints();
+```
+
+Esto permite que cada módulo cree subgrupos (`/auth`, `/accounts`, etc.) sin que `Program.cs` quede lleno de rutas.
+
+---
+
+## Paso 15: Manejar errores globales
+
+Hay errores que ocurren antes de llegar al endpoint, por ejemplo:
+
+- JSON mal formado
+- Tipos incompatibles en el body (`password: 123` cuando esperabas string)
+- Errores inesperados no controlados
+
+Para responder JSON consistente, agregá un manejador global.
+
+### Registro
+
+```csharp
+builder.Services.AddProblemDetails();
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+```
+
+### Middleware
+
+```csharp
+app.UseExceptionHandler();
+```
+
+### Implementación
+
+```csharp
+using Microsoft.AspNetCore.Diagnostics;
+using MyApp.Api.Contracts.Common;
+
+namespace MyApp.Api.Exceptions;
+
+public sealed class GlobalExceptionHandler : IExceptionHandler
+{
+    public async ValueTask<bool> TryHandleAsync(
+        HttpContext httpContext,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        if (exception is BadHttpRequestException)
+        {
+            httpContext.Response.StatusCode = StatusCodes.Status400BadRequest;
+
+            await httpContext.Response.WriteAsJsonAsync(
+                new ErrorResponse("Invalid request body."),
+                cancellationToken);
+
+            return true;
+        }
+
+        httpContext.Response.StatusCode = StatusCodes.Status500InternalServerError;
+
+        await httpContext.Response.WriteAsJsonAsync(
+            new ErrorResponse("An unexpected error occurred."),
+            cancellationToken);
+
+        return true;
+    }
+}
+```
+
+### Por qué esto importa
+
+Sin handler global, un body JSON inválido puede terminar mostrando trazas o respuestas inconsistentes, especialmente en desarrollo.  
+Con un manejador global, el cliente recibe siempre un JSON controlado.
+
+---
+
+## Paso 16: Diferenciar tipos de error
+
+Es clave entender que no todos los errores nacen en el mismo lugar.
+
+| Caso                  | Etapa                 | Respuesta típica |
+| --------------------- | --------------------- | ---------------- |
+| JSON mal formado      | Deserialización       | 400              |
+| Tipo inválido en body | Deserialización       | 400              |
+| Campo faltante        | Validación de DTO     | 400              |
+| Email ya registrado   | Regla de negocio      | 409              |
+| Excepción inesperada  | Infraestructura / bug | 500              |
+
+Pensarlo así te ayuda a no intentar resolver todo desde el endpoint.
+
+---
+
+## Paso 17: Pruebas mínimas manuales
+
+Antes de cerrar la feature, probá al menos estos escenarios:
+
+### Caso feliz
+
+```json
+{
+  "email": "test@example.com",
+  "password": "12345678"
+}
+```
+
+Esperado:
+
+- `201 Created`
+- Body con `id`, `email`, `createdAt`
+- Sin `password` ni `passwordHash`
+
+### Email duplicado
+
+Mismo request dos veces.
+
+Esperado:
+
+- segunda respuesta `409 Conflict`
+
+### Email inválido
+
+```json
+{
+  "email": "no-es-email",
+  "password": "12345678"
+}
+```
+
+Esperado:
+
+- `400 Bad Request`
+
+### Password corta
+
+```json
+{
+  "email": "test@example.com",
+  "password": "123"
+}
+```
+
+Esperado:
+
+- `400 Bad Request`
+
+### Tipo inválido
+
+```json
+{
+  "email": "test@example.com",
+  "password": 12345678
+}
+```
+
+Esperado:
+
+- `400 Bad Request`
+- JSON consistente desde el handler global
+
+### Persistencia real
+
+Verificá en la base de datos que:
+
+- el usuario fue guardado
+- `CreatedAt` fue generado correctamente
+- la contraseña está hasheada
+- el índice único de email funciona
+
+---
+
+## Checklist final
+
+- [ ] El request está separado de la entidad
+- [ ] El response no expone datos sensibles
+- [ ] El repositorio solo persiste y consulta
+- [ ] El servicio coordina el caso de uso
+- [ ] El endpoint solo traduce HTTP
+- [ ] El password se guarda hasheado
+- [ ] La DB protege la unicidad
+- [ ] La validación automática responde `400`
+- [ ] El conflicto de negocio responde `409`
+- [ ] El body inválido responde JSON consistente
+- [ ] Las dependencias están registradas con el lifetime correcto
+
+---
+
+## Errores comunes
+
+| Error                                        | Causa                             | Solución                                                |
+| -------------------------------------------- | --------------------------------- | ------------------------------------------------------- |
+| Guardar `request.Password` en `PasswordHash` | Se mezcló DTO con entidad         | Generar el hash en el servicio                          |
+| Validar duplicado solo en código             | Falta unicidad real en DB         | Crear índice único                                      |
+| El endpoint hace demasiadas cosas            | Lógica de negocio en la capa HTTP | Mover coordinación al servicio                          |
+| `BadHttpRequestException` muestra traza      | Falta handler global              | Registrar `AddExceptionHandler` y `UseExceptionHandler` |
+| `CreatedAt` cambia según servidor            | Se asigna en app con hora local   | Preferir valor generado por DB                          |
+| `Singleton` con `DbContext`                  | Lifetime incorrecto               | Usar `Scoped`                                           |
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Cuándo usar `ProblemDetails` en vez de DTO propio
+- [ ] Cómo traducir excepciones de PostgreSQL por índice único a un `409`
+- [ ] Cómo usar `CreatedAtRoute` cuando ya exista un `GET /resource/{id}`
+- [ ] Cómo escribir tests de integración para endpoints Minimal API
+- [ ] Cómo medir el `workFactor` de BCrypt en tu entorno
+
+---
+
+## Links útiles
+
+- [Minimal APIs: route handlers](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/minimal-apis/route-handlers?view=aspnetcore-10.0)
+- [Minimal APIs: responses](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/minimal-apis/responses?view=aspnetcore-10.0)
+- [Error handling in ASP.NET Core APIs](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/error-handling-api?view=aspnetcore-10.0)
+- [ProblemDetails](https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.mvc.problemdetails?view=aspnetcore-10.0)
+- [Dependency injection in ASP.NET Core](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/dependency-injection?view=aspnetcore-10.0)
+- [EF Core generated values](https://learn.microsoft.com/en-us/ef/core/modeling/generated-properties)
+- [Npgsql value generation](https://www.npgsql.org/efcore/modeling/generated-properties.html)
