@@ -4,7 +4,8 @@ import BaseLayout from '../layouts/BaseLayout.astro';
 import SideBar from '../components/SideBar.astro';
 
 const recent = [
-  ...await getCollection('playbooks', ({ data }) => data.status === 'active')
+  ...await getCollection('playbooks', ({ data }) => data.status === 'active'),
+  ...await getCollection('concepts', ({ data }) => data.status === 'active')
 ].sort((a, b) =>
   new Date(b.data.updatedAt).getTime() - new Date(a.data.updatedAt).getTime()
 ).slice(0, 8);
