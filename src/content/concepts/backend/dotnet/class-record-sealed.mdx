@@ -1,0 +1,411 @@
+---
+title: "class, record y sealed en C#"
+description: "Qué diferencias hay entre class y record, cuándo usar cada uno y para qué sirve sealed"
+tech: ["dotnet", "csharp"]
+tags: ["csharp", "poo", "records", "sealed", "dto"]
+level: "medio"
+status: "active"
+updatedAt: 2026-07-26
+summary: "En C#, record se usa principalmente para datos, class para objetos con identidad o comportamiento, y sealed para impedir herencia"
+related: []
+---
+
+## En una línea
+
+> **`record`** suele usarse para modelos orientados a datos, **`class`** para objetos con identidad o comportamiento, y **`sealed`** para indicar que una clase no debe heredarse.
+
+## Por qué importa
+
+Elegir entre `class` y `record` no es solo sintaxis.
+Define cómo se compara un objeto, qué intención comunica el tipo y qué tan cómodo será de mantener en tu arquitectura.
+
+Si usas el tipo incorrecto, el código puede seguir funcionando, pero el modelo queda menos claro.
+Y cuando vuelvas meses después, esa claridad importa mucho más que ahorrar dos líneas.
+
+## La diferencia base
+
+### `class`
+
+Una `class` representa un objeto que normalmente tiene al menos una de estas características:
+
+- Identidad propia
+- Estado mutable
+- Comportamiento
+- Ciclo de vida dentro del sistema
+
+Ejemplo:
+
+```csharp
+public class User
+{
+    public Guid Id { get; set; }
+    public string Email { get; set; } = string.Empty;
+    public string PasswordHash { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+Este `User` no es solo una bolsa de datos.
+Representa una entidad del dominio, vive en base de datos, tiene identidad (`Id`) y forma parte del ciclo de vida de la aplicación.
+
+### `record`
+
+Un `record` está pensado principalmente para representar datos.
+Su intención suele ser: “este tipo existe para transportar o describir información”.
+
+Ejemplo:
+
+```csharp
+public record UserDto(
+    Guid Id,
+    string Email,
+    DateTime CreatedAt
+);
+```
+
+Acá `UserDto` no representa una entidad del dominio.
+Solo representa el contrato de datos que vas a devolver o mover entre capas.
+
+## Diferencia importante: igualdad
+
+### En una `class`, la igualdad por defecto es por referencia
+
+```csharp
+public class UserDtoClass
+{
+    public Guid Id { get; set; }
+    public string Email { get; set; } = string.Empty;
+}
+```
+
+```csharp
+var a = new UserDtoClass { Id = id, Email = "test@test.com" };
+var b = new UserDtoClass { Id = id, Email = "test@test.com" };
+
+Console.WriteLine(a == b); // false
+```
+
+Aunque tengan los mismos valores, son dos objetos distintos en memoria.
+
+### En un `record`, la igualdad por defecto es por valor
+
+```csharp
+public record UserDtoRecord(Guid Id, string Email);
+```
+
+```csharp
+var a = new UserDtoRecord(id, "test@test.com");
+var b = new UserDtoRecord(id, "test@test.com");
+
+Console.WriteLine(a == b); // true
+```
+
+Eso hace que los `record` sean muy cómodos para DTOs, responses, results y objetos de configuración pequeños.
+
+## Cuándo usar `class`
+
+Usa `class` cuando el tipo:
+
+- Tiene identidad propia
+- Tiene comportamiento además de datos
+- Es una entidad de dominio
+- Va a ser manejado por EF Core
+- Necesita mutar con naturalidad
+- No quieres comunicar semántica de “solo datos”
+
+Ejemplos comunes:
+
+- `User`
+- `Account`
+- `Transaction`
+- `RefreshToken`
+- `AuthService`
+- `UserRepository`
+
+Ejemplo:
+
+```csharp
+public class Account
+{
+    public Guid Id { get; set; }
+    public Guid UserId { get; set; }
+    public decimal Balance { get; set; }
+
+    public void Deposit(decimal amount)
+    {
+        if (amount <= 0)
+            throw new ArgumentException("Amount must be greater than zero.");
+
+        Balance += amount;
+    }
+}
+```
+
+Acá claramente hay comportamiento.
+No es solo un contenedor de datos.
+
+## Cuándo usar `record`
+
+Usa `record` cuando el tipo:
+
+- Es un DTO
+- Representa request/response
+- Representa resultados simples
+- Sirve para mover datos entre capas
+- Te beneficia compararlo por valor
+- Quieres un modelo pequeño y expresivo
+
+Ejemplos comunes:
+
+- `AuthResponse`
+- `UserDto`
+- `LoginResult`
+- `RegisterResult`
+
+Ejemplo:
+
+```csharp
+public record AuthResponse(
+    string AccessToken,
+    int ExpiresIn,
+    UserDto User
+);
+```
+
+Esto expresa muy bien la intención:
+no hay lógica de dominio aquí, solo datos de salida.
+
+## Ojo con los request DTOs
+
+Aunque `record` suele ser muy bueno para DTOs, en los **request DTOs** muchas veces conviene usar `class`.
+
+¿Por qué?
+
+Porque con `class` las validaciones con DataAnnotations se leen más fácil y son más directas, especialmente en ASP.NET Core.
+Con `record` también se puede, pero la sintaxis y el targeting de atributos puede ser menos obvio.
+
+Ejemplo recomendado para request:
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+
+public sealed class LoginRequest
+{
+    [Required(ErrorMessage = "Email is required.")]
+    [EmailAddress(ErrorMessage = "Email format is invalid.")]
+    public string Email { get; set; } = null!;
+
+    [Required(ErrorMessage = "Password is required.")]
+    public string Password { get; set; } = null!;
+}
+```
+
+Regla práctica útil:
+
+- Request DTOs: `sealed class`
+- Response DTOs: `record`
+- Entidades: `class`
+
+No es una ley absoluta, pero como convención es muy sana y clara.
+
+## Qué hace `sealed`
+
+`sealed` significa que una clase **no puede heredarse**.
+
+Ejemplo:
+
+```csharp
+public sealed class AuthService
+{
+}
+```
+
+Esto impide hacer algo como:
+
+```csharp
+public class CustomAuthService : AuthService
+{
+}
+```
+
+## Cuándo usar `sealed`
+
+Usa `sealed` cuando:
+
+- No quieres que una clase sea base de otras
+- La clase representa una implementación final
+- Quieres evitar extensiones por herencia
+- La herencia no forma parte del diseño
+
+Es muy común usarlo en:
+
+- Servicios
+- Repositories
+- DTOs de request como convención
+- Clases concretas que no fueron diseñadas para extenderse
+
+Ejemplo:
+
+```csharp
+public sealed class AuthService : IAuthService
+{
+    // implementación
+}
+```
+
+La idea es simple:
+si la clase no fue diseñada para ser heredada, es mejor dejarlo explícito.
+
+## `sealed` no significa inmutable
+
+Esto es importante.
+
+`sealed` **solo bloquea la herencia**.
+No vuelve a la clase inmutable, no la hace más segura automáticamente y no cambia cómo se comparan sus instancias.
+
+Por ejemplo, esto sigue siendo mutable:
+
+```csharp
+public sealed class LoginRequest
+{
+    public string Email { get; set; } = string.Empty;
+}
+```
+
+Así que no mezcles estos conceptos:
+
+- `record` → intención de datos y comparación por valor
+- `class` → identidad o comportamiento
+- `sealed` → no permitir herencia
+
+## Ejemplos aplicados a Ceres
+
+### Entidad de dominio
+
+```csharp
+public class User
+{
+    public Guid Id { get; set; }
+    public string Email { get; set; } = string.Empty;
+    public string PasswordHash { get; set; } = string.Empty;
+    public DateTime CreatedAt { get; set; }
+}
+```
+
+Acá usar `class` tiene sentido porque `User` es una entidad persistida.
+
+### Request DTO
+
+```csharp
+public sealed class RegisterRequest
+{
+    [Required(ErrorMessage = "Email is required.")]
+    [EmailAddress(ErrorMessage = "Email format is invalid.")]
+    public string Email { get; set; } = null!;
+
+    [Required(ErrorMessage = "Password is required.")]
+    [MinLength(8, ErrorMessage = "Password must be at least 8 characters.")]
+    public string Password { get; set; } = null!;
+}
+```
+
+Acá `sealed class` tiene sentido por claridad y validación.
+
+### Response DTO
+
+```csharp
+public record UserDto(
+    Guid Id,
+    string Email,
+    DateTime CreatedAt
+);
+```
+
+Acá `record` comunica muy bien que es solo un contrato de salida.
+
+### Servicio
+
+```csharp
+public sealed class AuthService : IAuthService
+{
+    private readonly IUserRepository _userRepository;
+    private readonly IPasswordHasher _passwordHasher;
+
+    public AuthService(IUserRepository userRepository, IPasswordHasher passwordHasher)
+    {
+        _userRepository = userRepository;
+        _passwordHasher = passwordHasher;
+    }
+}
+```
+
+Acá `sealed class` tiene sentido porque es una implementación concreta del servicio.
+
+## Regla mental rápida
+
+Si dudas entre `class` y `record`, pregúntate esto:
+
+### 1. ¿Este tipo representa una entidad real del sistema?
+
+Si sí, normalmente usa `class`.
+
+### 2. ¿Este tipo solo transporta datos?
+
+Si sí, normalmente usa `record`.
+
+### 3. ¿Este tipo es un request con DataAnnotations?
+
+Si sí, normalmente usa `sealed class`.
+
+### 4. ¿Quiero permitir herencia?
+
+Si no, considera `sealed`.
+
+## Convención recomendada
+
+Una convención simple y práctica para proyectos como este:
+
+| Tipo                 | Recomendación                              |
+| -------------------- | ------------------------------------------ |
+| Entidades de dominio | `class`                                    |
+| Servicios            | `sealed class`                             |
+| Repositories         | `sealed class`                             |
+| Request DTOs         | `sealed class`                             |
+| Response DTOs        | `record`                                   |
+| Result DTOs          | `record`                                   |
+| Options / config     | `sealed class` o `record`, según comodidad |
+
+## Errores comunes
+
+### 1. Usar `record` para todo
+
+No todo en C# debe ser `record`.
+Si una clase tiene identidad, comportamiento o persistencia, probablemente `class` comunica mejor.
+
+### 2. Pensar que `sealed` mejora todo
+
+`sealed` no hace mágica una clase.
+Solo expresa que no quieres herencia.
+
+### 3. Confundir DTO con entidad
+
+Un `UserDto` no es un `User`.
+Uno es contrato de datos; el otro es parte del dominio.
+
+### 4. Elegir por moda y no por intención
+
+La mejor elección no es la más moderna.
+Es la que comunica mejor qué rol cumple ese tipo en tu sistema.
+
+## En resumen
+
+- `class` se usa mejor para entidades y objetos con comportamiento o identidad
+- `record` se usa mejor para datos y contratos entre capas
+- `sealed` se usa para impedir herencia cuando no forma parte del diseño
+
+La clave no es memorizar reglas rígidas.
+La clave es que el tipo elegido comunique bien la intención del modelo.
+
+---
+
+_Relacionado: [DTOs y contratos de API](#) · [Entidades vs DTOs](#) · [Arquitectura por capas en .NET](#)_
