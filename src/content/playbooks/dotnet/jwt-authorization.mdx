@@ -1,0 +1,1330 @@
+---
+title: "JWT en ASP.NET Core: login, registro y configuración segura"
+description: "Guía paso a paso para implementar autenticación JWT con Minimal APIs, capas, DTOs consistentes y validación de configuración."
+goal: "Tener endpoints de registro y login que devuelvan un access token JWT y datos básicos del usuario."
+tech: ["dotnet", "csharp", "aspnet-core", "minimal-api", "jwt"]
+tags: ["authentication", "authorization", "security", "jwt", "backend"]
+level: "medio"
+status: "active"
+prerequisites:
+  - ".NET SDK instalado"
+  - "Proyecto ASP.NET Core Web API o Minimal API"
+  - "Sistema de persistencia de usuarios ya creado"
+  - "Entidad User con Id, Email, PasswordHash y CreatedAt"
+  - "Servicio de hash de contraseñas, por ejemplo BCrypt"
+estimatedTime: "2 a 4 horas"
+updatedAt: 2026-07-26
+createdAt: 2026-07-26
+summary: "Implementación paso a paso de autenticación JWT: configuración tipada, registro, login, generación de tokens y protección futura de rutas."
+related:
+  - "Refresh tokens"
+  - "Logout y revocación de tokens"
+  - "Autorización basada en claims"
+---
+
+## Contexto
+
+> **¿Cuándo usar esta guía?**  
+> Cuando necesitas implementar autenticación propia basada en email y contraseña en una API .NET, sin depender de un proveedor externo de identidad.
+
+Al terminar tendrás:
+
+- Registro que crea un usuario y lo deja autenticado inmediatamente.
+- Login con email y contraseña.
+- Access token JWT firmado y con expiración corta.
+- Respuesta consistente para `register` y `login`.
+- Claims mínimos de identidad: `UserId` y `Email`.
+- Validación de JWT preparada para endpoints protegidos.
+- Configuración segura mediante variables de entorno.
+- Mitigación básica contra _user enumeration_ por tiempo de respuesta.
+
+Esta guía usa **Ceres** como ejemplo: una API de finanzas personales con arquitectura:
+
+```text
+Endpoints → Services → Repositories
+```
+
+La idea aplica igual a otros proyectos. Solo cambia los nombres de carpetas, namespaces y entidades.
+
+---
+
+## Conceptos antes de empezar
+
+### Autenticación vs autorización
+
+- **Autenticación:** responde “¿quién es este usuario?”. Ocurre al hacer registro o login.
+- **Autorización:** responde “¿este usuario puede acceder a este recurso?”. Ocurre al proteger una ruta con autorización.
+
+Ejemplo:
+
+```text
+POST /api/auth/login
+```
+
+Autentica al usuario y devuelve un token.
+
+```text
+GET /api/accounts
+```
+
+Autoriza el acceso: valida el token y obtiene la identidad del usuario.
+
+---
+
+### Qué es un JWT
+
+Un JWT (_JSON Web Token_) es una cadena firmada que representa una identidad durante un tiempo limitado.
+
+El frontend lo envía después en cada petición protegida:
+
+```http
+Authorization: Bearer <access-token>
+```
+
+El backend valida:
+
+1. Que el token tenga una firma válida.
+2. Que no haya expirado.
+3. Que haya sido emitido por el `Issuer` esperado.
+4. Que esté dirigido al `Audience` esperado.
+
+> Un JWT firmado no está cifrado por defecto. No pongas información sensible, hashes de contraseña, datos financieros ni secretos dentro de sus claims.
+
+---
+
+## Decisiones de diseño
+
+Para una primera versión de autenticación, usar:
+
+| Decisión                           | Elección                    | Por qué                                                                                                   |
+| ---------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Algoritmo                          | HMAC-SHA256                 | Simple para una API propia y usa una clave secreta compartida                                             |
+| Duración del access token          | 15 minutos                  | Reduce el impacto si un token se filtra                                                                   |
+| Claims                             | `UserId`, `Email`           | Son suficientes para identificar al usuario                                                               |
+| Refresh token                      | No por ahora                | Agrega persistencia, rotación y revocación; puede ir en una issue futura                                  |
+| Logout en backend                  | No por ahora                | JWT es stateless; revocarlo antes de expirar requiere una blocklist                                       |
+| Respuesta de registro              | Usuario + token             | El usuario queda autenticado al registrarse                                                               |
+| Respuesta de login                 | Usuario + token             | Mantiene un contrato consistente                                                                          |
+| Almacenamiento inicial en frontend | Decisión futura documentada | `localStorage` es simple, pero tiene riesgo ante XSS; `httpOnly cookies` reducen XSS pero introducen CSRF |
+
+---
+
+## Estructura sugerida
+
+Una organización posible para una arquitectura por capas:
+
+```text
+src/
+├─ MyProject.Api/
+│  ├─ Endpoints/
+│  │  └─ AuthEndpoints.cs
+│  ├─ Program.cs
+│  └─ appsettings.json
+│
+├─ MyProject.Application/
+│  └─ Identity/
+│     ├─ DTOs/
+│     │  ├─ LoginRequest.cs
+│     │  ├─ RegisterRequest.cs
+│     │  ├─ UserDto.cs
+│     │  ├─ AuthResponse.cs
+│     │  ├─ LoginResult.cs
+│     │  └─ RegisterResult.cs
+│     ├─ Enums/
+│     │  ├─ LoginStatus.cs
+│     │  └─ RegisterStatus.cs
+│     ├─ Interfaces/
+│     │  ├─ IAuthService.cs
+│     │  ├─ IUserRepository.cs
+│     │  └─ IPasswordHasher.cs
+│     ├─ Mappers/
+│     │  └─ UserMapper.cs
+│     ├─ Options/
+│     │  └─ JwtOptions.cs
+│     └─ Services/
+│        └─ AuthService.cs
+│
+├─ MyProject.Domain/
+│  └─ Identity/
+│     └─ Entities/
+│        └─ User.cs
+│
+└─ MyProject.Infrastructure/
+   └─ Repositories/
+      └─ UserRepository.cs
+```
+
+### Por qué `JwtOptions` va en Application
+
+`Program.cs` necesita la configuración para registrar el handler JWT y `AuthService` necesita esos valores para firmar tokens.
+
+Si `JwtOptions` vive en el proyecto API, `Application` tendría que depender de `Api`, lo cual invierte la dirección sana de dependencias.
+
+Por eso, una ubicación razonable es:
+
+```text
+MyProject.Application/Identity/Options/JwtOptions.cs
+```
+
+> `Application` define el contrato de configuración que necesita. `Api` es responsable de leer `appsettings.json` y conectarlo mediante DI.
+
+---
+
+## Paso 1: Instalar JWT Bearer
+
+Desde el proyecto de API:
+
+```bash
+dotnet add package Microsoft.AspNetCore.Authentication.JwtBearer
+```
+
+Este paquete cumple dos funciones:
+
+- Permite configurar cómo se validarán JWT en el pipeline HTTP.
+- Lee automáticamente el header `Authorization: Bearer <token>` cuando una ruta requiera autenticación.
+
+Aunque al inicio solo estés generando tokens en login y registro, conviene dejar preparada su validación desde el comienzo.
+
+---
+
+## Paso 2: Generar una SecretKey segura
+
+JWT con HMAC-SHA256 usa una clave simétrica: la misma clave firma y valida tokens.
+
+Genera una clave aleatoria de al menos 32 bytes:
+
+```bash
+openssl rand -base64 32
+```
+
+Alternativa hexadecimal:
+
+```bash
+openssl rand -hex 32
+```
+
+Alternativa desde C#:
+
+```csharp
+using System.Security.Cryptography;
+
+var secretKey = Convert.ToBase64String(
+    RandomNumberGenerator.GetBytes(32)
+);
+
+Console.WriteLine(secretKey);
+```
+
+### Reglas para la clave
+
+- No inventes una frase manualmente.
+- No reutilices la misma clave de desarrollo en producción.
+- No subas secretos reales al repositorio.
+- Usa una clave de al menos 32 caracteres; idealmente 32 bytes de entropía real.
+- Si cambias la clave en producción, los tokens emitidos con la anterior dejan de ser válidos.
+
+---
+
+## Paso 3: Crear la configuración JWT
+
+En `appsettings.json`:
+
+```json
+{
+  "Jwt": {
+    "Issuer": "myproject-api",
+    "Audience": "myproject-frontend",
+    "SecretKey": "DEV_ONLY_replace_with_a_real_generated_key"
+  }
+}
+```
+
+### Significado de cada valor
+
+| Valor       | Significado                                           |
+| ----------- | ----------------------------------------------------- |
+| `Issuer`    | Quién emite el token; normalmente tu API              |
+| `Audience`  | Quién debe consumir el token; normalmente tu frontend |
+| `SecretKey` | Clave privada usada para firmar y validar el token    |
+
+### Sobrescribir desde variables de entorno
+
+En producción no deberías depender del valor del archivo de configuración. Usa variables de entorno:
+
+```bash
+export Jwt__Issuer="myproject-api"
+export Jwt__Audience="myproject-frontend"
+export Jwt__SecretKey="your-real-production-secret-key"
+```
+
+En .NET, `__` representa `:` dentro de una clave jerárquica:
+
+```text
+Jwt__SecretKey → Jwt:SecretKey
+```
+
+Así la variable de entorno sobrescribe el valor definido en `appsettings.json`.
+
+---
+
+## Paso 4: Crear `JwtOptions`
+
+Crea el archivo:
+
+```text
+MyProject.Application/Identity/Options/JwtOptions.cs
+```
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+
+namespace myproject.application.Identity.Options;
+
+public sealed class JwtOptions
+{
+    public const string SectionName = "Jwt";
+
+    [Required(ErrorMessage = "Jwt:Issuer is required.")]
+    public string Issuer { get; init; } = string.Empty;
+
+    [Required(ErrorMessage = "Jwt:Audience is required.")]
+    public string Audience { get; init; } = string.Empty;
+
+    [Required(ErrorMessage = "Jwt:SecretKey is required.")]
+    [MinLength(32, ErrorMessage = "Jwt:SecretKey must be at least 32 characters long.")]
+    public string SecretKey { get; init; } = string.Empty;
+}
+```
+
+### Por qué no usar `!`
+
+Esto es peligroso:
+
+```csharp
+var secretKey = configuration["Jwt:SecretKey"]!;
+```
+
+El operador `!` no evita valores nulos. Solo silencia una advertencia del compilador.
+
+Si la configuración no existe, el error ocurre más tarde y suele ser menos claro.
+
+Con `JwtOptions`, validas la configuración al arrancar la aplicación, no durante el login ni cuando ya estás atendiendo tráfico.
+
+---
+
+## Paso 5: Registrar y validar opciones
+
+En `Program.cs`, antes de `builder.Build()`:
+
+```csharp
+using myproject.application.Identity.Options;
+
+builder.Services
+    .AddOptions<JwtOptions>()
+    .Bind(builder.Configuration.GetRequiredSection(JwtOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
+```
+
+### Qué hace cada línea
+
+| Código                      | Responsabilidad                          |
+| --------------------------- | ---------------------------------------- |
+| `AddOptions<JwtOptions>()`  | Registra la clase de configuración en DI |
+| `Bind(...)`                 | Mapea la sección `Jwt` a `JwtOptions`    |
+| `GetRequiredSection(...)`   | Falla si la sección `Jwt` no existe      |
+| `ValidateDataAnnotations()` | Ejecuta `[Required]` y `[MinLength]`     |
+| `ValidateOnStart()`         | Valida al iniciar, no en el primer login |
+
+Si falta un valor, la API no iniciará y mostrará un error de configuración entendible.
+
+Esto es deseable: una API no debería operar si no puede firmar tokens correctamente.
+
+---
+
+## Paso 6: Configurar JWT Bearer
+
+En el mismo `Program.cs`, después de registrar `JwtOptions`:
+
+```csharp
+using System.Text;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.Extensions.Options;
+using myproject.application.Identity.Options;
+
+var jwtOptions = builder.Configuration
+    .GetRequiredSection(JwtOptions.SectionName)
+    .Get<JwtOptions>()
+    ?? throw new InvalidOperationException("Jwt configuration is missing.");
+
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+
+            ValidIssuer = jwtOptions.Issuer,
+            ValidAudience = jwtOptions.Audience,
+
+            IssuerSigningKey = new SymmetricSecurityKey(
+                Encoding.UTF8.GetBytes(jwtOptions.SecretKey)),
+
+            ClockSkew = TimeSpan.Zero
+        };
+    });
+
+builder.Services.AddAuthorization();
+```
+
+### Qué valida el backend
+
+| Validación                  | Evita                                         |
+| --------------------------- | --------------------------------------------- |
+| `ValidateIssuer`            | Tokens emitidos por otro sistema              |
+| `ValidateAudience`          | Tokens destinados a otra aplicación           |
+| `ValidateLifetime`          | Tokens expirados                              |
+| `ValidateIssuerSigningKey`  | Tokens modificados o firmados con otra clave  |
+| `ClockSkew = TimeSpan.Zero` | Minutos adicionales de tolerancia por defecto |
+
+> Para una API de aprendizaje, `ClockSkew = TimeSpan.Zero` hace que los tokens expiren exactamente cuando declaras. En sistemas distribuidos, podrías requerir una pequeña tolerancia por diferencias de reloj entre servidores.
+
+---
+
+## Paso 7: Agregar middlewares
+
+Después de crear la aplicación:
+
+```csharp
+var app = builder.Build();
+```
+
+agrega:
+
+```csharp
+app.UseAuthentication();
+app.UseAuthorization();
+```
+
+El orden es importante:
+
+```csharp
+app.UseAuthentication();
+app.UseAuthorization();
+
+// Registrar endpoints después
+app.MapAuthEndpoints();
+
+app.Run();
+```
+
+### Por qué el orden importa
+
+- `UseAuthentication()` intenta leer el bearer token y construir `HttpContext.User`.
+- `UseAuthorization()` decide si ese usuario puede entrar a una ruta protegida.
+
+Si autorización corre primero, todavía no hay una identidad autenticada.
+
+---
+
+## Paso 8: Diseñar DTOs consistentes
+
+Registro y login hacen cosas distintas internamente, pero ambos terminan con la misma necesidad del frontend:
+
+```text
+“Tengo un usuario autenticado y necesito su token.”
+```
+
+Por eso deben responder el mismo contrato.
+
+### `UserDto.cs`
+
+```csharp
+namespace myproject.application.Identity.DTOs;
+
+public sealed record UserDto(
+    Guid Id,
+    string Email,
+    DateTime CreatedAt
+);
+```
+
+Este DTO contiene únicamente datos seguros y básicos del usuario.
+
+No incluyas:
+
+- `PasswordHash`
+- Tokens de refresh sin necesidad
+- Datos internos de auditoría
+- Roles o permisos si el frontend todavía no los requiere
+
+---
+
+### `AuthResponse.cs`
+
+```csharp
+namespace myproject.application.Identity.DTOs;
+
+public sealed record AuthResponse(
+    string AccessToken,
+    int ExpiresIn,
+    UserDto User
+);
+```
+
+Ejemplo de respuesta JSON:
+
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+  "expiresIn": 900,
+  "user": {
+    "id": "e5a33b2b-7fcb-4bf3-9e82-646b4cab67f7",
+    "email": "user@example.com",
+    "createdAt": "2026-07-26T18:00:00Z"
+  }
+}
+```
+
+`ExpiresIn` representa segundos:
+
+```text
+15 minutos × 60 segundos = 900 segundos
+```
+
+---
+
+### `LoginRequest.cs`
+
+```csharp
+namespace myproject.application.Identity.DTOs;
+
+public sealed record LoginRequest(
+    string Email,
+    string Password
+);
+```
+
+---
+
+### `RegisterRequest.cs`
+
+```csharp
+using System.ComponentModel.DataAnnotations;
+
+namespace myproject.application.Identity.DTOs;
+
+public sealed class RegisterRequest
+{
+    [Required(ErrorMessage = "Email is required.")]
+    [EmailAddress(ErrorMessage = "Email format is invalid.")]
+    public string Email { get; set; } = null!;
+
+    [Required(ErrorMessage = "Password is required.")]
+    [MinLength(8, ErrorMessage = "Password must be at least 8 characters.")]
+    public string Password { get; set; } = null!;
+}
+```
+
+> Si tu proyecto usa validación manual en endpoints, puedes usar `record` en ambos requests. Si usas atributos de `DataAnnotations`, una clase como la anterior es una opción clara.
+
+---
+
+## Paso 9: Crear resultados internos del servicio
+
+Los resultados internos no tienen por qué ser iguales a las respuestas HTTP. Su responsabilidad es informar al endpoint del resultado de la operación.
+
+### Estados de registro
+
+```csharp
+namespace myproject.application.Identity.Enums;
+
+public enum RegisterStatus
+{
+    Success,
+    EmailAlreadyExists
+}
+```
+
+### `RegisterResult.cs`
+
+```csharp
+using myproject.application.Identity.Enums;
+
+namespace myproject.application.Identity.DTOs;
+
+public sealed record RegisterResult(
+    RegisterStatus Status,
+    AuthResponse? Auth = null
+);
+```
+
+### Estados de login
+
+```csharp
+namespace myproject.application.Identity.Enums;
+
+public enum LoginStatus
+{
+    Success,
+    InvalidCredentials
+}
+```
+
+### `LoginResult.cs`
+
+```csharp
+using myproject.application.Identity.Enums;
+
+namespace myproject.application.Identity.DTOs;
+
+public sealed record LoginResult(
+    LoginStatus Status,
+    AuthResponse? Auth = null
+);
+```
+
+### Por qué usar resultados internos
+
+El endpoint necesita tomar decisiones HTTP:
+
+| Resultado del servicio | Respuesta HTTP                             |
+| ---------------------- | ------------------------------------------ |
+| Email ya existe        | `409 Conflict`                             |
+| Credenciales inválidas | `401 Unauthorized`                         |
+| Registro/login exitoso | `200 OK` o `201 Created` según tu contrato |
+
+El servicio no necesita conocer `Results.Conflict()` o `Results.Unauthorized()`. Eso mantiene la capa de aplicación independiente de HTTP.
+
+---
+
+## Paso 10: Actualizar el mapper
+
+El mapper transforma objetos entre capas.
+
+En este caso hay tres transformaciones útiles:
+
+1. `RegisterRequest` a `User`.
+2. `User` a `UserDto`.
+3. `User + token` a `AuthResponse`.
+
+```csharp
+using myproject.application.Identity.DTOs;
+using myproject.domain.Identity.Entities;
+
+namespace myproject.application.Identity.Mappers;
+
+public static class UserMapper
+{
+    public static User ToEntity(
+        this RegisterRequest request,
+        string passwordHash)
+    {
+        return new User
+        {
+            Email = request.Email,
+            PasswordHash = passwordHash
+        };
+    }
+
+    public static UserDto ToDto(this User user)
+    {
+        return new UserDto(
+            Id: user.Id,
+            Email: user.Email,
+            CreatedAt: user.CreatedAt
+        );
+    }
+
+    public static AuthResponse ToAuthResponse(
+        this User user,
+        string accessToken,
+        int expiresIn)
+    {
+        return new AuthResponse(
+            AccessToken: accessToken,
+            ExpiresIn: expiresIn,
+            User: user.ToDto()
+        );
+    }
+}
+```
+
+### ¿Debo crear más mappers?
+
+No automáticamente.
+
+Crea un mapper cuando exista una transformación repetida o cuando el mapeo ayude a expresar el límite entre capas.
+
+En este caso:
+
+- `User → UserDto`: sí es reutilizable.
+- `User + token → AuthResponse`: sí evita duplicar código en login y registro.
+- `LoginRequest → algo`: no es necesario; no se transforma directamente en entidad.
+- `AuthResponse → ...`: no es necesario por ahora.
+
+Evita crear mappers vacíos o uno por cada clase. Un mapper debe simplificar una transformación real.
+
+---
+
+## Paso 11: Preparar el hash dummy
+
+Si el email no existe, no debes devolver la respuesta inmediatamente.
+
+Este flujo es inseguro:
+
+```csharp
+if (user is null)
+{
+    return new LoginResult(LoginStatus.InvalidCredentials);
+}
+```
+
+Es más rápido que verificar una contraseña real. Un atacante podría medir diferencias de latencia e inferir cuáles emails están registrados.
+
+La mitigación básica es verificar contra un hash BCrypt dummy.
+
+Genera un hash una vez:
+
+```csharp
+using BCrypt.Net;
+
+var dummyHash = BCrypt.HashPassword(
+    "dummy-password-not-used-by-any-user",
+    workFactor: 12
+);
+
+Console.WriteLine(dummyHash);
+```
+
+Guarda el resultado como constante:
+
+```csharp
+private const string DummyPasswordHash =
+    "$2a$12$REPLACE_WITH_A_REAL_GENERATED_BCRYPT_HASH";
+```
+
+### Reglas para el hash dummy
+
+- No debe pertenecer a un usuario real.
+- Debe ser un hash BCrypt válido.
+- Debe usar el mismo `workFactor` que el registro.
+- No hace falta rotarlo frecuentemente.
+- No reemplaza otros controles de seguridad; solo reduce una señal de timing evidente.
+
+---
+
+## Paso 12: Generar el token en `AuthService`
+
+`AuthService` recibe las dependencias que necesita:
+
+- `IPasswordHasher`: hashea y verifica contraseñas.
+- `IUserRepository`: consulta y persiste usuarios.
+- `IOptions<JwtOptions>`: recibe configuración JWT validada.
+
+```csharp
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Text;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using myproject.application.Identity.DTOs;
+using myproject.application.Identity.Enums;
+using myproject.application.Identity.Interfaces;
+using myproject.application.Identity.Mappers;
+using myproject.application.Identity.Options;
+using myproject.domain.Identity.Entities;
+
+namespace myproject.application.Identity.Services;
+
+public sealed class AuthService(
+    IPasswordHasher passwordHasher,
+    IUserRepository userRepository,
+    IOptions<JwtOptions> jwtOptions) : IAuthService
+{
+    private const int AccessTokenLifetimeSeconds = 900;
+
+    private const string DummyPasswordHash =
+        "$2a$12$REPLACE_WITH_A_REAL_GENERATED_BCRYPT_HASH";
+
+    private readonly JwtOptions _jwtOptions = jwtOptions.Value;
+
+    public async Task<RegisterResult> RegisterAsync(
+        RegisterRequest registerRequest,
+        CancellationToken cancellationToken = default)
+    {
+        var existingUser = await userRepository.FindByEmailAsync(
+            registerRequest.Email,
+            cancellationToken);
+
+        if (existingUser is not null)
+        {
+            return new RegisterResult(RegisterStatus.EmailAlreadyExists);
+        }
+
+        var passwordHash = passwordHasher.Hash(registerRequest.Password);
+
+        var newUser = registerRequest.ToEntity(passwordHash);
+
+        await userRepository.AddAsync(newUser, cancellationToken);
+
+        var accessToken = GenerateJwtToken(newUser);
+
+        return new RegisterResult(
+            RegisterStatus.Success,
+            newUser.ToAuthResponse(
+                accessToken,
+                AccessTokenLifetimeSeconds));
+    }
+
+    public async Task<LoginResult> LoginAsync(
+        LoginRequest loginRequest,
+        CancellationToken cancellationToken = default)
+    {
+        var user = await userRepository.FindByEmailAsync(
+            loginRequest.Email,
+            cancellationToken);
+
+        if (user is null)
+        {
+            passwordHasher.Verify(
+                loginRequest.Password,
+                DummyPasswordHash);
+
+            return new LoginResult(LoginStatus.InvalidCredentials);
+        }
+
+        var isPasswordValid = passwordHasher.Verify(
+            loginRequest.Password,
+            user.PasswordHash);
+
+        if (!isPasswordValid)
+        {
+            return new LoginResult(LoginStatus.InvalidCredentials);
+        }
+
+        var accessToken = GenerateJwtToken(user);
+
+        return new LoginResult(
+            LoginStatus.Success,
+            user.ToAuthResponse(
+                accessToken,
+                AccessTokenLifetimeSeconds));
+    }
+
+    private string GenerateJwtToken(User user)
+    {
+        var claims = new[]
+        {
+            new Claim("UserId", user.Id.ToString()),
+            new Claim("Email", user.Email)
+        };
+
+        var securityKey = new SymmetricSecurityKey(
+            Encoding.UTF8.GetBytes(_jwtOptions.SecretKey));
+
+        var credentials = new SigningCredentials(
+            securityKey,
+            SecurityAlgorithms.HmacSha256);
+
+        var token = new JwtSecurityToken(
+            issuer: _jwtOptions.Issuer,
+            audience: _jwtOptions.Audience,
+            claims: claims,
+            expires: DateTime.UtcNow.AddSeconds(
+                AccessTokenLifetimeSeconds),
+            signingCredentials: credentials);
+
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+}
+```
+
+---
+
+## Paso 13: Revisar el repositorio
+
+El servicio necesita buscar al usuario por email.
+
+Interfaz:
+
+```csharp
+using myproject.domain.Identity.Entities;
+
+namespace myproject.application.Identity.Interfaces;
+
+public interface IUserRepository
+{
+    Task<User?> FindByEmailAsync(
+        string email,
+        CancellationToken cancellationToken = default);
+
+    Task AddAsync(
+        User user,
+        CancellationToken cancellationToken = default);
+}
+```
+
+Implementación de ejemplo con EF Core:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using myproject.application.Identity.Interfaces;
+using myproject.domain.Identity.Entities;
+
+namespace myproject.infrastructure.Repositories.Identity;
+
+public sealed class UserRepository(AppDbContext context) : IUserRepository
+{
+    public async Task<User?> FindByEmailAsync(
+        string email,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedEmail = email.Trim().ToLowerInvariant();
+
+        return await context.Users.FirstOrDefaultAsync(
+            user => user.Email == normalizedEmail,
+            cancellationToken);
+    }
+
+    public async Task AddAsync(
+        User user,
+        CancellationToken cancellationToken = default)
+    {
+        await context.Users.AddAsync(user, cancellationToken);
+        await context.SaveChangesAsync(cancellationToken);
+    }
+}
+```
+
+> Define desde el inicio una estrategia consistente para normalizar emails. Si guardas en minúsculas, busca en minúsculas. Idealmente también agrega un índice único en la base de datos.
+
+---
+
+## Paso 14: Registrar dependencias
+
+En `Program.cs`, registra las implementaciones concretas:
+
+```csharp
+builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddScoped<IUserRepository, UserRepository>();
+builder.Services.AddScoped<IPasswordHasher, PasswordHasher>();
+```
+
+La vida `Scoped` es adecuada cuando el repositorio depende de un `DbContext`, ya que ambos viven durante una request HTTP.
+
+---
+
+## Paso 15: Crear el endpoint de registro
+
+El endpoint tiene responsabilidades HTTP:
+
+- Recibir el body.
+- Validar formato de entrada.
+- Delegar al servicio.
+- Convertir el resultado de negocio en una respuesta HTTP.
+
+```csharp
+using myproject.application.Identity.DTOs;
+using myproject.application.Identity.Enums;
+using myproject.application.Identity.Interfaces;
+
+namespace myproject.api.Endpoints;
+
+public static class AuthEndpoints
+{
+    public static IEndpointRouteBuilder MapAuthEndpoints(
+        this IEndpointRouteBuilder app)
+    {
+        var authGroup = app.MapGroup("/api/auth");
+
+        authGroup.MapPost("/register", RegisterAsync);
+        authGroup.MapPost("/login", LoginAsync);
+
+        return app;
+    }
+
+    private static async Task<IResult> RegisterAsync(
+        RegisterRequest request,
+        IAuthService authService,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(request.Email))
+        {
+            return Results.BadRequest(new
+            {
+                error = "Email is required.",
+                field = "email"
+            });
+        }
+
+        if (string.IsNullOrWhiteSpace(request.Password))
+        {
+            return Results.BadRequest(new
+            {
+                error = "Password is required.",
+                field = "password"
+            });
+        }
+
+        var result = await authService.RegisterAsync(
+            request,
+            cancellationToken);
+
+        return result.Status switch
+        {
+            RegisterStatus.EmailAlreadyExists => Results.Conflict(new
+            {
+                error = "An account with this email already exists.",
+                field = "email"
+            }),
+
+            RegisterStatus.Success => Results.Ok(result.Auth),
+
+            _ => Results.Problem(
+                title: "Unexpected registration result.",
+                statusCode: StatusCodes.Status500InternalServerError)
+        };
+    }
+}
+```
+
+### ¿`200 OK` o `201 Created` al registrar?
+
+Ambas decisiones pueden ser defendibles:
+
+- Usa `201 Created` si tu prioridad es comunicar que se creó un recurso.
+- Usa `200 OK` si tu contrato prioriza que el resultado es una autenticación exitosa con token.
+
+Lo importante es que el contrato sea explícito y consistente.
+
+---
+
+## Paso 16: Crear el endpoint de login
+
+Agrega este método en la misma clase de endpoints:
+
+```csharp
+private static async Task<IResult> LoginAsync(
+    LoginRequest request,
+    IAuthService authService,
+    CancellationToken cancellationToken)
+{
+    if (string.IsNullOrWhiteSpace(request.Email))
+    {
+        return Results.BadRequest(new
+        {
+            error = "Email is required.",
+            field = "email"
+        });
+    }
+
+    if (string.IsNullOrWhiteSpace(request.Password))
+    {
+        return Results.BadRequest(new
+        {
+            error = "Password is required.",
+            field = "password"
+        });
+    }
+
+    var result = await authService.LoginAsync(
+        request,
+        cancellationToken);
+
+    return result.Status switch
+    {
+        LoginStatus.InvalidCredentials => Results.Unauthorized(),
+
+        LoginStatus.Success => Results.Ok(result.Auth),
+
+        _ => Results.Problem(
+            title: "Unexpected login result.",
+            statusCode: StatusCodes.Status500InternalServerError)
+    };
+}
+```
+
+### Regla clave: no revelar qué falló
+
+Estas respuestas son inseguras:
+
+```json
+{ "error": "Email does not exist." }
+```
+
+```json
+{ "error": "Incorrect password." }
+```
+
+Un atacante podría usar el endpoint para descubrir emails registrados.
+
+Para cualquier credencial incorrecta, devuelve el mismo resultado:
+
+```http
+401 Unauthorized
+```
+
+Si necesitas un body consistente:
+
+```csharp
+return Results.Json(
+    new { error = "Invalid credentials." },
+    statusCode: StatusCodes.Status401Unauthorized);
+```
+
+Evita incluir un `field` en este caso, porque indicaría si el problema fue el email o la contraseña.
+
+---
+
+## Paso 17: Proteger una ruta futura
+
+Una vez JWT Bearer está configurado, proteger rutas es simple.
+
+```csharp
+app.MapGet("/api/accounts", (HttpContext context) =>
+{
+    var userId = context.User.FindFirst("UserId")?.Value;
+
+    return Results.Ok(new
+    {
+        message = "Protected data",
+        userId
+    });
+})
+.RequireAuthorization();
+```
+
+El frontend debe enviar:
+
+```http
+Authorization: Bearer <access-token>
+```
+
+Si no envía token, si está expirado o si su firma no es válida, la API devolverá `401 Unauthorized`.
+
+---
+
+## Paso 18: Leer claims en rutas protegidas
+
+En una ruta protegida, puedes obtener la identidad desde `HttpContext.User`:
+
+```csharp
+app.MapGet("/api/auth/me", (HttpContext context) =>
+{
+    var userId = context.User.FindFirst("UserId")?.Value;
+    var email = context.User.FindFirst("Email")?.Value;
+
+    if (userId is null || email is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    return Results.Ok(new
+    {
+        userId,
+        email
+    });
+})
+.RequireAuthorization();
+```
+
+> El claim del token prueba identidad, pero no reemplaza las verificaciones de ownership. Por ejemplo, al consultar una cuenta financiera, filtra también por `UserId` en la base de datos.
+
+---
+
+## Pruebas manuales
+
+### Registro exitoso
+
+```bash
+curl -X POST http://localhost:5000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "user@example.com",
+    "password": "SecurePassword123!"
+  }'
+```
+
+Respuesta esperada:
+
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+  "expiresIn": 900,
+  "user": {
+    "id": "e5a33b2b-7fcb-4bf3-9e82-646b4cab67f7",
+    "email": "user@example.com",
+    "createdAt": "2026-07-26T18:00:00Z"
+  }
+}
+```
+
+---
+
+### Email duplicado
+
+```bash
+curl -X POST http://localhost:5000/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "user@example.com",
+    "password": "AnotherPassword123!"
+  }'
+```
+
+Respuesta esperada:
+
+```http
+409 Conflict
+```
+
+```json
+{
+  "error": "An account with this email already exists.",
+  "field": "email"
+}
+```
+
+---
+
+### Login exitoso
+
+```bash
+curl -X POST http://localhost:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "user@example.com",
+    "password": "SecurePassword123!"
+  }'
+```
+
+Respuesta esperada:
+
+```http
+200 OK
+```
+
+con el mismo contrato `AuthResponse`.
+
+---
+
+### Credenciales inválidas
+
+```bash
+curl -X POST http://localhost:5000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "user@example.com",
+    "password": "WrongPassword123!"
+  }'
+```
+
+Respuesta esperada:
+
+```http
+401 Unauthorized
+```
+
+Prueba también con un email inexistente. Debe responder exactamente igual.
+
+---
+
+### Ruta protegida
+
+```bash
+curl http://localhost:5000/api/accounts \
+  -H "Authorization: Bearer TU_ACCESS_TOKEN"
+```
+
+Prueba también:
+
+- Sin header `Authorization`.
+- Con un token modificado.
+- Con un token expirado.
+- Con un token firmado con otra `SecretKey`.
+
+Todos deben fallar con `401 Unauthorized`.
+
+---
+
+## Criterios de aceptación
+
+Marca cada punto al terminar:
+
+- [ ] `POST /api/auth/register` crea un usuario.
+- [ ] Registro devuelve `accessToken`, `expiresIn` y datos básicos del usuario.
+- [ ] `POST /api/auth/login` devuelve el mismo contrato de autenticación.
+- [ ] El JWT contiene `UserId` y `Email`.
+- [ ] El JWT expira en 15 minutos.
+- [ ] El token se firma con HMAC-SHA256.
+- [ ] La API valida issuer, audience, firma y expiración.
+- [ ] `Jwt:SecretKey` puede sobrescribirse con `Jwt__SecretKey`.
+- [ ] La API no inicia si falta configuración JWT obligatoria.
+- [ ] Una `SecretKey` menor a 32 caracteres bloquea el inicio.
+- [ ] Email inexistente y contraseña incorrecta devuelven el mismo `401`.
+- [ ] El caso de usuario inexistente ejecuta `Verify` contra un hash BCrypt dummy.
+- [ ] `UseAuthentication()` aparece antes de `UseAuthorization()`.
+- [ ] Los endpoints protegidos usan `.RequireAuthorization()`.
+
+---
+
+## Errores comunes
+
+| Problema                                        | Causa probable                                                      | Solución                                                                    |
+| ----------------------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `Jwt configuration is missing`                  | No existe la sección `Jwt`                                          | Agrega la sección a `appsettings.json` o define variables de entorno        |
+| La aplicación falla al arrancar por `SecretKey` | La clave está vacía o mide menos de 32 caracteres                   | Genera una clave aleatoria segura                                           |
+| Todos los endpoints protegidos devuelven `401`  | El frontend no está enviando `Authorization: Bearer ...`            | Revisa el header de la petición                                             |
+| Token inválido inmediatamente                   | `Issuer`, `Audience` o `SecretKey` no coinciden al emitir y validar | Usa la misma configuración para `AuthService` y `JwtBearer`                 |
+| Token no expira cuando esperas                  | Existe tolerancia de reloj                                          | Configura `ClockSkew = TimeSpan.Zero` si ese es el comportamiento requerido |
+| `HttpContext.User` no tiene claims              | Falta `UseAuthentication()` o está después de autorización          | Respeta el orden del pipeline                                               |
+| Error al generar token                          | Falta `System.IdentityModel.Tokens.Jwt` o los usings de seguridad   | Revisa referencias y `using`                                                |
+| El email duplicado pasa en concurrencia         | Solo validas antes de insertar                                      | Agrega también un índice único en base de datos                             |
+| Un email inexistente responde más rápido        | Se retorna antes de BCrypt                                          | Verifica contra `DummyPasswordHash` antes de devolver `401`                 |
+| El frontend recibe hash de contraseña           | Se retornó la entidad `User` directamente                           | Usa `UserDto` y `AuthResponse`                                              |
+
+---
+
+## Seguridad y límites
+
+### Lo que esta implementación sí cubre
+
+- Contraseñas almacenadas como hash mediante BCrypt.
+- Tokens firmados.
+- Validación de firma, audiencia, emisor y expiración.
+- Token de vida corta.
+- No revelar si el email existe.
+- Validación temprana de configuración.
+
+### Lo que queda para una siguiente etapa
+
+- [ ] Refresh tokens.
+- [ ] Rotación de refresh tokens.
+- [ ] Revocación o blocklist para logout real.
+- [ ] Rate limiting para frenar intentos masivos de login.
+- [ ] Confirmación de email.
+- [ ] Recuperación de contraseña.
+- [ ] Autorización por roles o permisos.
+- [ ] Registro de eventos de seguridad.
+- [ ] Almacenamiento del token con cookies `httpOnly`.
+- [ ] Pruebas de integración para auth.
+- [ ] Índice único de email y manejo de errores de concurrencia.
+
+---
+
+## Próximos pasos recomendados
+
+1. Implementar un endpoint protegido sencillo, por ejemplo `GET /api/auth/me`.
+2. Crear el primer recurso asociado a usuario, por ejemplo cuentas financieras en Ceres.
+3. Extraer `UserId` del claim y filtrar los datos por ownership.
+4. Agregar pruebas para login correcto, contraseña incorrecta y usuario inexistente.
+5. Crear una issue separada para refresh tokens.
+6. Crear una issue separada para logout y revocación.
+
+> No agregues refresh tokens dentro de la primera issue de login si todavía estás entendiendo JWT. Un access token corto y bien validado es una base correcta antes de incorporar rotación, persistencia y revocación.
