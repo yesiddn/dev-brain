@@ -1,0 +1,2094 @@
+---
+title: "Cómo iniciar un frontend React con TypeScript, Vite y autenticación base"
+description: "Guía de reentrada para montar un frontend React funcional con rutas, formularios, validación, cliente HTTP y estado de autenticación"
+goal: "Tener una aplicación React corriendo localmente, con arquitectura modular y un flujo de login listo para conectarse a una API"
+tech:
+  [
+    "react",
+    "typescript",
+    "vite",
+    "tailwindcss",
+    "axios",
+    "react-hook-form",
+    "zod",
+    "react-router",
+  ]
+tags: ["starter", "setup", "frontend", "authentication", "spa", "architecture"]
+level: "basico"
+status: "draft"
+prerequisites:
+  - "Node.js 20 o superior"
+  - "npm, pnpm o yarn"
+  - "Visual Studio Code o IDE equivalente"
+  - "Conocimientos básicos de React, TypeScript y peticiones HTTP"
+estimatedTime: "45 min"
+updatedAt: 2026-07-30
+createdAt: 2026-07-30
+summary: "Pasos para iniciar una SPA con React, TypeScript y Vite, organizarla por dominio e implementar un flujo de login con Axios, React Hook Form, Zod y React Router"
+related: ["JWT en ASP.NET Core: login, registro y configuración segura"]
+---
+
+import { Code } from "astro:components";
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**
+> Cuando necesitás iniciar una SPA con React y TypeScript que consuma una API, tenga navegación, formularios validados y un estado global básico de autenticación.
+
+Este playbook no busca crear una arquitectura empresarial completa desde el primer día.
+
+El objetivo es construir un primer recorrido vertical funcional:
+
+```text
+Formulario
+    ↓
+Validación
+    ↓
+Servicio del módulo
+    ↓
+Cliente HTTP
+    ↓
+Backend
+    ↓
+Contexto de autenticación
+    ↓
+Navegación
+```
+
+Al terminar vas a poder:
+
+- ✅ Crear un proyecto React con TypeScript y Vite
+- ✅ Configurar Tailwind CSS
+- ✅ Organizar el frontend por dominio
+- ✅ Crear rutas mediante objetos
+- ✅ Definir layouts con rutas anidadas
+- ✅ Consumir una API con Axios
+- ✅ Gestionar formularios con React Hook Form
+- ✅ Validar datos con Zod
+- ✅ Separar Context, Provider y custom hooks
+- ✅ Guardar el access token en estado global
+- ✅ Redirigir al usuario después del login
+- ✅ Manejar errores HTTP como `401 Unauthorized`
+
+---
+
+## Prerequisitos
+
+Verificá que Node.js y npm estén disponibles:
+
+```bash
+node --version
+npm --version
+```
+
+Una versión moderna de Node.js evita incompatibilidades con Vite y sus herramientas de desarrollo.
+
+También es conveniente conocer previamente:
+
+- Componentes funcionales de React
+- Hooks básicos como `useState`
+- Promesas y `async/await`
+- Fundamentos de HTTP
+- Tipos e interfaces de TypeScript
+- Conceptos básicos de JWT
+
+---
+
+## Paso 1: Crear el proyecto
+
+Creá un proyecto React con TypeScript usando Vite:
+
+```bash
+npm create vite@latest frontend -- --template react-ts
+
+cd frontend
+
+npm install
+```
+
+Levantá el servidor:
+
+```bash
+npm run dev
+```
+
+Vite mostrará una dirección similar a:
+
+```text
+http://localhost:5173
+```
+
+> ⚠️ **Truco que siempre olvido:** después de modificar un archivo `.env`, es necesario reiniciar el servidor de Vite.
+
+---
+
+## Paso 2: Limpiar la plantilla inicial
+
+Vite genera una aplicación de demostración con archivos y estilos que probablemente no necesitás.
+
+Podés eliminar:
+
+```text
+src/assets/react.svg
+public/vite.svg
+```
+
+También podés reemplazar el contenido inicial de:
+
+```text
+src/App.tsx
+src/App.css
+```
+
+Más adelante, cuando configures el router, `App.tsx` incluso puede dejar de ser necesario.
+
+La aplicación terminará arrancando directamente desde:
+
+```text
+main.tsx
+    ↓
+AppProviders
+    ↓
+RouterProvider
+```
+
+---
+
+## Paso 3: Configurar Tailwind CSS
+
+La configuración exacta puede cambiar según la versión de Tailwind instalada, pero el objetivo es que las clases puedan utilizarse directamente en los componentes:
+
+```tsx
+export function Example() {
+  return (
+    <main className="min-h-screen bg-slate-100 p-8">
+      <h1 className="text-2xl font-semibold">Aplicación</h1>
+    </main>
+  );
+}
+```
+
+Antes de continuar, verificá que una clase visual de Tailwind se aplique correctamente.
+
+Esto permite distinguir rápidamente un problema de estilos de un problema relacionado con React o el router.
+
+---
+
+## Paso 4: Instalar las dependencias
+
+Instalá las dependencias del flujo base:
+
+```bash
+npm install axios react-hook-form zod @hookform/resolvers react-router
+```
+
+Responsabilidad de cada paquete:
+
+| Dependencia           | Responsabilidad                            |
+| --------------------- | ------------------------------------------ |
+| `axios`               | Comunicación HTTP con el backend           |
+| `react-hook-form`     | Estado y ciclo de vida del formulario      |
+| `zod`                 | Validación de datos en tiempo de ejecución |
+| `@hookform/resolvers` | Integración entre Zod y React Hook Form    |
+| `react-router`        | Navegación, rutas, layouts y redirecciones |
+
+No es necesario instalar:
+
+```bash
+npm install @types/axios
+```
+
+Axios ya incluye sus declaraciones de TypeScript.
+
+### ¿Por qué usar estas dependencias?
+
+`Axios` evita repetir configuración HTTP y posteriormente permite incorporar interceptores.
+
+`React Hook Form` evita mantener manualmente un `useState` para cada campo, error y estado de envío.
+
+`Zod` permite definir una sola fuente de verdad para las reglas de validación y obtener tipos de TypeScript a partir del mismo esquema.
+
+Ejemplo:
+
+```ts
+const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+});
+
+type LoginFormValues = z.infer<typeof loginSchema>;
+```
+
+El esquema valida datos durante la ejecución y `z.infer` produce el tipo estático correspondiente.
+
+---
+
+## Paso 5: Elegir una arquitectura inicial
+
+Para una aplicación con varios dominios, conviene organizar el código por funcionalidad antes que por tipo técnico global.
+
+Una estructura base puede ser:
+
+```text
+src/
+├── app/
+│   ├── layouts/
+│   ├── providers/
+│   ├── router/
+│   └── guards/
+│
+├── modules/
+│   ├── auth/
+│   │   ├── components/
+│   │   ├── context/
+│   │   ├── hooks/
+│   │   ├── layouts/
+│   │   ├── pages/
+│   │   ├── providers/
+│   │   ├── schemas/
+│   │   ├── services/
+│   │   └── types/
+│   │
+│   └── example/
+│       ├── components/
+│       ├── pages/
+│       ├── services/
+│       └── types/
+│
+├── shared/
+│   ├── components/
+│   ├── hooks/
+│   ├── pages/
+│   ├── services/
+│   │   ├── api/
+│   │   └── storage/
+│   ├── types/
+│   └── utils/
+│
+├── main.tsx
+└── vite-env.d.ts
+```
+
+Esta organización se aproxima a una **Screaming Architecture**.
+
+Al observar las carpetas principales, debería ser posible entender qué hace la aplicación:
+
+```text
+auth
+finance
+gym
+catalog
+orders
+users
+```
+
+En lugar de encontrar únicamente carpetas técnicas globales:
+
+```text
+components
+services
+hooks
+pages
+```
+
+### Responsabilidad de cada nivel
+
+| Carpeta   | Responsabilidad                                        |
+| --------- | ------------------------------------------------------ |
+| `app`     | Configuración y composición global                     |
+| `modules` | Funcionalidades y dominios de negocio                  |
+| `shared`  | Elementos transversales sin dueño funcional específico |
+
+> ⚠️ No crees todas las carpetas desde el principio. Creá únicamente las que la primera funcionalidad necesite.
+
+---
+
+## Paso 6: Crear la estructura mínima para autenticación
+
+Para implementar el primer login, la estructura mínima puede ser:
+
+```text
+src/
+├── app/
+│   ├── layouts/
+│   │   └── AppLayout.tsx
+│   ├── providers/
+│   │   └── AppProviders.tsx
+│   └── router/
+│       ├── router.ts
+│       └── routes.ts
+│
+├── modules/
+│   └── auth/
+│       ├── context/
+│       │   └── AuthContext.ts
+│       ├── hooks/
+│       │   └── useAuth.ts
+│       ├── pages/
+│       │   └── LoginPage.tsx
+│       ├── providers/
+│       │   └── AuthProvider.tsx
+│       ├── schemas/
+│       │   └── loginSchema.ts
+│       ├── services/
+│       │   └── authService.ts
+│       └── types/
+│           └── auth.ts
+│
+├── modules/
+│   └── example/
+│       └── pages/
+│           └── DashboardPage.tsx
+│
+├── shared/
+│   ├── pages/
+│   │   └── NotFoundPage.tsx
+│   └── services/
+│       └── api/
+│           └── apiClient.ts
+│
+└── main.tsx
+```
+
+En un proyecto como Ceres, el módulo `example` sería reemplazado por módulos reales como:
+
+```text
+finance
+gym
+```
+
+---
+
+## Paso 7: Configurar variables de entorno
+
+Creá un archivo `.env` en la raíz del frontend:
+
+```env
+VITE_API_URL=https://localhost:7000
+```
+
+También conviene documentar las variables requeridas:
+
+```text
+.env.example
+```
+
+```env
+VITE_API_URL=
+```
+
+En Vite, las variables disponibles en el navegador deben comenzar por:
+
+```text
+VITE_
+```
+
+Se consumen mediante:
+
+```ts
+const apiUrl = import.meta.env.VITE_API_URL;
+```
+
+> ⚠️ Las variables `VITE_` terminan formando parte del código enviado al navegador. No guardes contraseñas, API keys privadas ni secretos en ellas.
+
+La URL de una API pública no es un secreto.
+
+---
+
+## Paso 8: Crear el cliente Axios
+
+Creá:
+
+```text
+src/shared/services/api/apiClient.ts
+```
+
+```ts
+import axios from "axios";
+
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_URL,
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+export default apiClient;
+```
+
+La función `axios.create` permite crear una instancia reutilizable.
+
+Esto evita repetir:
+
+```ts
+axios.post("https://localhost:7000/api/auth/login", credentials);
+```
+
+En los servicios se podrá escribir:
+
+```ts
+apiClient.post("/api/auth/login", credentials);
+```
+
+### ¿Por qué ubicarlo en `shared`?
+
+Porque el cliente HTTP será utilizado por múltiples dominios:
+
+```text
+auth
+users
+orders
+finance
+gym
+```
+
+No pertenece exclusivamente al módulo de autenticación.
+
+### Qué puede incorporarse posteriormente
+
+El cliente Axios es el lugar adecuado para configurar:
+
+- URL base
+- Headers generales
+- Access token
+- Cookies
+- Timeouts
+- Interceptores
+- Renovación de sesión
+- Normalización de errores
+
+No agregues interceptores hasta que exista una necesidad real.
+
+Un interceptor de refresh token implementado antes de tener refresh tokens solo añade complejidad y oculta el flujo básico.
+
+---
+
+## Paso 9: Definir los contratos HTTP
+
+Creá:
+
+```text
+src/modules/auth/types/auth.ts
+```
+
+```ts
+export interface LoginRequest {
+  email: string;
+  password: string;
+}
+
+export interface LoginResponse {
+  accessToken: string;
+}
+```
+
+Estos tipos representan el contrato entre frontend y backend.
+
+Es importante distinguir entre diferentes clases de tipos:
+
+| Tipo               | Representa                            |
+| ------------------ | ------------------------------------- |
+| `LoginFormValues`  | Estado validado del formulario        |
+| `LoginRequest`     | Body enviado al backend               |
+| `LoginResponse`    | Respuesta recibida                    |
+| `AuthContextValue` | API disponible para componentes React |
+
+Aunque algunos tipos tengan inicialmente las mismas propiedades, pueden evolucionar por motivos diferentes.
+
+Por ejemplo, el formulario podría agregar:
+
+```ts
+rememberSession: boolean;
+```
+
+sin que el backend necesite recibir ese valor directamente.
+
+---
+
+## Paso 10: Crear el esquema de login
+
+Creá:
+
+```text
+src/modules/auth/schemas/loginSchema.ts
+```
+
+```ts
+import { z } from "zod";
+
+export const loginSchema = z.object({
+  email: z
+    .string()
+    .min(1, "El correo es obligatorio")
+    .email("Ingresa un correo válido"),
+
+  password: z.string().min(1, "La contraseña es obligatoria"),
+});
+
+export type LoginFormValues = z.infer<typeof loginSchema>;
+```
+
+### ¿Por qué no validar una longitud mínima en el login?
+
+La página de registro debe aplicar la política de creación de contraseñas:
+
+```text
+Mínimo de caracteres
+Mayúsculas
+Números
+Símbolos
+```
+
+El login solamente necesita comprobar que el usuario ingresó un valor.
+
+El backend sigue siendo la autoridad que determina si las credenciales son válidas.
+
+Además, una contraseña antigua podría no cumplir una política nueva y seguir siendo válida para iniciar sesión.
+
+---
+
+## Paso 11: Crear el servicio de autenticación
+
+Creá:
+
+```text
+src/modules/auth/services/authService.ts
+```
+
+```ts
+import apiClient from "../../../shared/services/api/apiClient";
+import type { LoginRequest, LoginResponse } from "../types/auth";
+
+export async function login(credentials: LoginRequest): Promise<LoginResponse> {
+  const response = await apiClient.post<LoginResponse>(
+    "/api/auth/login",
+    credentials,
+  );
+
+  return response.data;
+}
+```
+
+El servicio encapsula una operación específica del dominio:
+
+```ts
+login(credentials);
+```
+
+La página no debería conocer detalles como:
+
+```text
+URL base
+Headers
+AxiosResponse
+Serialización
+Configuración de red
+```
+
+La dirección de dependencias queda:
+
+```text
+LoginPage
+    ↓
+authService
+    ↓
+apiClient
+    ↓
+Backend
+```
+
+### Dato útil sobre Axios
+
+Axios devuelve un objeto con información adicional:
+
+```ts
+response.data;
+response.status;
+response.headers;
+response.config;
+```
+
+La respuesta del backend normalmente se encuentra en:
+
+```ts
+response.data;
+```
+
+El genérico:
+
+```ts
+apiClient.post<LoginResponse>(...)
+```
+
+le indica a TypeScript qué estructura se espera dentro de `response.data`.
+
+Esto no valida la respuesta durante la ejecución. Solo proporciona tipado estático.
+
+Si el backend devuelve una forma diferente, TypeScript no la corregirá automáticamente.
+
+---
+
+## Paso 12: Separar Context, Provider y custom hook
+
+Una implementación inicial suele colocar todo en un archivo:
+
+```text
+AuthProvider.tsx
+├── AuthContext
+├── AuthProvider
+└── useAuth
+```
+
+Esto puede funcionar, pero a medida que la autenticación crece, conviene separar las responsabilidades:
+
+```text
+context/AuthContext.ts
+providers/AuthProvider.tsx
+hooks/useAuth.ts
+```
+
+> El principio de responsabilidad única no significa necesariamente “un export por archivo”. Significa que cada módulo debe tener un motivo principal para cambiar.
+
+En este caso:
+
+- El contexto define el contrato.
+- El provider produce el valor.
+- El hook consume el contexto.
+
+---
+
+## Paso 13: Crear `AuthContext`
+
+Creá:
+
+```text
+src/modules/auth/context/AuthContext.ts
+```
+
+```ts
+import { createContext } from "react";
+
+export interface AuthContextValue {
+  accessToken: string | null;
+  isAuthenticated: boolean;
+  login: (accessToken: string) => void;
+  logout: () => void;
+}
+
+export const AuthContext = createContext<AuthContextValue | undefined>(
+  undefined,
+);
+```
+
+Este archivo define el contrato público del contexto.
+
+Usar:
+
+```ts
+AuthContextValue | undefined;
+```
+
+permite detectar componentes que intenten consumir el contexto fuera del provider.
+
+No es recomendable usar un valor ficticio como:
+
+```ts
+createContext<AuthContextValue>({
+  accessToken: null,
+  isAuthenticated: false,
+  login: () => {},
+  logout: () => {},
+});
+```
+
+Ese valor podría ocultar un error de configuración.
+
+---
+
+## Paso 14: Crear `AuthProvider`
+
+Creá:
+
+```text
+src/modules/auth/providers/AuthProvider.tsx
+```
+
+```tsx
+import { useState, type ReactNode } from "react";
+import { AuthContext, type AuthContextValue } from "../context/AuthContext";
+
+interface AuthProviderProps {
+  children: ReactNode;
+}
+
+export function AuthProvider({ children }: AuthProviderProps) {
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+
+  function login(token: string) {
+    setAccessToken(token);
+  }
+
+  function logout() {
+    setAccessToken(null);
+  }
+
+  const value: AuthContextValue = {
+    accessToken,
+    isAuthenticated: accessToken !== null,
+    login,
+    logout,
+  };
+
+  return <AuthContext value={value}>{children}</AuthContext>;
+}
+```
+
+En React 19 es posible utilizar directamente:
+
+```tsx
+<AuthContext value={value}>
+```
+
+La sintaxis tradicional continúa siendo reconocible:
+
+```tsx
+<AuthContext.Provider value={value}>
+```
+
+### Responsabilidad del provider
+
+El provider debe encargarse de:
+
+- Mantener el estado de autenticación
+- Exponer operaciones relacionadas con ese estado
+- Proporcionar el valor a los componentes descendientes
+
+En esta primera versión no debería conocer:
+
+- Axios
+- React Hook Form
+- Zod
+- El endpoint de login
+- El router
+- La interfaz visual
+
+El provider recibe un token ya obtenido:
+
+```ts
+auth.login(response.accessToken);
+```
+
+---
+
+## Paso 15: Crear `useAuth`
+
+Creá:
+
+```text
+src/modules/auth/hooks/useAuth.ts
+```
+
+```ts
+import { useContext } from "react";
+import { AuthContext } from "../context/AuthContext";
+
+export function useAuth() {
+  const context = useContext(AuthContext);
+
+  if (context === undefined) {
+    throw new Error("useAuth debe utilizarse dentro de AuthProvider");
+  }
+
+  return context;
+}
+```
+
+El custom hook encapsula:
+
+- La llamada a `useContext`
+- La validación del provider
+- El acceso al contexto concreto
+
+Los componentes consumidores solo necesitan:
+
+```ts
+const auth = useAuth();
+```
+
+No necesitan importar directamente:
+
+```ts
+AuthContext;
+AuthProvider;
+```
+
+Eso reduce el acoplamiento entre componentes y la implementación interna del estado global.
+
+---
+
+## Paso 16: Crear `AppProviders`
+
+Creá:
+
+```text
+src/app/providers/AppProviders.tsx
+```
+
+```tsx
+import type { ReactNode } from "react";
+import { AuthProvider } from "../../modules/auth/providers/AuthProvider";
+
+interface AppProvidersProps {
+  children: ReactNode;
+}
+
+export function AppProviders({ children }: AppProvidersProps) {
+  return <AuthProvider>{children}</AuthProvider>;
+}
+```
+
+`AppProviders` es el punto de composición global.
+
+Su responsabilidad no es implementar autenticación, temas o internacionalización.
+
+Su responsabilidad es ensamblar los providers que necesita la aplicación:
+
+```tsx
+<AppProviders>
+  <RouterProvider router={router} />
+</AppProviders>
+```
+
+En el futuro podría crecer:
+
+```tsx
+export function AppProviders({ children }: AppProvidersProps) {
+  return (
+    <AuthProvider>
+      <ThemeProvider>{children}</ThemeProvider>
+    </AuthProvider>
+  );
+}
+```
+
+No agregues providers hipotéticos. Añadilos cuando exista una necesidad real.
+
+---
+
+## Paso 17: Crear el layout principal
+
+Creá:
+
+```text
+src/app/layouts/AppLayout.tsx
+```
+
+```tsx
+import { Outlet } from "react-router";
+
+export function AppLayout() {
+  return (
+    <div className="min-h-screen bg-slate-100">
+      <header className="border-b bg-white px-6 py-4">
+        <h1 className="text-xl font-semibold">Mi aplicación</h1>
+      </header>
+
+      <div className="flex">
+        <aside className="min-h-[calc(100vh-65px)] w-64 border-r bg-white p-4">
+          Navegación
+        </aside>
+
+        <main className="flex-1 p-6">
+          <Outlet />
+        </main>
+      </div>
+    </div>
+  );
+}
+```
+
+`Outlet` indica dónde debe renderizarse la ruta hija activa.
+
+Conceptualmente:
+
+```text
+AppLayout
+├── Header
+├── Sidebar
+└── Outlet
+    └── Página actual
+```
+
+### ¿Dónde ubicar cada layout?
+
+Usá esta regla:
+
+```text
+Layout usado por varios dominios
+→ src/app/layouts
+
+Layout exclusivo de un dominio
+→ src/modules/{dominio}/layouts
+```
+
+Ejemplos:
+
+```text
+src/app/layouts/AppLayout.tsx
+src/modules/auth/layouts/AuthLayout.tsx
+src/modules/admin/layouts/AdminLayout.tsx
+```
+
+El login normalmente no debería utilizar `AppLayout`, porque una página pública no necesita mostrar:
+
+- Sidebar privado
+- Menú del usuario
+- Navegación interna
+- Acciones de sesión autenticada
+
+---
+
+## Paso 18: Crear una página temporal de dashboard
+
+Creá una página sencilla que permita verificar la redirección y el estado global:
+
+```text
+src/modules/example/pages/DashboardPage.tsx
+```
+
+```tsx
+import { useAuth } from "../../auth/hooks/useAuth";
+
+export function DashboardPage() {
+  const { isAuthenticated, logout } = useAuth();
+
+  return (
+    <section>
+      <h1 className="text-2xl font-semibold">Dashboard</h1>
+
+      <p className="mt-4">
+        Estado: {isAuthenticated ? "Sesión iniciada" : "Sin autenticación"}
+      </p>
+
+      {isAuthenticated && (
+        <button
+          type="button"
+          onClick={logout}
+          className="mt-4 rounded bg-red-600 px-4 py-2 text-white"
+        >
+          Cerrar sesión
+        </button>
+      )}
+    </section>
+  );
+}
+```
+
+Esta página no tiene que ser el dashboard definitivo.
+
+Su función es permitir comprobar que:
+
+- La navegación funciona
+- El provider está disponible
+- El token fue almacenado
+- `isAuthenticated` cambió
+
+---
+
+## Paso 19: Crear la página 404
+
+Creá:
+
+```text
+src/shared/pages/NotFoundPage.tsx
+```
+
+```tsx
+export function NotFoundPage() {
+  return (
+    <main className="flex min-h-screen items-center justify-center">
+      <div className="text-center">
+        <h1 className="text-4xl font-bold">404</h1>
+
+        <p className="mt-2 text-slate-600">La página solicitada no existe.</p>
+      </div>
+    </main>
+  );
+}
+```
+
+Se ubica en `shared` porque representa una página transversal y no pertenece a un módulo de negocio específico.
+
+---
+
+## Paso 20: Definir rutas mediante objetos
+
+En lugar de escribir rutas con componentes `<Route>`, podés declararlas como objetos.
+
+Creá:
+
+```text
+src/app/router/routes.ts
+```
+
+```ts
+import type { RouteObject } from "react-router";
+import { AppLayout } from "../layouts/AppLayout";
+import { LoginPage } from "../../modules/auth/pages/LoginPage";
+import { DashboardPage } from "../../modules/example/pages/DashboardPage";
+import { NotFoundPage } from "../../shared/pages/NotFoundPage";
+
+export const routes: RouteObject[] = [
+  {
+    path: "/",
+    Component: AppLayout,
+    children: [
+      {
+        index: true,
+        Component: DashboardPage,
+      },
+    ],
+  },
+  {
+    path: "/login",
+    Component: LoginPage,
+  },
+  {
+    path: "*",
+    Component: NotFoundPage,
+  },
+];
+```
+
+`createBrowserRouter` recibe un arreglo:
+
+```ts
+RouteObject[]
+```
+
+Cada objeto representa una ruta.
+
+### `Component` frente a `element`
+
+Podés utilizar:
+
+```ts
+{
+  path: "/login",
+  Component: LoginPage,
+}
+```
+
+O:
+
+```tsx
+{
+  path: "/login",
+  element: <LoginPage />,
+}
+```
+
+Para rutas simples, `Component` permite mantener el archivo como `.ts` y evita escribir JSX en la configuración.
+
+No utilices ambas propiedades en la misma ruta.
+
+### ¿Qué significa `index: true`?
+
+```ts
+{
+  index: true,
+  Component: DashboardPage,
+}
+```
+
+Representa la ruta por defecto de su padre.
+
+En este caso:
+
+```text
+/
+```
+
+renderiza:
+
+```text
+AppLayout
+└── DashboardPage
+```
+
+`DashboardPage` aparece en el lugar donde `AppLayout` declara:
+
+```tsx
+<Outlet />
+```
+
+---
+
+## Paso 21: Crear la instancia del router
+
+Creá:
+
+```text
+src/app/router/router.ts
+```
+
+```ts
+import { createBrowserRouter } from "react-router";
+import { routes } from "./routes";
+
+export const router = createBrowserRouter(routes);
+```
+
+El router se crea fuera de los componentes React.
+
+Evitá esto:
+
+```tsx
+export function AppRouter() {
+  const router = createBrowserRouter(routes);
+
+  return <RouterProvider router={router} />;
+}
+```
+
+La instancia podría recrearse cada vez que el componente se renderiza.
+
+La configuración queda separada en dos responsabilidades:
+
+```text
+routes.ts
+→ declara las rutas
+
+router.ts
+→ crea la instancia del router
+```
+
+---
+
+## Paso 22: Configurar `main.tsx`
+
+Reemplazá el contenido principal por:
+
+```tsx
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { RouterProvider } from "react-router/dom";
+import { AppProviders } from "./app/providers/AppProviders";
+import { router } from "./app/router/router";
+import "./index.css";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <AppProviders>
+      <RouterProvider router={router} />
+    </AppProviders>
+  </StrictMode>,
+);
+```
+
+La jerarquía final es:
+
+```text
+StrictMode
+└── AppProviders
+    └── AuthProvider
+        └── RouterProvider
+            └── Ruta activa
+```
+
+Todas las páginas renderizadas por el router quedan dentro de `AuthProvider`.
+
+Por eso pueden utilizar:
+
+```ts
+const auth = useAuth();
+```
+
+### No agregues `BrowserRouter`
+
+Cuando usás:
+
+```ts
+createBrowserRouter(...)
+```
+
+y:
+
+```tsx
+<RouterProvider router={router} />
+```
+
+no necesitás:
+
+```tsx
+<BrowserRouter>
+```
+
+Usar ambos crearía dos routers y provocaría errores o una jerarquía innecesaria.
+
+---
+
+## Paso 23: Implementar el formulario de login
+
+Creá:
+
+```text
+src/modules/auth/pages/LoginPage.tsx
+```
+
+```tsx
+import axios from "axios";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useForm } from "react-hook-form";
+import { useNavigate } from "react-router";
+import { useAuth } from "../hooks/useAuth";
+import { loginSchema, type LoginFormValues } from "../schemas/loginSchema";
+import { login as loginRequest } from "../services/authService";
+
+export function LoginPage() {
+  const navigate = useNavigate();
+  const auth = useAuth();
+
+  const {
+    register,
+    handleSubmit,
+    setError,
+    formState: { errors, isSubmitting },
+  } = useForm<LoginFormValues>({
+    resolver: zodResolver(loginSchema),
+    defaultValues: {
+      email: "",
+      password: "",
+    },
+  });
+
+  async function onSubmit(values: LoginFormValues) {
+    try {
+      const response = await loginRequest({
+        email: values.email,
+        password: values.password,
+      });
+
+      auth.login(response.accessToken);
+
+      navigate("/", {
+        replace: true,
+      });
+    } catch (error: unknown) {
+      if (axios.isAxiosError(error) && error.response?.status === 401) {
+        setError("root.server", {
+          type: "server",
+          message: "Credenciales incorrectas",
+        });
+
+        return;
+      }
+
+      setError("root.server", {
+        type: "server",
+        message: "No fue posible iniciar sesión. Intenta nuevamente.",
+      });
+    }
+  }
+
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-slate-100 px-4">
+      <section className="w-full max-w-md rounded-xl bg-white p-8 shadow">
+        <h1 className="text-2xl font-semibold text-slate-900">
+          Iniciar sesión
+        </h1>
+
+        <p className="mt-2 text-sm text-slate-600">
+          Ingresa tus credenciales para continuar.
+        </p>
+
+        <form
+          onSubmit={handleSubmit(onSubmit)}
+          noValidate
+          className="mt-8 space-y-5"
+        >
+          <div>
+            <label
+              htmlFor="email"
+              className="block text-sm font-medium text-slate-700"
+            >
+              Correo electrónico
+            </label>
+
+            <input
+              id="email"
+              type="email"
+              autoComplete="email"
+              aria-invalid={errors.email ? "true" : "false"}
+              {...register("email")}
+              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 outline-none focus:border-slate-500"
+            />
+
+            {errors.email?.message && (
+              <p role="alert" className="mt-1 text-sm text-red-600">
+                {errors.email.message}
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label
+              htmlFor="password"
+              className="block text-sm font-medium text-slate-700"
+            >
+              Contraseña
+            </label>
+
+            <input
+              id="password"
+              type="password"
+              autoComplete="current-password"
+              aria-invalid={errors.password ? "true" : "false"}
+              {...register("password")}
+              className="mt-1 w-full rounded-md border border-slate-300 px-3 py-2 outline-none focus:border-slate-500"
+            />
+
+            {errors.password?.message && (
+              <p role="alert" className="mt-1 text-sm text-red-600">
+                {errors.password.message}
+              </p>
+            )}
+          </div>
+
+          {errors.root?.server?.message && (
+            <p
+              role="alert"
+              className="rounded-md bg-red-50 p-3 text-sm text-red-700"
+            >
+              {errors.root.server.message}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="w-full rounded-md bg-slate-900 px-4 py-2 font-medium text-white disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isSubmitting ? "Iniciando sesión..." : "Iniciar sesión"}
+          </button>
+        </form>
+      </section>
+    </main>
+  );
+}
+```
+
+---
+
+## Paso 24: Entender cómo funciona React Hook Form
+
+Con un formulario administrado manualmente probablemente necesitarías:
+
+```tsx
+const [email, setEmail] = useState("");
+const [password, setPassword] = useState("");
+const [isSubmitting, setIsSubmitting] = useState(false);
+const [error, setError] = useState<string | null>(null);
+```
+
+React Hook Form proporciona esas responsabilidades mediante:
+
+```text
+register
+handleSubmit
+errors
+setError
+isSubmitting
+```
+
+Un campo se conecta así:
+
+```tsx
+<input {...register("email")} />
+```
+
+Conceptualmente, `register` proporciona propiedades como:
+
+```text
+name
+onChange
+onBlur
+ref
+```
+
+React Hook Form puede gestionar los valores sin convertir necesariamente cada input en un campo controlado con `value` y `onChange`.
+
+---
+
+## Paso 25: Entender el flujo de validación
+
+Al enviar el formulario ocurre:
+
+```text
+handleSubmit
+    ↓
+zodResolver
+    ↓
+loginSchema
+    ↓
+¿Los datos son válidos?
+    ├── No → llena formState.errors
+    └── Sí → ejecuta onSubmit
+```
+
+Si el correo no es válido, `onSubmit` ni siquiera se ejecuta.
+
+Ejemplo:
+
+```text
+Correo: usuario
+Contraseña: test
+```
+
+Resultado:
+
+```text
+Ingresa un correo válido
+```
+
+No se realiza ninguna petición HTTP.
+
+---
+
+## Paso 26: Entender el estado `isSubmitting`
+
+Mientras la función `onSubmit` continúa ejecutándose:
+
+```ts
+isSubmitting === true;
+```
+
+Cuando la promesa termina:
+
+```ts
+isSubmitting === false;
+```
+
+Esto permite escribir:
+
+```tsx
+<button type="submit" disabled={isSubmitting}>
+  {isSubmitting ? "Iniciando sesión..." : "Iniciar sesión"}
+</button>
+```
+
+No es necesario crear manualmente:
+
+```ts
+const [isLoading, setIsLoading] = useState(false);
+```
+
+ni usar:
+
+```ts
+try {
+  setIsLoading(true);
+} finally {
+  setIsLoading(false);
+}
+```
+
+React Hook Form administra el ciclo de envío.
+
+---
+
+## Paso 27: Manejar errores de Axios correctamente
+
+El parámetro de `catch` debe tratarse como `unknown`:
+
+```ts
+catch (error: unknown) {
+  // ...
+}
+```
+
+No es seguro asumir directamente:
+
+```ts
+error.response.status;
+```
+
+Cualquier valor puede ser lanzado:
+
+```ts
+throw new Error();
+throw "error";
+throw null;
+```
+
+Axios proporciona un type guard:
+
+```ts
+axios.isAxiosError(error);
+```
+
+Entonces es seguro consultar:
+
+```ts
+error.response?.status;
+```
+
+Ejemplo:
+
+```ts
+if (axios.isAxiosError(error) && error.response?.status === 401) {
+  setError("root.server", {
+    message: "Credenciales incorrectas",
+  });
+}
+```
+
+### Diferencia importante entre Axios y `fetch`
+
+Axios rechaza la promesa cuando recibe respuestas HTTP no exitosas como:
+
+```text
+400
+401
+403
+404
+500
+```
+
+Por eso terminan en `catch`.
+
+`fetch`, en cambio, solo rechaza por errores de red. Con `fetch` es necesario comprobar manualmente:
+
+```ts
+if (!response.ok) {
+  // Manejar error HTTP
+}
+```
+
+---
+
+## Paso 28: Mostrar errores del servidor
+
+Los errores de campos individuales se muestran desde:
+
+```ts
+errors.email;
+errors.password;
+```
+
+Los errores generales del backend pueden guardarse en:
+
+```ts
+errors.root.server;
+```
+
+Ejemplo:
+
+```ts
+setError("root.server", {
+  type: "server",
+  message: "Credenciales incorrectas",
+});
+```
+
+Y renderizarse así:
+
+```tsx
+{
+  errors.root?.server?.message && (
+    <p role="alert">{errors.root.server.message}</p>
+  );
+}
+```
+
+Esto diferencia:
+
+```text
+Errores de validación
+→ asociados a campos
+
+Errores de autenticación o servidor
+→ asociados al formulario completo
+```
+
+---
+
+## Paso 29: Guardar el token en estado global
+
+Después de un login exitoso:
+
+```ts
+const response = await loginRequest(values);
+
+auth.login(response.accessToken);
+```
+
+Esto actualiza:
+
+```ts
+accessToken;
+isAuthenticated;
+```
+
+en `AuthProvider`.
+
+El contexto no debería realizar la petición en esta primera implementación.
+
+El flujo se mantiene explícito:
+
+```text
+LoginPage
+├── ejecuta loginRequest
+├── recibe LoginResponse
+├── actualiza AuthProvider
+└── navega al dashboard
+```
+
+Esta separación ayuda a aprender dónde ocurre cada responsabilidad.
+
+---
+
+## Paso 30: Redirigir después del login
+
+Utilizá:
+
+```ts
+const navigate = useNavigate();
+```
+
+Después del login:
+
+```ts
+navigate("/", {
+  replace: true,
+});
+```
+
+`replace: true` reemplaza la entrada actual del historial.
+
+Sin `replace`, el historial podría ser:
+
+```text
+/login
+/
+```
+
+Al pulsar “atrás”, el usuario volvería al login.
+
+Con `replace`, el login es sustituido por la ruta de destino.
+
+---
+
+## Paso 31: No persistir el token prematuramente
+
+Para cumplir con un primer estado global, esto es suficiente:
+
+```ts
+const [accessToken, setAccessToken] = useState<string | null>(null);
+```
+
+No agregues automáticamente:
+
+```ts
+localStorage.setItem("accessToken", token);
+```
+
+La persistencia del token es una decisión de arquitectura y seguridad.
+
+Alternativas comunes:
+
+```text
+Access token en memoria
+Refresh token en cookie HttpOnly
+
+Access token y refresh token en cookies
+
+Access token en localStorage
+
+Access token en sessionStorage
+```
+
+Cada alternativa tiene implicaciones diferentes.
+
+En una arquitectura con access token corto y refresh token, una estrategia frecuente es:
+
+```text
+Access token
+→ memoria de la aplicación
+
+Refresh token
+→ cookie HttpOnly y Secure
+```
+
+El frontend no puede leer una cookie `HttpOnly`, lo que reduce la exposición ante ciertos ataques XSS.
+
+La estrategia concreta debe acordarse con el backend antes de implementar persistencia.
+
+---
+
+## Paso 32: Probar el flujo completo
+
+Verificá los siguientes escenarios.
+
+### Formulario vacío
+
+Resultado esperado:
+
+```text
+El correo es obligatorio
+La contraseña es obligatoria
+```
+
+No debe realizarse una petición HTTP.
+
+### Correo inválido
+
+Entrada:
+
+```text
+usuario
+```
+
+Resultado:
+
+```text
+Ingresa un correo válido
+```
+
+### Credenciales incorrectas
+
+El backend responde:
+
+```http
+401 Unauthorized
+```
+
+La interfaz muestra:
+
+```text
+Credenciales incorrectas
+```
+
+### Login exitoso
+
+El backend responde:
+
+```json
+{
+  "accessToken": "..."
+}
+```
+
+Resultado esperado:
+
+```text
+El token se guarda en AuthProvider
+La URL cambia a /
+El dashboard detecta isAuthenticated === true
+```
+
+### Petición en curso
+
+Mientras el backend responde:
+
+```text
+Botón deshabilitado
+Texto: Iniciando sesión...
+```
+
+---
+
+## Paso 33: Revisar CORS
+
+Si el frontend corre en:
+
+```text
+http://localhost:5173
+```
+
+y el backend en:
+
+```text
+https://localhost:7000
+```
+
+los orígenes son diferentes.
+
+El backend debe permitir explícitamente el origen del frontend.
+
+Un error de CORS puede aparecer como:
+
+```text
+Network Error
+```
+
+aunque el endpoint exista y Axios esté configurado correctamente.
+
+Revisá:
+
+- Origen permitido
+- Métodos HTTP permitidos
+- Headers permitidos
+- Cookies o credenciales
+- Orden del middleware de CORS
+
+---
+
+## Paso 34: Revisar certificados HTTPS locales
+
+Si la API utiliza HTTPS con un certificado local no confiable, el navegador puede bloquear la conexión.
+
+Abrí directamente la dirección del backend:
+
+```text
+https://localhost:7000
+```
+
+y verificá que el certificado de desarrollo sea aceptado.
+
+En proyectos .NET también puede ser necesario confiar en el certificado local de desarrollo.
+
+Un problema de certificado puede presentarse en Axios como un error de red sin respuesta HTTP disponible.
+
+---
+
+## Paso 35: Verificar el contrato real del backend
+
+TypeScript no valida automáticamente el JSON recibido.
+
+Este tipo:
+
+```ts
+interface LoginResponse {
+  accessToken: string;
+}
+```
+
+no transforma:
+
+```json
+{
+  "token": "..."
+}
+```
+
+en:
+
+```json
+{
+  "accessToken": "..."
+}
+```
+
+Comprobá la respuesta real desde:
+
+- DevTools
+- Swagger
+- Postman
+- Bruno
+- curl
+- Logs del backend
+
+El frontend debe reflejar el contrato real.
+
+---
+
+## Errores comunes
+
+| Error                                            | Causa probable                                 | Solución                                                     |
+| ------------------------------------------------ | ---------------------------------------------- | ------------------------------------------------------------ |
+| `Network Error`                                  | CORS, certificado o backend apagado            | Revisar consola, red y configuración del backend             |
+| `VITE_API_URL` es `undefined`                    | Variable mal nombrada o servidor sin reiniciar | Usar prefijo `VITE_` y reiniciar Vite                        |
+| El `401` no muestra mensaje                      | Error tratado como `Error` genérico            | Usar `axios.isAxiosError` y revisar `response?.status`       |
+| El formulario llama a la API con datos inválidos | Resolver no configurado                        | Agregar `resolver: zodResolver(loginSchema)`                 |
+| `useAuth debe utilizarse dentro de AuthProvider` | El router está fuera del provider              | Envolver `RouterProvider` con `AppProviders`                 |
+| Error por routers anidados                       | Se usaron `BrowserRouter` y `RouterProvider`   | Mantener únicamente `createBrowserRouter` + `RouterProvider` |
+| La ruta hija no aparece                          | Falta `<Outlet />`                             | Agregar `Outlet` al layout padre                             |
+| La URL cambia pero la página queda vacía         | Configuración incorrecta de `children`         | Revisar ruta padre, ruta índice y `Outlet`                   |
+| El token aparece como `undefined`                | El contrato no coincide con la respuesta       | Revisar el JSON real del backend                             |
+| Tailwind no aplica estilos                       | Configuración o importación incompleta         | Revisar `index.css` y configuración de Tailwind              |
+| El botón no se deshabilita                       | No se usa `formState.isSubmitting`             | Conectar `disabled={isSubmitting}`                           |
+| Los errores del servidor desaparecen mal         | Se mezclan con errores de campos               | Usar `setError("root.server", ...)`                          |
+
+---
+
+## Qué no implementar todavía
+
+Para mantener el primer flujo pequeño y comprensible, dejá fuera:
+
+- Refresh token
+- Interceptor de renovación automática
+- Persistencia en `localStorage`
+- Guards avanzados
+- Logout contra el backend
+- Recuperación de sesión al recargar
+- React Query
+- Redux o Zustand
+- Componentes genéricos de formulario
+- Repositorios frontend
+- Abstracciones para todos los errores HTTP
+- Un hook `useLogin` sin repetición real
+- Design system completo
+
+Primero completá:
+
+```text
+UI
+↓
+Validación
+↓
+Servicio
+↓
+API
+↓
+Estado global
+↓
+Navegación
+```
+
+Después agregá complejidad de forma incremental.
+
+---
+
+## Posibles siguientes pasos
+
+Una vez que el login básico funciona:
+
+- [ ] Crear una página de registro
+- [ ] Crear un `AuthLayout` para login y registro
+- [ ] Implementar rutas protegidas
+- [ ] Agregar logout contra el backend
+- [ ] Definir la estrategia de refresh token
+- [ ] Incorporar el token a Axios
+- [ ] Recuperar la sesión al iniciar la aplicación
+- [ ] Agregar pruebas del formulario
+- [ ] Crear componentes reutilizables cuando aparezca repetición
+- [ ] Configurar alias de importación como `@/modules/auth`
+- [ ] Agregar lazy loading por ruta
+
+---
+
+## Arquitectura final resumida
+
+```text
+src/
+├── app/
+│   ├── layouts/
+│   │   └── AppLayout.tsx
+│   ├── providers/
+│   │   └── AppProviders.tsx
+│   └── router/
+│       ├── router.ts
+│       └── routes.ts
+│
+├── modules/
+│   ├── auth/
+│   │   ├── context/
+│   │   │   └── AuthContext.ts
+│   │   ├── hooks/
+│   │   │   └── useAuth.ts
+│   │   ├── pages/
+│   │   │   └── LoginPage.tsx
+│   │   ├── providers/
+│   │   │   └── AuthProvider.tsx
+│   │   ├── schemas/
+│   │   │   └── loginSchema.ts
+│   │   ├── services/
+│   │   │   └── authService.ts
+│   │   └── types/
+│   │       └── auth.ts
+│   │
+│   └── example/
+│       └── pages/
+│           └── DashboardPage.tsx
+│
+├── shared/
+│   ├── pages/
+│   │   └── NotFoundPage.tsx
+│   └── services/
+│       └── api/
+│           └── apiClient.ts
+│
+├── main.tsx
+└── vite-env.d.ts
+```
+
+---
+
+## Principios para recordar
+
+### Organizar por dominio
+
+```text
+modules/auth
+modules/orders
+modules/users
+```
+
+antes que crear grandes carpetas globales con archivos de todos los módulos mezclados.
+
+### Separar responsabilidades reales
+
+```text
+Context
+→ define el contrato
+
+Provider
+→ produce el valor
+
+Custom hook
+→ consume el contexto
+```
+
+### Mantener explícito el primer flujo
+
+```text
+Page
+→ Service
+→ API Client
+→ Backend
+```
+
+No ocultarlo prematuramente bajo demasiadas abstracciones.
+
+### Crear elementos compartidos solo cuando realmente lo sean
+
+Un servicio de login pertenece a:
+
+```text
+modules/auth/services
+```
+
+El cliente Axios pertenece a:
+
+```text
+shared/services/api
+```
+
+### Ubicar los layouts según su alcance
+
+```text
+Layout global
+→ app/layouts
+
+Layout de un dominio
+→ modules/{dominio}/layouts
+```
+
+### No confundir SRP con cantidad de exports
+
+Un archivo puede exportar varios elementos si todos cambian por la misma razón.
+
+Separá archivos cuando existan responsabilidades o motivos de cambio distintos, no solo para cumplir una regla mecánica.
+
+---
+
+## Links útiles
+
+- [React](https://react.dev/)
+- [React Router](https://reactrouter.com/)
+- [React Hook Form](https://react-hook-form.com/)
+- [Zod](https://zod.dev/)
+- [Axios](https://axios-http.com/)
+- [Vite](https://vite.dev/)
+- [Tailwind CSS](https://tailwindcss.com/)
