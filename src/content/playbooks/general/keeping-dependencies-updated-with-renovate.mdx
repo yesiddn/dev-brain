@@ -1,0 +1,132 @@
+---
+title: "Cómo mantener dependencias actualizadas con Renovate"
+description: "Guía de reentrada para configurar Renovate y establecer la rutina quincenal de revisión"
+goal: "Tener Renovate activo creando PRs los sábados, con solo minor/patch, y una rutina de revisión clara"
+tech: ["pnpm", "renovate", "github"]
+tags: ["dependencies", "automation", "renovate", "rutina"]
+level: "medio"
+status: "active"
+prerequisites:
+  - "Repositorio en GitHub"
+  - "Permisos para instalar GitHub Apps en el repo/org"
+estimatedTime: "20 min setup inicial, 15 min por revisión quincenal"
+updatedAt: 2026-08-01
+createdAt: 2026-08-01
+summary: "Instalar la app de Renovate, configurar renovate.json para updates semanales de minor/patch, y establecer la rutina de revisión"
+related: ["concepto-gestion-dependencias", "snippets-gestion-dependencias"]
+---
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**
+> Cuando arrancás un proyecto nuevo, o cuando un proyecto existente se está atrasando en dependencias y querés automatizar el mantenimiento.
+
+Qué vas a lograr:
+
+- ✅ Renovate creando PRs de dependencias automáticamente
+- ✅ Solo minor y patch (major bloqueadas, se revisan manualmente)
+- ✅ Updates agrupados para revisar una vez por semana/quincena
+- ✅ Rutina clara de qué hacer con cada PR
+
+---
+
+## Paso 1: Instalar la GitHub App
+
+1. Ir a [GitHub Apps](https://github.com/apps/renovate) → **Install**
+2. Seleccionar los repos a monitorear (o "All repositories")
+3. Renovate crea un **onboarding PR** titulado "Configure Renovate"
+
+> ⚠️ **Truco que siempre olvido:** NO mergear el onboarding PR todavía. Primero editar el `renovate.json` en esa misma rama con la config propia (paso 2). Renovate actualiza la descripción del PR automáticamente con la nueva config.
+
+---
+
+## Paso 2: Configurar renovate.json
+
+Editar en la rama del onboarding PR:
+
+```json
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "timezone": "America/Bogota",
+  "schedule": ["before 7am on Saturday"],
+  "prHourlyLimit": 0,
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "matchUpdateTypes": ["patch"],
+      "groupName": "patch updates"
+    }
+  ]
+}
+```
+
+Qué hace cada parte:
+
+- `schedule`: PRs solo los sábados temprano (no es hora exacta, es una ventana)
+- `prHourlyLimit: 0`: sin límite de PRs/hora (el default es 2, frena el primer batch)
+- Major deshabilitadas: no genera ruido; las major se revisan aparte
+- Patch agrupados: un solo PR "patch updates" en vez de 5 PRs individuales
+
+Mergear el onboarding PR → Renovate queda activo.
+
+---
+
+## Paso 3: Rutina de revisión (cada 15 días)
+
+1. Revisar el **Dependency Dashboard** (issue que Renovate crea en el repo) para ver el estado general
+2. Para cada PR de Renovate:
+   - Minor/patch de libs no críticas → correr CI/tests → merge
+   - Minor de libs críticas (vite, react) → skim del changelog en el PR → merge
+   - **Vulnerabilidad de seguridad** → prioridad inmediata, no esperar al ciclo
+3. Para major pendientes (Renovate no las crea, se ven con `ncu`):
+   - `npx npm-check-updates` en el proyecto
+   - Leer changelog/migration guide de las major que valgan la pena
+   - Rama aparte, una dependencia a la vez, tests completos
+
+---
+
+## Paso 4: Dónde leer changelogs
+
+Orden de preferencia:
+
+1. **changelogs.xyz** → `https://changelogs.xyz/<paquete>` (el que mejor funciona)
+2. **GitHub Releases** del repo del paquete → fuente de verdad
+3. **El propio PR de Renovate** → linkea changelogs y muestra badges de Merge Confidence (age, adoption)
+
+Casos sin changelog (ir directo al repo o al blog oficial):
+
+- TypeScript major → devblogs.microsoft.com/typescript
+- `@types/*` → sin changelog, confiar en los tests
+
+---
+
+## Errores comunes
+
+| Error                       | Causa                     | Solución                                                        |
+| --------------------------- | ------------------------- | --------------------------------------------------------------- |
+| Renovate no crea PRs        | Onboarding PR no mergeado | Mergear el PR "Configure Renovate"                              |
+| PRs creados en horario raro | Timezone no configurada   | Agregar `"timezone": "America/Bogota"`                          |
+| Demasiados PRs individuales | Falta grouping            | Agregar packageRule con `groupName` para patches                |
+| PR major inesperado         | Falta la regla de bloqueo | packageRule con `matchUpdateTypes: ["major"]`, `enabled: false` |
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Evaluar automerge de patches después de un mes de confianza en el setup
+- [ ] Configurar Renovate para el proyecto Astro (dev-brain) igual que Ceres
+- [ ] Revisar si vale grouping de minor updates también
+- [ ] Explorar Merge Confidence badges para decidir merges más rápido
+
+---
+
+## Links útiles
+
+- [Docs de configuración de Renovate](https://docs.renovatebot.com/configuration-options/)
+- [changelogs.xyz](https://changelogs.xyz)
+- [Nota concepto: gestión de dependencias](/concepts/general/dependency-management)

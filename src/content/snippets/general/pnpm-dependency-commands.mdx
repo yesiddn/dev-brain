@@ -1,0 +1,74 @@
+---
+title: "Comandos para gestionar dependencias (pnpm)"
+description: "Comandos rápidos para auditar, revisar y actualizar dependencias en proyectos con pnpm"
+tech: ["pnpm", "typescript"]
+tags: ["dependencies", "pnpm", "cli", "updates", "audit"]
+language: "bash"
+level: "basico"
+status: "active"
+copyReady: true
+context: "cualquier proyecto JS/TS"
+updatedAt: 2026-08-01
+summary: "ncu para ver qué está viejo, pnpm update para aplicar, changelogs.xyz para revisar cambios"
+related:
+  ["concepto-gestion-dependencias", "playbook-actualizacion-dependencias"]
+---
+
+## Qué hace
+
+Set de comandos para el ciclo completo: detectar qué está desactualizado → revisar changelogs → actualizar → verificar seguridad.
+
+## Ver qué está desactualizado
+
+```bash
+npx npm-check-updates
+# Agrupa por Patch / Minor / Major con colores
+# Respeta minimumReleaseAge de pnpm-workspace.yaml si existe
+```
+
+## Actualizar
+
+```bash
+# Solo patch y minor (respeta los rangos ^ y ~ de package.json)
+pnpm update
+
+# Actualizar TODO incluyendo major (modifica package.json)
+npx npm-check-updates -u
+pnpm install
+
+# Actualizar una sola dependencia
+pnpm update axios
+```
+
+## Revisar changelogs
+
+```bash
+# Opción 1: browser (la más confiable)
+# https://changelogs.xyz/axios
+# https://changelogs.xyz/vite
+
+# Opción 2: fuente de verdad directa
+# https://github.com/<org>/<repo>/releases
+```
+
+## Seguridad
+
+```bash
+# Auditar vulnerabilidades conocidas
+pnpm audit
+
+# Auditar e intentar fix automático
+pnpm audit --fix
+```
+
+## Notas
+
+- `pnpm update` solo actualiza dentro del rango declarado en package.json (`^1.18.0` → llega a `1.x.x`, nunca a `2.0.0`)
+- Para major updates hay que usar `ncu -u` o editar package.json a mano
+- `@types/node` y TypeScript no tienen changelog en changelogs.xyz → ir a GitHub releases o al blog oficial de TypeScript
+- Después de cualquier update: correr tests + build antes de commitear
+
+## Cuándo NO usar
+
+- `pnpm update` a ciegas sin revisar nada si hay major pendientes → usá `ncu` primero para ver el panorama
+- `pnpm audit --fix` en producción sin revisar qué cambia → puede forzar updates major transitivas

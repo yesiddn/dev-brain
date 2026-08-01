@@ -1,0 +1,80 @@
+---
+title: "Gestión de dependencias en proyectos JS/TS"
+description: "Qué son las dependencias, cómo funciona semver y cómo decidir qué actualizar sin volverte loco"
+tech: ["typescript", "pnpm", "react"]
+tags: ["dependencies", "semver", "seguridad", "deuda-tecnica"]
+level: "medio"
+status: "active"
+updatedAt: 2026-08-01
+summary: "Las dependencias se gestionan con una rutina programada + automatización, no esperando a que algo se rompa"
+related:
+  ["playbook-actualizacion-dependencias", "snippets-gestion-dependencias"]
+---
+
+## En una línea
+
+> **Gestionar dependencias** es mantener los paquetes de tu proyecto actualizados de forma controlada: automatizar patch/minor, revisar major, y priorizar seguridad por encima de todo.
+
+## Por qué importa
+
+Sin gestión activa:
+
+- Vulnerabilidades de seguridad se acumulan sin que te enteres (como la que apareció en Ceres)
+- Las actualizaciones se atrasan y cuando finalmente actualizás, son major + major + major = migración dolorosa
+- Deuda técnica silenciosa: cada semana que pasa, más caro es ponerte al día
+
+Con gestión activa:
+
+- Actualizaciones chicas y frecuentes = riesgo bajo por cambio
+- Sabés qué cambió antes de mergear
+- Las major updates son eventos planificados, no sorpresas
+
+## Semver: la clave para decidir
+
+1.19.0
+│ │ └─ patch: bug fixes, backwards-compatible → actualizar sin pensar
+│ └──── minor: features nuevas, backwards-compatible → actualizar, skim del changelog
+└─────── major: breaking changes → leer changelog completo + plan de migración
+
+En `package.json`, el prefijo importa:
+
+- `^1.19.0` → permite minor y patch (1.x.x). Es lo normal.
+- `~6.0.2` → solo patch (6.0.x). Más restrictivo.
+
+## Qué revisar según el tipo de update
+
+| Tipo      | ¿Leer changelog?               | Riesgo   | Acción                                                |
+| --------- | ------------------------------ | -------- | ----------------------------------------------------- |
+| Patch     | No                             | Muy bajo | Dejar que Renovate automergee o aplicar directo       |
+| Minor     | Skim (features + deprecations) | Bajo     | Aplicar + correr tests                                |
+| Major     | Sí, completo                   | Alto     | Revisar migration guide, rama aparte, tests completos |
+| Seguridad | Sí (qué CVE arregla)           | Crítico  | Actualizar YA, sin esperar al ciclo programado        |
+
+## El stack de herramientas
+
+- **npm-check-updates (`ncu`)**: muestra qué está desactualizado, agrupado por patch/minor/major
+- **changelogs.xyz**: ver changelogs de cualquier paquete en el browser
+- **Renovate**: automatiza todo el ciclo (ver playbook relacionado)
+- **GitHub Releases**: fuente de verdad cuando ninguna herramienta encuentra el changelog
+
+## Casos especiales
+
+**Paquetes sin changelog formal:**
+
+- `@types/*` (de DefinitelyTyped): no tienen changelog. Revisar commits en el repo o no preocuparse si los tests pasan — son solo tipos.
+- TypeScript major: el changelog está en el blog oficial (devblogs.microsoft.com/typescript), no en un CHANGELOG.md.
+
+**Vulnerabilidades:**
+
+- `pnpm audit` te dice qué hay roto ahora mismo
+- Las alerts de seguridad pisan cualquier schedule: se actualizan inmediatamente
+
+## Cuándo NO actualizar
+
+- Una major recién salida sin razón urgente (dejala madurar unas semanas, salvo que sea seguridad)
+- Antes de un release importante del producto
+- Si el paquete está deprecado → no actualizar, reemplazar
+
+---
+
+_Relacionado: [Playbook: actualización de dependencias](/playbooks/general/keeping-dependencies-updated-with-renovate) · [Snippet: comandos de gestión](/snippets/general/pnpm-dependency-commands)_
