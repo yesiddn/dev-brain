@@ -10,7 +10,7 @@ prerequisites:
   - "Repositorio en GitHub"
   - "Permisos para instalar GitHub Apps en el repo/org"
 estimatedTime: "20 min setup inicial, 15 min por revisión quincenal"
-updatedAt: 2026-08-01
+updatedAt: 2026-08-08
 createdAt: 2026-08-01
 summary: "Instalar la app de Renovate, configurar renovate.json para updates semanales de minor/patch, y establecer la rutina de revisión"
 related: ["concepto-gestion-dependencias", "snippets-gestion-dependencias"]
@@ -76,6 +76,30 @@ Mergear el onboarding PR → Renovate queda activo.
 
 ---
 
+## Lección aprendida (2026-08-08): `schedule` es un filtro, NO un disparador
+
+> ⚠️ **Error real cometido en Ceres:** la primera semana con esta config, Renovate no creó ningún PR. El dashboard mostraba todo en "Awaiting Schedule" y el log decía `Package not scheduled` / `Skipping branch creation as not within schedule` para las 6 ramas.
+
+**Qué pasó:** el `schedule` NO hace que Renovate corra los sábados. La app hosted de Mend corre jobs en su propio ritmo (por pushes a `main` y jobs periódicos de su infraestructura). Cuando un job corre, Renovate pregunta "¿estoy dentro de la ventana?" — si sí, crea los PRs; si no, los salta. El job de esa semana corrió un **viernes 11 AM**, fuera de la ventana `before 7am on Saturday` (~7 horas por semana), así que saltó todo.
+
+**Soluciones (de mejor a peor):**
+
+1. **Ampliar la ventana** → cambiar el schedule a algo que casi garantice que un job caiga dentro:
+
+   ```json
+   "schedule": ["every weekend"]
+   ```
+
+   o `"on Saturday"` si querés mantener el día. Es el fix definitivo.
+
+2. **Desbloqueo manual desde el dashboard** → marcar el checkbox `🔐 Create all awaiting schedule PRs at once 🔐` en el Dependency Dashboard. Esto "unschedulea" las ramas y en el próximo job se crean ignorando el schedule. Sirve para no esperar una semana.
+
+3. **Checkbox de "manual job"** (el último del dashboard) → fuerza un job inmediato, PERO si corre fuera de la ventana sigue sin crear nada. Solo sirve combinado con el punto 2.
+
+**Regla mental:** ventanas muy angostas (horas específicas) = alta probabilidad de que ningún job caiga dentro. Ventanas de días completos = confiable.
+
+---
+
 ## Paso 3: Rutina de revisión (cada 15 días)
 
 1. Revisar el **Dependency Dashboard** (issue que Renovate crea en el repo) para ver el estado general
@@ -87,6 +111,42 @@ Mergear el onboarding PR → Renovate queda activo.
    - `npx npm-check-updates` en el proyecto
    - Leer changelog/migration guide de las major que valgan la pena
    - Rama aparte, una dependencia a la vez, tests completos
+
+---
+
+## Lección aprendida (2026-08-08): por qué los PRs de npm solo tocan el `pnpm-lock.yaml` (y los de NuGet sí el `.csproj`)
+
+> ⚠️ **Confusión real en Ceres:** los PRs de axios, vite, react, etc. solo modificaban `frontend/pnpm-lock.yaml` y no el `package.json`. No es un bug — es el comportamiento esperado. Las ramas ya lo anuncian con el sufijo `-lockfile` (`renovate/axios-1.x-lockfile`).
+
+**Por qué:** en `package.json` las dependencias tienen rangos (`"axios": "^1.18.1"`). Como la nueva versión (1.19.0) **ya satisface el rango `^1.18.1`**, no hace falta editar el `package.json` — Renovate solo actualiza la versión pineada en el lockfile. Esto lo controla `rangeStrategy` (default `auto` → solo edita `package.json` cuando la nueva versión queda **fuera** del rango).
+
+En cambio, los `.csproj` de NuGet pinean versiones sin rangos (`10.0.9` → `10.0.10`), así que ahí **sí** se edita el archivo de proyecto en cada PR.
+
+**¿Cuándo lockfile-only está bien (apps como Ceres)?**
+
+- ✅ El lockfile es la fuente de verdad de lo que se instala en CI/producción
+- ✅ Diffs mínimos, menos ruido en los PRs
+- ✅ Un `pnpm install` fresco resolvería la última del rango de todas formas
+
+**¿Cuándo SÍ querés que toque el `package.json`? (librerías publicadas)**
+
+- Querés declarar el mínimo real a tus consumidores (`^1.19.0`)
+- Protección contra alguien que borre el lockfile e instale una versión vieja vulnerable
+
+En ese caso, agregar a la config:
+
+```json
+{
+  "packageRules": [
+    {
+      "matchManagers": ["npm"],
+      "rangeStrategy": "bump"
+    }
+  ]
+}
+```
+
+Para Ceres (app, no librería) la decisión fue **dejarlo lockfile-only**.
 
 ---
 
@@ -107,12 +167,14 @@ Casos sin changelog (ir directo al repo o al blog oficial):
 
 ## Errores comunes
 
-| Error                       | Causa                     | Solución                                                        |
-| --------------------------- | ------------------------- | --------------------------------------------------------------- |
-| Renovate no crea PRs        | Onboarding PR no mergeado | Mergear el PR "Configure Renovate"                              |
-| PRs creados en horario raro | Timezone no configurada   | Agregar `"timezone": "America/Bogota"`                          |
-| Demasiados PRs individuales | Falta grouping            | Agregar packageRule con `groupName` para patches                |
-| PR major inesperado         | Falta la regla de bloqueo | packageRule con `matchUpdateTypes: ["major"]`, `enabled: false` |
+| Error                                                  | Causa                                                                  | Solución                                                                                         |
+| ------------------------------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Renovate no crea PRs                                   | Onboarding PR no mergeado                                              | Mergear el PR "Configure Renovate"                                                               |
+| PRs creados en horario raro                            | Timezone no configurada                                                | Agregar `"timezone": "America/Bogota"`                                                           |
+| Demasiados PRs individuales                            | Falta grouping                                                         | Agregar packageRule con `groupName` para patches                                                 |
+| PR major inesperado                                    | Falta la regla de bloqueo                                              | packageRule con `matchUpdateTypes: ["major"]`, `enabled: false`                                  |
+| Job corre pero no crea PRs (`not-scheduled` en el log) | El job corrió fuera de la ventana del schedule (es filtro, no trigger) | Ampliar schedule a `"every weekend"` o marcar "Create all awaiting schedule PRs" en el dashboard |
+| PR de npm solo modifica el lockfile                    | La nueva versión ya satisface el rango `^` → lockfile-only update      | Comportamiento esperado en apps; si es librería, `rangeStrategy: "bump"`                         |
 
 ---
 
@@ -128,5 +190,7 @@ Casos sin changelog (ir directo al repo o al blog oficial):
 ## Links útiles
 
 - [Docs de configuración de Renovate](https://docs.renovatebot.com/configuration-options/)
+- [Docs de `rangeStrategy`](https://docs.renovatebot.com/configuration-options/#rangestrategy)
+- [Docs de `schedule`](https://docs.renovatebot.com/configuration-options/#schedule)
 - [changelogs.xyz](https://changelogs.xyz)
 - [Nota concepto: gestión de dependencias](/concepts/general/dependency-management)
