@@ -150,6 +150,52 @@ Para Ceres (app, no librería) la decisión fue **dejarlo lockfile-only**.
 
 ---
 
+## Lección aprendida (2026-08-08): `minimumReleaseAge` de pnpm puede rechazar los PRs de Renovate
+
+> ⚠️ **Error real en Ceres:** un PR de Renovate falló con "⚠️ Artifact update problem" y el log mostraba `[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION]` en `frontend/pnpm-lock.yaml`. Además el PR quedó conflicted contra `main` por una versión distinta de `react-hook-form`.
+
+**Qué pasó:** pnpm 11+ trae una protección de cadena de suministro llamada `minimumReleaseAge` (default **1440 minutos = 1 día**): no instala versiones publicadas hace menos de ese tiempo. En este caso, Renovate actualizó `react-hook-form` a la `7.85.0`, pero esa versión se había publicado **el mismo día** (~17 horas antes) — era literalmente "demasiado fresca" para la política de pnpm. El lockfile ya la contenía, así que TODO `pnpm install` fallaba hasta que la versión cumpliera 24 horas de antigüedad.
+
+⚠️ **No es un ataque ni un bug** — es la protección funcionando tal cual. La versión era legítima, solo muy nueva. El ataque que esto previene: alguien publica una versión comprometida y los bots la instalan en minutos; con la espera de 24h, npm suele detectarla y retirarla antes de que la instales.
+
+**Soluciones (de mejor a peor):**
+
+1. **Alinear Renovate con pnpm (fix definitivo)** → agregar un cooldown en `renovate.json` mayor que el de pnpm, así Renovate no propone versiones que pnpm rechazaría:
+
+   ```json
+   {
+     "minimumReleaseAge": "2 days"
+   }
+   ```
+
+   Acepta `"1 day"`, `"2 days"`, `"7 days"`, etc. Con el schedule de fin de semana casi no se nota el retraso, y de paso te protegés de versiones maliciosas que se retiran en las primeras 24-48h.
+
+2. **Esperar y reintentar** → si el error ya ocurrió: la versión "fresca" cumple la edad mínima en ~1 día. Marcar el checkbox de rebase/retry del PR (o renombrar el título a `rebase! ...`) y Renovate regenera el lockfile — eso también resuelve el conflicto de merge, porque el lockfile se reconstruye desde cero (los conflictos en `pnpm-lock.yaml` **nunca se resuelven a mano**).
+
+3. **Excepción puntual en pnpm** (si hay prisa, antes de las 24h) → en `pnpm-workspace.yaml`:
+
+   ```yaml
+   minimumReleaseAgeExclude:
+     - react-hook-form
+   ```
+
+   y luego `pnpm install` para regenerar el lockfile localmente.
+
+4. **Desactivar la política** ❌ → `minimumReleaseAge: 0` funciona, pero apaga una protección de seguridad útil por un problema que se resuelve solo esperando. No recomendado.
+
+**Regla mental:** si Renovate es más rápido que `minimumReleaseAge` de pnpm, sus PRs van a fallar intermitentemente. El cooldown de Renovate debe ser **mayor o igual** que el de pnpm.
+
+**Bonus - excepción para paquetes críticos:** si algún día necesitás que una dependencia se actualice sin esperar (ej. parche de seguridad urgente), se puede exceptuar en `packageRules`:
+
+```json
+{
+  "matchPackageNames": ["axios"],
+  "minimumReleaseAge": "0 days"
+}
+```
+
+---
+
 ## Paso 4: Dónde leer changelogs
 
 Orden de preferencia:
@@ -167,14 +213,15 @@ Casos sin changelog (ir directo al repo o al blog oficial):
 
 ## Errores comunes
 
-| Error                                                  | Causa                                                                  | Solución                                                                                         |
-| ------------------------------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| Renovate no crea PRs                                   | Onboarding PR no mergeado                                              | Mergear el PR "Configure Renovate"                                                               |
-| PRs creados en horario raro                            | Timezone no configurada                                                | Agregar `"timezone": "America/Bogota"`                                                           |
-| Demasiados PRs individuales                            | Falta grouping                                                         | Agregar packageRule con `groupName` para patches                                                 |
-| PR major inesperado                                    | Falta la regla de bloqueo                                              | packageRule con `matchUpdateTypes: ["major"]`, `enabled: false`                                  |
-| Job corre pero no crea PRs (`not-scheduled` en el log) | El job corrió fuera de la ventana del schedule (es filtro, no trigger) | Ampliar schedule a `"every weekend"` o marcar "Create all awaiting schedule PRs" en el dashboard |
-| PR de npm solo modifica el lockfile                    | La nueva versión ya satisface el rango `^` → lockfile-only update      | Comportamiento esperado en apps; si es librería, `rangeStrategy: "bump"`                         |
+| Error                                                  | Causa                                                                                               | Solución                                                                                                        |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Renovate no crea PRs                                   | Onboarding PR no mergeado                                                                           | Mergear el PR "Configure Renovate"                                                                              |
+| PRs creados en horario raro                            | Timezone no configurada                                                                             | Agregar `"timezone": "America/Bogota"`                                                                          |
+| Demasiados PRs individuales                            | Falta grouping                                                                                      | Agregar packageRule con `groupName` para patches                                                                |
+| PR major inesperado                                    | Falta la regla de bloqueo                                                                           | packageRule con `matchUpdateTypes: ["major"]`, `enabled: false`                                                 |
+| Job corre pero no crea PRs (`not-scheduled` en el log) | El job corrió fuera de la ventana del schedule (es filtro, no trigger)                              | Ampliar schedule a `"every weekend"` o marcar "Create all awaiting schedule PRs" en el dashboard                |
+| PR de npm solo modifica el lockfile                    | La nueva versión ya satisface el rango `^` → lockfile-only update                                   | Comportamiento esperado en apps; si es librería, `rangeStrategy: "bump"`                                        |
+| PR falla con `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`  | Renovate propuso una versión publicada hace menos de 24h (política `minimumReleaseAge` de pnpm 11+) | Agregar `"minimumReleaseAge": "2 days"` en renovate.json; si ya ocurrió, esperar ~1 día y reintentar con rebase |
 
 ---
 
@@ -184,6 +231,7 @@ Casos sin changelog (ir directo al repo o al blog oficial):
 - [ ] Configurar Renovate para el proyecto Astro (dev-brain) igual que Ceres
 - [ ] Revisar si vale grouping de minor updates también
 - [ ] Explorar Merge Confidence badges para decidir merges más rápido
+- [ ] Verificar que `"minimumReleaseAge": "2 days"` esté en el renovate.json de Ceres y del dev-brain
 
 ---
 
@@ -192,5 +240,7 @@ Casos sin changelog (ir directo al repo o al blog oficial):
 - [Docs de configuración de Renovate](https://docs.renovatebot.com/configuration-options/)
 - [Docs de `rangeStrategy`](https://docs.renovatebot.com/configuration-options/#rangestrategy)
 - [Docs de `schedule`](https://docs.renovatebot.com/configuration-options/#schedule)
+- [Docs de `minimumReleaseAge` en Renovate](https://docs.renovatebot.com/configuration-options/#minimumreleaseage)
+- [Docs de `minimumReleaseAge` en pnpm](https://pnpm.io/settings#minimumreleaseage)
 - [changelogs.xyz](https://changelogs.xyz)
 - [Nota concepto: gestión de dependencias](/concepts/general/dependency-management)
