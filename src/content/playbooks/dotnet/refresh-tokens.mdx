@@ -1,0 +1,1767 @@
+---
+title: "Cómo implementar persistencia segura de Refresh Tokens en .NET + EF Core"
+description: "Guía práctica y conceptual para modelar, configurar y persistir refresh tokens opacos de forma segura usando .NET, EF Core y PostgreSQL"
+goal: "Tener una capa de persistencia para refresh tokens lista para soportar renovación, revocación y rotación de sesiones"
+tech: ["dotnet", "csharp", "ef-core", "postgresql"]
+tags:
+  [
+    "authentication",
+    "refresh-token",
+    "security",
+    "ef-core",
+    "repository",
+    "jwt",
+  ]
+level: "intermedio"
+status: "active"
+prerequisites:
+  - ".NET SDK instalado"
+  - "Proyecto backend con Entity Framework Core configurado"
+  - "Base de datos PostgreSQL conectada"
+  - "Entidad User existente"
+  - "Conocimientos básicos de JWT, EF Core y relaciones entre entidades"
+estimatedTime: "45-60 min"
+updatedAt: 2026-08-13
+createdAt: 2026-08-13
+summary: "Implementación reusable de la persistencia de refresh tokens: entidad, relación con User, Fluent API, índices, repositorio, DI, migración y validación del esquema"
+related: []
+---
+
+import { Code } from "astro:components";
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**
+> Cuando un backend utiliza **access tokens JWT de corta duración** y necesitás agregar sesiones renovables mediante **refresh tokens**, conservando en el servidor la capacidad de expirar, revocar y rotar esas sesiones.
+
+Este playbook se concentra únicamente en la **persistencia**.
+
+Al terminar vas a tener:
+
+- ✅ Una entidad `RefreshToken`
+- ✅ Una relación `User 1:N RefreshToken`
+- ✅ Una tabla para sesiones renovables
+- ✅ Almacenamiento exclusivo del **hash** del refresh token
+- ✅ Índices para búsquedas frecuentes
+- ✅ Un repositorio para consultar, crear y revocar tokens
+- ✅ Una migración EF Core lista para PostgreSQL
+- ✅ Una base preparada para implementar posteriormente generación, refresh, rotación y logout
+
+Este playbook **no implementa todavía**:
+
+- generación criptográfica del refresh token;
+- hashing del refresh token;
+- endpoint `/refresh`;
+- cookies `HttpOnly`;
+- rotación;
+- logout;
+- blacklist de access tokens JWT.
+
+Es importante mantener esa separación porque aquí estamos resolviendo una sola responsabilidad:
+
+```text
+¿Cómo representar y persistir una sesión renovable?
+```
+
+---
+
+## Antes de empezar: access token y refresh token no son lo mismo
+
+Una implementación segura normalmente utiliza dos tipos de token.
+
+### Access token
+
+El access token suele ser un JWT:
+
+```text
+Access Token
+├── corta duración
+├── contiene claims
+├── se envía en Authorization: Bearer ...
+├── permite acceder a endpoints protegidos
+└── normalmente NO se persiste
+```
+
+Ejemplo:
+
+```http
+Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
+```
+
+El servidor valida su:
+
+- firma;
+- issuer;
+- audience;
+- expiración.
+
+La idea es mantenerlo **stateless**.
+
+---
+
+### Refresh token
+
+El refresh token cumple una responsabilidad diferente:
+
+```text
+Refresh Token
+├── larga duración
+├── normalmente opaco
+├── representa una sesión renovable
+├── permite conseguir un nuevo access token
+└── requiere estado en el servidor
+```
+
+El servidor necesita recordar esta sesión porque posteriormente debe poder responder preguntas como:
+
+```text
+¿Este refresh token existe?
+
+¿Expiró?
+
+¿Fue revocado?
+
+¿Ya fue reemplazado?
+
+¿A qué usuario pertenece?
+```
+
+Por eso el refresh token sí necesita persistencia.
+
+---
+
+## Regla principal de seguridad
+
+> **Nunca almacenes el refresh token real en la base de datos.**
+
+Si el cliente recibe:
+
+```text
+FJneNf8UHqiCBv1R7C4YjP...
+```
+
+la base de datos no debería almacenar ese mismo valor.
+
+Debe almacenar algo como:
+
+```text
+SHA256(FJneNf8UHqiCBv1R7C4YjP...)
+```
+
+Conceptualmente:
+
+```text
+Cliente
+  │
+  │ refresh token real
+  ▼
+Hash
+  │
+  │ TokenHash
+  ▼
+Base de datos
+```
+
+Esto limita el impacto de una filtración de la base de datos.
+
+Un atacante que robe la tabla no debería poder copiar directamente los tokens y utilizarlos para renovar sesiones.
+
+---
+
+# Paso 1: Definir qué representa un `RefreshToken`
+
+Antes de escribir código, modelá el concepto.
+
+Un registro de refresh token puede representar:
+
+```text
+una sesión renovable de un usuario
+```
+
+Por ejemplo:
+
+```text
+User
+├── sesión laptop
+├── sesión desktop
+└── sesión teléfono
+```
+
+Por eso la relación natural es:
+
+```text
+User 1 ─────────── N RefreshToken
+```
+
+Un usuario puede tener múltiples refresh tokens.
+
+Cada uno puede representar una sesión independiente.
+
+---
+
+## Campos recomendados
+
+Una entidad mínima pero preparada para rotación puede contener:
+
+```text
+Id
+TokenHash
+UserId
+ExpiresAt
+RevokedAt
+ReplacedByTokenHash
+CreatedAt
+```
+
+Responsabilidad de cada campo:
+
+| Campo                 | Propósito                                           |
+| --------------------- | --------------------------------------------------- |
+| `Id`                  | Identificador interno del registro                  |
+| `TokenHash`           | Hash del refresh token real                         |
+| `UserId`              | Usuario propietario de la sesión                    |
+| `ExpiresAt`           | Momento en el que deja de ser válido                |
+| `RevokedAt`           | Momento en que se revocó manualmente o por rotación |
+| `ReplacedByTokenHash` | Hash del token que reemplazó al actual              |
+| `CreatedAt`           | Fecha de creación de la sesión                      |
+
+---
+
+# Paso 2: Crear la entidad `RefreshToken`
+
+Una estructura habitual podría ser:
+
+```text
+Domain/
+└── Identity/
+    └── Entities/
+        ├── User.cs
+        └── RefreshToken.cs
+```
+
+Ejemplo:
+
+```csharp
+namespace MyProject.Domain.Identity.Entities;
+
+public class RefreshToken
+{
+    public Guid Id { get; set; }
+
+    public string TokenHash { get; set; } = null!;
+
+    public Guid UserId { get; set; }
+
+    public User User { get; set; } = null!;
+
+    public DateTime ExpiresAt { get; set; }
+
+    public DateTime? RevokedAt { get; set; }
+
+    public string? ReplacedByTokenHash { get; set; }
+
+    public DateTime CreatedAt { get; private set; }
+}
+```
+
+---
+
+## ¿Por qué tenemos `UserId` y `User`?
+
+Porque cumplen funciones diferentes.
+
+### `UserId`
+
+```csharp
+public Guid UserId { get; set; }
+```
+
+Es la **foreign key**.
+
+PostgreSQL almacenará algo equivalente a:
+
+```text
+RefreshTokens.UserId
+            │
+            ▼
+Users.Id
+```
+
+---
+
+### `User`
+
+```csharp
+public User User { get; set; } = null!;
+```
+
+Es una **navigation property de EF Core**.
+
+Representa la relación desde C#.
+
+Por ejemplo, si la relación fue cargada:
+
+```csharp
+refreshToken.User.Email
+```
+
+No representa otra columna.
+
+Representa una conexión entre entidades.
+
+---
+
+# Paso 3: Añadir la relación inversa a `User`
+
+La entidad `User` debería poder expresar que posee varios refresh tokens.
+
+```csharp
+public class User
+{
+    public Guid Id { get; set; }
+
+    public string Email { get; set; } = null!;
+
+    public string PasswordHash { get; set; } = null!;
+
+    public DateTime CreatedAt { get; private set; }
+
+    public ICollection<RefreshToken> RefreshTokens { get; set; }
+        = new List<RefreshToken>();
+}
+```
+
+Ahora el modelo expresa explícitamente:
+
+```text
+User
+ │
+ │ 1:N
+ ▼
+RefreshToken
+```
+
+---
+
+## ¿Por qué no asumir un único refresh token por usuario?
+
+Porque eso impediría manejar correctamente múltiples sesiones.
+
+Un usuario podría iniciar sesión desde:
+
+```text
+Laptop
+Teléfono
+Tablet
+```
+
+Cada dispositivo debería poder:
+
+- renovar independientemente;
+- expirar independientemente;
+- cerrar sesión independientemente.
+
+El modelo `1:N` permite hacerlo.
+
+---
+
+# Paso 4: Mantener EF Core fuera de la entidad
+
+Evita llenar la entidad con atributos de persistencia como:
+
+```csharp
+[Table]
+[Required]
+[MaxLength]
+[Index]
+```
+
+Una alternativa más limpia consiste en mantener la entidad como concepto del dominio y configurar EF Core mediante **Fluent API**.
+
+Estructura:
+
+```text
+Infrastructure/
+└── Persistence/
+    └── Configurations/
+        └── RefreshTokenConfiguration.cs
+```
+
+Base de la configuración:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using MyProject.Domain.Identity.Entities;
+
+namespace MyProject.Infrastructure.Persistence.Configurations;
+
+public class RefreshTokenConfiguration
+    : IEntityTypeConfiguration<RefreshToken>
+{
+    public void Configure(EntityTypeBuilder<RefreshToken> builder)
+    {
+    }
+}
+```
+
+La separación queda así:
+
+```text
+RefreshToken.cs
+    │
+    └── ¿Qué representa este concepto?
+
+RefreshTokenConfiguration.cs
+    │
+    └── ¿Cómo se persiste este concepto?
+```
+
+---
+
+# Paso 5: Configurar tabla y primary key
+
+Dentro de `Configure`:
+
+```csharp
+builder.ToTable("RefreshTokens", "identity");
+
+builder.HasKey(refreshToken => refreshToken.Id);
+```
+
+Esto generará:
+
+```text
+identity.RefreshTokens
+```
+
+Usar un schema específico como:
+
+```text
+identity
+```
+
+es opcional, pero resulta útil cuando la base de datos contiene varios dominios.
+
+Por ejemplo:
+
+```text
+identity.Users
+identity.RefreshTokens
+
+finance.Accounts
+finance.Transactions
+finance.Categories
+```
+
+---
+
+# Paso 6: Configurar `TokenHash`
+
+```csharp
+builder.Property(refreshToken => refreshToken.TokenHash)
+    .IsRequired()
+    .HasMaxLength(128);
+```
+
+Después agregá un índice único:
+
+```csharp
+builder.HasIndex(refreshToken => refreshToken.TokenHash)
+    .IsUnique()
+    .HasDatabaseName("IX_RefreshTokens_TokenHash");
+```
+
+---
+
+## ¿Por qué `TokenHash` debe ser único?
+
+Dos sesiones nunca deberían compartir exactamente el mismo refresh token.
+
+Queremos proteger este invariante:
+
+```text
+TokenHash
+────────────
+abc123       ✓
+xyz456       ✓
+abc123       ✗
+```
+
+La restricción debe existir en la base de datos, no solamente en C#.
+
+Esto también protege frente a condiciones de carrera.
+
+---
+
+## ¿Por qué `HasMaxLength(128)`?
+
+Depende de cómo representes el hash.
+
+Por ejemplo:
+
+```text
+SHA-256 = 256 bits
+```
+
+Representado en hexadecimal:
+
+```text
+64 caracteres
+```
+
+Una longitud de `128` permite margen sin convertir la columna innecesariamente en `text`.
+
+No es una regla criptográfica.
+
+Es únicamente una decisión de persistencia.
+
+> ⚠️ El tamaño debe revisarse si en el futuro cambiás algoritmo o representación.
+
+---
+
+# Paso 7: Configurar fechas
+
+## `ExpiresAt`
+
+```csharp
+builder.Property(refreshToken => refreshToken.ExpiresAt)
+    .HasColumnType("timestamp with time zone")
+    .IsRequired();
+```
+
+Representa:
+
+```text
+¿Cuándo deja de ser válida esta sesión?
+```
+
+---
+
+## `RevokedAt`
+
+```csharp
+builder.Property(refreshToken => refreshToken.RevokedAt)
+    .HasColumnType("timestamp with time zone");
+```
+
+Es nullable porque un token nuevo todavía está activo:
+
+```text
+RevokedAt = null
+```
+
+Cuando se revoca:
+
+```text
+RevokedAt = 2026-08-13 21:30 UTC
+```
+
+---
+
+## `CreatedAt`
+
+Podés permitir que PostgreSQL genere el valor:
+
+```csharp
+builder.Property(refreshToken => refreshToken.CreatedAt)
+    .HasColumnType("timestamp with time zone")
+    .HasDefaultValueSql("CURRENT_TIMESTAMP")
+    .ValueGeneratedOnAdd()
+    .IsRequired();
+```
+
+Así evitás repetir:
+
+```csharp
+CreatedAt = DateTime.UtcNow;
+```
+
+en cada lugar que crea un refresh token.
+
+---
+
+# Paso 8: Configurar `ReplacedByTokenHash`
+
+```csharp
+builder.Property(refreshToken => refreshToken.ReplacedByTokenHash)
+    .HasMaxLength(128);
+```
+
+Es nullable.
+
+Un token nuevo normalmente comienza así:
+
+```text
+RevokedAt = null
+ReplacedByTokenHash = null
+```
+
+Durante una futura rotación:
+
+```text
+Refresh Token A
+      │
+      │ usado para renovar
+      ▼
+A se revoca
+      │
+      └──── reemplazado por ────► Refresh Token B
+```
+
+Entonces A podría quedar:
+
+```text
+RevokedAt = fecha actual
+ReplacedByTokenHash = hash de B
+```
+
+Esto permite conservar el historial de rotación.
+
+---
+
+# Paso 9: Configurar la relación `User 1:N RefreshToken`
+
+```csharp
+builder.HasOne(refreshToken => refreshToken.User)
+    .WithMany(user => user.RefreshTokens)
+    .HasForeignKey(refreshToken => refreshToken.UserId)
+    .OnDelete(DeleteBehavior.Cascade);
+```
+
+Esto representa:
+
+```text
+identity.Users
+      │
+      │ Id
+      │
+      └──────────────┐
+                     │ FK
+                     ▼
+identity.RefreshTokens
+              UserId
+```
+
+---
+
+## ¿Por qué `Cascade`?
+
+Porque un refresh token depende completamente de un usuario.
+
+Una sesión renovable sin usuario propietario no tiene sentido.
+
+Entonces:
+
+```text
+User eliminado
+      ↓
+RefreshTokens del usuario eliminados
+```
+
+Este comportamiento debe evaluarse según las reglas de cada proyecto.
+
+Si los usuarios se eliminan mediante soft-delete, probablemente nunca se active el cascade.
+
+---
+
+# Paso 10: Crear índices útiles
+
+Además del índice único de `TokenHash`, conviene agregar:
+
+```csharp
+builder.HasIndex(refreshToken => refreshToken.UserId)
+    .HasDatabaseName("IX_RefreshTokens_UserId");
+```
+
+y:
+
+```csharp
+builder.HasIndex(refreshToken => refreshToken.ExpiresAt)
+    .HasDatabaseName("IX_RefreshTokens_ExpiresAt");
+```
+
+---
+
+## Índice por `UserId`
+
+Facilita consultas como:
+
+```text
+Dame todas las sesiones de este usuario.
+```
+
+Conceptualmente:
+
+```sql
+WHERE "UserId" = ...
+```
+
+Puede ser útil para:
+
+- mostrar sesiones activas;
+- revocar todas las sesiones;
+- cerrar sesión en todos los dispositivos.
+
+---
+
+## Índice por `ExpiresAt`
+
+Facilita operaciones como:
+
+```text
+buscar tokens vencidos;
+eliminar sesiones expiradas;
+realizar limpieza periódica.
+```
+
+Conceptualmente:
+
+```sql
+WHERE "ExpiresAt" < NOW()
+```
+
+---
+
+# Paso 11: Configuración completa
+
+Una configuración típica quedaría así:
+
+```csharp
+public void Configure(EntityTypeBuilder<RefreshToken> builder)
+{
+    builder.ToTable("RefreshTokens", "identity");
+
+    builder.HasKey(refreshToken => refreshToken.Id);
+
+    builder.Property(refreshToken => refreshToken.TokenHash)
+        .IsRequired()
+        .HasMaxLength(128);
+
+    builder.Property(refreshToken => refreshToken.ExpiresAt)
+        .HasColumnType("timestamp with time zone")
+        .IsRequired();
+
+    builder.Property(refreshToken => refreshToken.RevokedAt)
+        .HasColumnType("timestamp with time zone");
+
+    builder.Property(refreshToken => refreshToken.ReplacedByTokenHash)
+        .HasMaxLength(128);
+
+    builder.Property(refreshToken => refreshToken.CreatedAt)
+        .HasColumnType("timestamp with time zone")
+        .HasDefaultValueSql("CURRENT_TIMESTAMP")
+        .ValueGeneratedOnAdd()
+        .IsRequired();
+
+    builder.HasOne(refreshToken => refreshToken.User)
+        .WithMany(user => user.RefreshTokens)
+        .HasForeignKey(refreshToken => refreshToken.UserId)
+        .OnDelete(DeleteBehavior.Cascade);
+
+    builder.HasIndex(refreshToken => refreshToken.TokenHash)
+        .IsUnique()
+        .HasDatabaseName("IX_RefreshTokens_TokenHash");
+
+    builder.HasIndex(refreshToken => refreshToken.UserId)
+        .HasDatabaseName("IX_RefreshTokens_UserId");
+
+    builder.HasIndex(refreshToken => refreshToken.ExpiresAt)
+        .HasDatabaseName("IX_RefreshTokens_ExpiresAt");
+}
+```
+
+---
+
+# Paso 12: Registrar el `DbSet`
+
+En tu `DbContext`:
+
+```csharp
+public class AppDbContext(DbContextOptions<AppDbContext> options)
+    : DbContext(options)
+{
+    public DbSet<User> Users => Set<User>();
+
+    public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        builder.ApplyConfigurationsFromAssembly(
+            typeof(AppDbContext).Assembly);
+    }
+}
+```
+
+---
+
+## ¿Es obligatorio el `DbSet`?
+
+EF Core puede descubrir entidades por relaciones o configuraciones.
+
+Aun así, declarar:
+
+```csharp
+public DbSet<RefreshToken> RefreshTokens => Set<RefreshToken>();
+```
+
+hace explícito que la aplicación persiste esta entidad y facilita posteriormente:
+
+```csharp
+_dbContext.RefreshTokens
+```
+
+en los repositorios.
+
+---
+
+## `ApplyConfigurationsFromAssembly`
+
+Si ya tenés:
+
+```csharp
+builder.ApplyConfigurationsFromAssembly(
+    typeof(AppDbContext).Assembly);
+```
+
+no necesitás registrar manualmente:
+
+```csharp
+RefreshTokenConfiguration
+```
+
+EF Core encontrará automáticamente las implementaciones de:
+
+```csharp
+IEntityTypeConfiguration<T>
+```
+
+dentro del assembly.
+
+---
+
+# Paso 13: Compilar antes de continuar
+
+No esperes hasta el final para probar.
+
+Ejecutá:
+
+```bash
+dotnet build
+```
+
+En este punto estás verificando únicamente:
+
+```text
+Domain
+  +
+relación
+  +
+configuración EF
+  +
+DbContext
+```
+
+Si algo falla, el problema está contenido en ese grupo.
+
+> ⚠️ **Regla útil:** después de cada bloque arquitectónico importante, compilá.
+
+---
+
+# Paso 14: Diseñar el repositorio
+
+La persistencia debería permitir como mínimo:
+
+```text
+buscar por hash;
+crear;
+revocar;
+guardar cambios.
+```
+
+Una interfaz sencilla:
+
+```csharp
+public interface IRefreshTokenRepository
+{
+    Task<RefreshToken?> FindByHashAsync(
+        string tokenHash,
+        CancellationToken cancellationToken = default);
+
+    Task AddAsync(
+        RefreshToken refreshToken,
+        CancellationToken cancellationToken = default);
+
+    void Revoke(
+        RefreshToken refreshToken,
+        DateTime revokedAt,
+        string? replacedByTokenHash = null);
+
+    Task SaveChangesAsync(
+        CancellationToken cancellationToken = default);
+}
+```
+
+---
+
+# Paso 15: ¿Por qué separar `SaveChangesAsync`?
+
+Esta es una de las decisiones más importantes del diseño.
+
+Podríamos implementar:
+
+```csharp
+AddAsync(...)
+{
+    Add(...);
+    SaveChangesAsync();
+}
+```
+
+Pero eso obliga a persistir cada operación inmediatamente.
+
+Para refresh tokens, posteriormente necesitaremos rotación.
+
+Una rotación suele ser:
+
+```text
+1. encontrar token A;
+2. validar A;
+3. revocar A;
+4. crear token B;
+5. guardar ambos cambios.
+```
+
+Queremos:
+
+```text
+A.RevokedAt = now
+A.ReplacedByTokenHash = B.TokenHash
+
+Add(B)
+
+SaveChanges()
+```
+
+y no:
+
+```text
+Revocar A
+    ↓
+SaveChanges ✓
+
+Crear B
+    ↓
+SaveChanges ✗
+```
+
+Porque en ese segundo caso podríamos terminar con:
+
+```text
+A revocado
+B nunca creado
+```
+
+La sesión queda rota.
+
+Separar `SaveChangesAsync` prepara el código para tratar revocación + creación como **una misma unidad lógica**.
+
+---
+
+# Paso 16: Implementar `RefreshTokenRepository`
+
+Base:
+
+```csharp
+public sealed class RefreshTokenRepository(
+    AppDbContext dbContext)
+    : IRefreshTokenRepository
+{
+    private readonly AppDbContext _dbContext = dbContext;
+}
+```
+
+---
+
+## Buscar por hash
+
+```csharp
+public Task<RefreshToken?> FindByHashAsync(
+    string tokenHash,
+    CancellationToken cancellationToken = default)
+{
+    return _dbContext.RefreshTokens
+        .SingleOrDefaultAsync(
+            refreshToken => refreshToken.TokenHash == tokenHash,
+            cancellationToken);
+}
+```
+
+---
+
+## ¿Por qué `SingleOrDefaultAsync`?
+
+Porque `TokenHash` tiene una restricción única.
+
+Los únicos estados válidos son:
+
+```text
+0 coincidencias → null
+1 coincidencia  → RefreshToken
+```
+
+Dos resultados representarían una inconsistencia del esquema.
+
+---
+
+# Paso 17: Implementar `AddAsync`
+
+```csharp
+public async Task AddAsync(
+    RefreshToken refreshToken,
+    CancellationToken cancellationToken = default)
+{
+    await _dbContext.RefreshTokens
+        .AddAsync(refreshToken, cancellationToken);
+}
+```
+
+Importante:
+
+```csharp
+AddAsync()
+```
+
+solo registra la entidad en el Change Tracker.
+
+No ejecutamos:
+
+```csharp
+SaveChangesAsync()
+```
+
+todavía.
+
+---
+
+# Paso 18: Implementar `Revoke`
+
+Versión sencilla:
+
+```csharp
+public void Revoke(
+    RefreshToken refreshToken,
+    DateTime revokedAt,
+    string? replacedByTokenHash = null)
+{
+    refreshToken.RevokedAt = revokedAt;
+    refreshToken.ReplacedByTokenHash = replacedByTokenHash;
+}
+```
+
+---
+
+## ¿Por qué no necesitamos llamar `Update()`?
+
+Si previamente recuperaste la entidad mediante:
+
+```csharp
+_dbContext.RefreshTokens
+    .SingleOrDefaultAsync(...)
+```
+
+EF Core ya está haciendo tracking.
+
+Flujo:
+
+```text
+SELECT
+  ↓
+RefreshToken
+  ↓
+Change Tracker
+  ↓
+modificás propiedades
+  ↓
+estado Modified
+  ↓
+SaveChanges
+```
+
+Por eso normalmente no necesitás:
+
+```csharp
+_dbContext.RefreshTokens.Update(refreshToken);
+```
+
+---
+
+# Paso 19: Implementar `SaveChangesAsync`
+
+```csharp
+public async Task SaveChangesAsync(
+    CancellationToken cancellationToken = default)
+{
+    await _dbContext.SaveChangesAsync(cancellationToken);
+}
+```
+
+El repositorio queda preparado para:
+
+```text
+FindByHashAsync
+AddAsync
+Revoke
+SaveChangesAsync
+```
+
+---
+
+# Paso 20: Registrar el repositorio en Dependency Injection
+
+Si utilizás DI nativa de .NET:
+
+```csharp
+services.AddScoped<
+    IRefreshTokenRepository,
+    RefreshTokenRepository>();
+```
+
+---
+
+## ¿Por qué `Scoped`?
+
+`DbContext` normalmente también es scoped.
+
+Conceptualmente:
+
+```text
+HTTP Request
+     │
+     ├── AppDbContext
+     │
+     ├── UserRepository
+     │
+     └── RefreshTokenRepository
+```
+
+Los repositorios de esa request trabajan con el mismo contexto.
+
+Eso será especialmente importante durante operaciones relacionadas como:
+
+```text
+buscar sesión;
+revocarla;
+crear reemplazo;
+guardar.
+```
+
+---
+
+# Paso 21: Volver a compilar
+
+Antes de tocar la base de datos:
+
+```bash
+dotnet build
+```
+
+Debés tener:
+
+```text
+Domain          ✓
+EF Core config  ✓
+DbContext       ✓
+Repository      ✓
+DI              ✓
+```
+
+Si no compila, todavía no generes una migración.
+
+---
+
+# Paso 22: Generar la migración
+
+Ejemplo genérico:
+
+```bash
+dotnet ef migrations add AddRefreshTokens
+```
+
+En una solución con proyectos separados:
+
+```bash
+dotnet ef migrations add AddRefreshTokens \
+  --project MyProject.Infrastructure/MyProject.Infrastructure.csproj \
+  --startup-project MyProject.Api/MyProject.Api.csproj \
+  --output-dir Persistence/Migrations
+```
+
+Adapta las rutas a tu solución.
+
+---
+
+# Paso 23: No aplicar la migración inmediatamente
+
+Después de generar:
+
+```text
+AddRefreshTokens.cs
+```
+
+**abrila y revisala.**
+
+Una migración es código que cambiará la base de datos.
+
+No debería ejecutarse a ciegas.
+
+---
+
+# Paso 24: Qué revisar en la migración
+
+Esperá algo equivalente a:
+
+```text
+CreateTable
+└── identity.RefreshTokens
+```
+
+Con columnas:
+
+```text
+Id
+TokenHash
+UserId
+ExpiresAt
+RevokedAt
+ReplacedByTokenHash
+CreatedAt
+```
+
+Además:
+
+```text
+FK RefreshTokens.UserId
+    → Users.Id
+```
+
+E índices:
+
+```text
+IX_RefreshTokens_TokenHash UNIQUE
+IX_RefreshTokens_UserId
+IX_RefreshTokens_ExpiresAt
+```
+
+Checklist:
+
+- [ ] La tabla está en el schema correcto
+- [ ] `TokenHash` no permite `NULL`
+- [ ] `TokenHash` es único
+- [ ] `UserId` tiene foreign key
+- [ ] `RevokedAt` permite `NULL`
+- [ ] `ReplacedByTokenHash` permite `NULL`
+- [ ] `CreatedAt` tiene el comportamiento esperado
+- [ ] Los índices fueron generados
+
+---
+
+# Paso 25: Si la migración está incorrecta, no la parchees primero
+
+Si EF generó algo equivocado:
+
+1. corregí la configuración;
+2. eliminá la migración;
+3. generala nuevamente.
+
+Ejemplo:
+
+```bash
+dotnet ef migrations remove
+```
+
+Después:
+
+```bash
+dotnet ef migrations add AddRefreshTokens
+```
+
+La migración debe representar correctamente el modelo.
+
+No debería convertirse en un parche manual para esconder una configuración incorrecta.
+
+---
+
+# Paso 26: Aplicar la migración
+
+Cuando hayas revisado el archivo:
+
+```bash
+dotnet ef database update
+```
+
+En soluciones separadas:
+
+```bash
+dotnet ef database update \
+  --project MyProject.Infrastructure/MyProject.Infrastructure.csproj \
+  --startup-project MyProject.Api/MyProject.Api.csproj
+```
+
+---
+
+# Paso 27: Verificar PostgreSQL
+
+La estructura debería verse aproximadamente así:
+
+```text
+identity
+├── Users
+└── RefreshTokens
+```
+
+Podés comprobar la tabla:
+
+```sql
+SELECT *
+FROM identity."RefreshTokens";
+```
+
+Al principio probablemente estará vacía.
+
+Eso es correcto.
+
+Todavía no implementamos generación de refresh tokens.
+
+---
+
+## Revisar índices
+
+```sql
+SELECT
+    indexname,
+    indexdef
+FROM pg_indexes
+WHERE schemaname = 'identity'
+  AND tablename = 'RefreshTokens';
+```
+
+Esperá encontrar:
+
+```text
+IX_RefreshTokens_TokenHash
+IX_RefreshTokens_UserId
+IX_RefreshTokens_ExpiresAt
+```
+
+y confirmar que `TokenHash` es único.
+
+---
+
+# Paso 28: Flujo que debe soportar el repositorio
+
+Aunque todavía no exista el endpoint de refresh, la persistencia debería permitir conceptualmente:
+
+```text
+Create RefreshToken
+       │
+       ▼
+AddAsync
+       │
+       ▼
+SaveChangesAsync
+       │
+       ▼
+PostgreSQL
+```
+
+y luego:
+
+```text
+TokenHash
+    │
+    ▼
+FindByHashAsync
+    │
+    ▼
+RefreshToken
+    │
+    ▼
+Revoke
+    │
+    ▼
+SaveChangesAsync
+```
+
+La futura rotación será:
+
+```text
+buscar A
+   ↓
+validar
+   ↓
+revocar A
+   ↓
+crear B
+   ↓
+SaveChanges
+```
+
+---
+
+# Paso 29: No persistir el token real
+
+Antes de considerar terminado el trabajo, buscá que no hayas creado algo como:
+
+```csharp
+public string Token { get; set; }
+```
+
+La entidad debería almacenar:
+
+```csharp
+public string TokenHash { get; set; }
+```
+
+Nunca:
+
+```text
+RefreshTokens
+└── Token = valor real enviado al cliente
+```
+
+Siempre:
+
+```text
+RefreshTokens
+└── TokenHash = hash(valor real)
+```
+
+---
+
+# Paso 30: No crear una blacklist de access tokens por accidente
+
+Si tus JWT tienen:
+
+```text
+jti
+```
+
+eso no significa que debas almacenar cada access token.
+
+No confundas:
+
+```text
+RefreshToken persistence
+```
+
+con:
+
+```text
+RevokedAccessTokens
+JwtBlacklist
+InvalidJtis
+```
+
+La arquitectura buscada normalmente es:
+
+```text
+Access Token
+    ↓
+JWT
+    ↓
+stateless
+    ↓
+no persistido
+```
+
+mientras:
+
+```text
+Refresh Token
+    ↓
+opaque token
+    ↓
+stateful
+    ↓
+hash persistido
+```
+
+---
+
+# Paso 31: Diferenciar persistencia de generación
+
+Este playbook termina antes de generar el token.
+
+La persistencia conoce:
+
+```text
+TokenHash
+ExpiresAt
+UserId
+```
+
+pero no debería necesariamente saber:
+
+```text
+cómo generar el token;
+cómo hashearlo;
+cómo escribir la cookie;
+cómo renovar el access token.
+```
+
+Esas responsabilidades pueden vivir en servicios específicos.
+
+Flujo futuro:
+
+```text
+RefreshTokenService
+        │
+        ├── genera token opaco
+        │
+        ├── calcula hash
+        │
+        ▼
+AuthService
+        │
+        ▼
+RefreshTokenRepository
+        │
+        ▼
+PostgreSQL
+```
+
+Esto evita que el repositorio se convierta en un servicio de seguridad.
+
+---
+
+# Arquitectura final esperada
+
+Un proyecto organizado por capas podría terminar así:
+
+```text
+src/
+├── MyProject.Domain/
+│   └── Identity/
+│       └── Entities/
+│           ├── User.cs
+│           └── RefreshToken.cs
+│
+├── MyProject.Application/
+│   └── Identity/
+│       ├── Interfaces/
+│       └── Services/
+│
+├── MyProject.Infrastructure/
+│   ├── Persistence/
+│   │   ├── AppDbContext.cs
+│   │   ├── Configurations/
+│   │   │   └── RefreshTokenConfiguration.cs
+│   │   └── Migrations/
+│   │
+│   └── Repositories/
+│       └── Identity/
+│           ├── IRefreshTokenRepository.cs
+│           └── RefreshTokenRepository.cs
+│
+└── MyProject.Api/
+    └── Program.cs
+```
+
+La ubicación exacta del **contrato del repositorio** depende de tu arquitectura.
+
+En una arquitectura con inversión de dependencias estricta, normalmente sería preferible:
+
+```text
+Application
+└── IRefreshTokenRepository
+```
+
+y:
+
+```text
+Infrastructure
+└── RefreshTokenRepository
+```
+
+La regla conceptual es:
+
+```text
+la capa de negocio conoce el contrato;
+Infrastructure conoce la implementación.
+```
+
+No hagas un refactor arquitectónico grande solamente para introducir refresh tokens si tu proyecto todavía no aplica esa separación. Tratá esa mejora como un cambio independiente.
+
+---
+
+# Errores comunes
+
+| Error                                             | Causa                                | Solución                                                                   |
+| ------------------------------------------------- | ------------------------------------ | -------------------------------------------------------------------------- |
+| Guardar el refresh token real                     | Se trató como un identificador común | Persistir exclusivamente `TokenHash`                                       |
+| Un único refresh token por usuario                | Modelo demasiado simplificado        | Utilizar relación `User 1:N RefreshToken`                                  |
+| `TokenHash` sin índice único                      | El invariante depende solo de código | Añadir unique index en DB                                                  |
+| `SaveChangesAsync` dentro de cada operación       | Repositorio demasiado eager          | Separar mutaciones y persistencia cuando necesites operaciones coordinadas |
+| Llamar `Update()` después de consultar la entidad | No se entiende el Change Tracker     | Las entidades consultadas están trackeadas por defecto                     |
+| Mezclar generación con repositorio                | Responsabilidades acopladas          | Repository persiste; otro servicio genera/hash                             |
+| Generar migración y aplicarla sin revisar         | Confianza ciega en EF                | Inspeccionar siempre `Up()` y `Down()`                                     |
+| Crear blacklist JWT junto con refresh tokens      | Se confunden access y refresh tokens | Mantener access token stateless                                            |
+| Guardar refresh token en `localStorage`           | Mayor exposición ante XSS            | Cuando implementes transporte, preferir cookie `HttpOnly`                  |
+| No almacenar `ReplacedByTokenHash`                | No queda historial de rotación       | Guardar el hash del reemplazo al rotar                                     |
+| No indexar `ExpiresAt`                            | Limpiezas futuras más costosas       | Añadir índice si se consultará por expiración                              |
+| Diferencias entre `dotnet-ef` y paquetes EF       | Tooling desalineado                  | Mantener versiones compatibles y preferiblemente alineadas                 |
+
+---
+
+# Sobre versiones de EF Core
+
+Intentá mantener alineados:
+
+```text
+Microsoft.EntityFrameworkCore
+Microsoft.EntityFrameworkCore.Design
+Npgsql.EntityFrameworkCore.PostgreSQL
+dotnet-ef
+```
+
+No significa:
+
+```text
+actualizar todo automáticamente cada vez que aparezca una versión
+```
+
+Significa:
+
+```text
+verificar compatibilidad;
+mantener una línea de versiones coherente;
+actualizar conscientemente.
+```
+
+Especialmente:
+
+```text
+dotnet-ef
+```
+
+debería ser compatible con la versión de EF Core utilizada por el proyecto.
+
+---
+
+# Checklist final
+
+Antes de considerar terminada la persistencia:
+
+- [ ] Existe la entidad `RefreshToken`
+- [ ] La entidad contiene `TokenHash`, no el token real
+- [ ] Existe una relación `User 1:N RefreshToken`
+- [ ] Existe una configuración Fluent API independiente
+- [ ] La tabla utiliza el schema esperado
+- [ ] `TokenHash` es requerido
+- [ ] `TokenHash` tiene índice único
+- [ ] `UserId` tiene índice
+- [ ] `ExpiresAt` tiene índice
+- [ ] La foreign key hacia `User` existe
+- [ ] `RevokedAt` es nullable
+- [ ] `ReplacedByTokenHash` es nullable
+- [ ] `CreatedAt` utiliza la convención temporal del proyecto
+- [ ] El `DbContext` expone `DbSet<RefreshToken>`
+- [ ] Existe una operación para buscar por hash
+- [ ] Existe una operación para agregar
+- [ ] Existe una operación para revocar
+- [ ] La persistencia permite guardar varios cambios juntos
+- [ ] El repositorio está registrado en DI
+- [ ] El proyecto compila
+- [ ] La migración fue generada
+- [ ] La migración fue inspeccionada manualmente
+- [ ] La migración fue aplicada
+- [ ] La tabla existe en PostgreSQL
+- [ ] Los índices existen
+- [ ] No se introdujo una blacklist de access tokens
+- [ ] No se mezcló generación, cookies o endpoints con esta responsabilidad
+
+---
+
+# Modelo mental para recordar
+
+Si dentro de seis meses olvidás todo el detalle, recordá este flujo:
+
+```text
+1. El cliente tiene el refresh token REAL.
+
+2. El servidor trabaja con:
+      hash(token real)
+
+3. PostgreSQL almacena:
+      TokenHash
+      UserId
+      ExpiresAt
+      RevokedAt
+      ReplacedByTokenHash
+
+4. Un usuario puede tener N sesiones.
+
+5. Al renovar:
+      encontrar token viejo
+          ↓
+      validarlo
+          ↓
+      revocarlo
+          ↓
+      crear reemplazo
+          ↓
+      guardar ambos cambios juntos
+```
+
+La idea central es:
+
+> **El access token demuestra autorización durante poco tiempo. El refresh token representa una sesión renovable, y por eso necesita estado controlado por el servidor.**
+
+---
+
+## Qué implementar después
+
+Una vez completado este playbook, el siguiente bloque natural es:
+
+1. Generar un refresh token opaco criptográficamente seguro.
+2. Calcular su hash.
+3. Persistir únicamente el hash.
+4. Entregar el token real en una cookie `HttpOnly`.
+5. Modificar login para crear la sesión.
+6. Crear `/auth/refresh`.
+7. Validar token existente.
+8. Comprobar expiración y revocación.
+9. Rotar el refresh token.
+10. Revocar el anterior y registrar su reemplazo.
+11. Persistir la rotación de forma atómica.
+12. Implementar logout y revocación.
+13. Implementar limpieza de sesiones expiradas.
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Diferencia exacta entre access token y refresh token
+- [ ] Cómo generar un token opaco con `RandomNumberGenerator`
+- [ ] Cómo calcular SHA-256 correctamente
+- [ ] Por qué comparar hashes y nunca tokens reales contra la DB
+- [ ] Cómo configurar una cookie `HttpOnly`, `Secure` y `SameSite`
+- [ ] Cómo realizar rotación segura
+- [ ] Cómo detectar reutilización de un refresh token rotado
+- [ ] Cómo hacer revocación de todas las sesiones de un usuario
+- [ ] Cómo manejar transacciones EF Core durante la rotación
+- [ ] Cómo limpiar refresh tokens expirados
+- [ ] Cómo probar el flujo mediante integration tests
+- [ ] Cómo aplicar correctamente inversión de dependencias a los repositories
+
+---
+
+## Referencias útiles
+
+- [ASP.NET Core Security](https://learn.microsoft.com/aspnet/core/security/)
+- [Entity Framework Core](https://learn.microsoft.com/ef/core/)
+- [EF Core Relationships](https://learn.microsoft.com/ef/core/modeling/relationships)
+- [EF Core Indexes](https://learn.microsoft.com/ef/core/modeling/indexes)
+- [EF Core Migrations](https://learn.microsoft.com/ef/core/managing-schemas/migrations/)
+- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
