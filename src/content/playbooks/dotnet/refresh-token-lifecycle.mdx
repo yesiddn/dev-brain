@@ -1,547 +1,424 @@
 ---
-title: "Cómo generar, hashear, validar y rotar Refresh Tokens opacos en .NET"
-description: "Guía conceptual y práctica para generar refresh tokens criptográficamente seguros, protegerlos con SHA-256, emitirlos mediante cookies HttpOnly, validarlos y rotarlos de forma segura en .NET"
-goal: "Implementar el ciclo de vida completo de un refresh token opaco sobre una capa de persistencia existente"
-tech: ["dotnet", "csharp", "aspnet-core", "cryptography", "sha-256", "jwt"]
+title: "Cómo implementar emisión y rotación segura de Refresh Tokens en .NET"
+description: "Guía práctica y conceptual para generar refresh tokens opacos, hashearlos con SHA-256, emitirlos mediante cookies HttpOnly y rotarlos de forma segura en un backend .NET"
+goal: "Completar un flujo de sesión renovable con access tokens JWT y refresh tokens opacos, incluyendo login, refresh, hashing, cookies y rotación"
+tech:
+  ["dotnet", "csharp", "aspnet-core", "jwt", "sha-256", "ef-core", "postgresql"]
 tags:
   [
     "authentication",
     "refresh-token",
     "security",
-    "cryptography",
-    "sha-256",
     "jwt",
+    "sha-256",
     "cookies",
     "rotation",
+    "minimal-api",
   ]
 level: "medio"
 status: "active"
 prerequisites:
   - ".NET SDK instalado"
-  - "Autenticación mediante access tokens JWT funcionando"
-  - "Persistencia de RefreshToken implementada"
-  - "Repositorio de RefreshToken disponible"
-  - "Entidad RefreshToken con TokenHash, ExpiresAt, RevokedAt y ReplacedByTokenHash"
-  - "Conocimientos básicos de ASP.NET Core y JWT"
+  - "Backend ASP.NET Core o Minimal APIs configurado"
+  - "Login con access token JWT funcionando"
+  - "Entidad User existente"
+  - "Persistencia de RefreshToken ya implementada"
+  - "IRefreshTokenRepository con FindByHashAsync, AddAsync, Revoke y SaveChangesAsync"
+  - "Conocimientos básicos de JWT, HTTP cookies y EF Core"
 estimatedTime: "60-90 min"
 updatedAt: 2026-08-13
 createdAt: 2026-08-13
-summary: "Implementación reusable del ciclo de vida de refresh tokens opacos: generación de 256 bits, Base64URL, SHA-256, emisión segura, validación, rotación, revocación y manejo de cookies HttpOnly"
+summary: "Implementación reusable de emisión y rotación de refresh tokens: generación criptográfica, SHA-256, login, cookies HttpOnly, endpoint /refresh, validación, rotación atómica y pruebas"
 related:
-  ["Cómo implementar persistencia segura de Refresh Tokens en .NET + EF Core"]
+  - "Cómo implementar persistencia segura de Refresh Tokens en .NET + EF Core"
 ---
 
 import { Code } from "astro:components";
 
-## Contexto
+# Contexto
 
 > **¿Cuándo usar este playbook?**
 >
-> Cuando ya tenés implementada la persistencia de refresh tokens y necesitás construir la parte que genera, entrega, valida y rota esos tokens.
+> Cuando ya tenés autenticación mediante access tokens JWT y una capa de
+> persistencia para refresh tokens, pero todavía necesitás construir el ciclo
+> completo de sesión: emitir el refresh token, almacenarlo de forma segura en
+> el navegador, utilizarlo para renovar el access token y rotarlo después de
+> cada uso.
 
-El playbook anterior resolvía:
+Este playbook continúa después de haber resuelto la persistencia.
 
-```text
-¿Cómo representar y persistir una sesión renovable?
-```
-
-Este playbook resuelve:
-
-```text
-¿Cómo crear un refresh token seguro
-y cómo utilizarlo durante login y refresh?
-```
-
-Al terminar vas a tener:
-
-- ✅ Refresh tokens opacos de 256 bits
-- ✅ Generación mediante un CSPRNG
-- ✅ Representación mediante Base64URL
-- ✅ Hashing mediante SHA-256
-- ✅ Persistencia exclusiva del hash
-- ✅ Cookie `HttpOnly`
-- ✅ Emisión durante login
-- ✅ Endpoint `/refresh`
-- ✅ Validación del refresh token
-- ✅ Rotación en cada renovación
-- ✅ Revocación del token anterior
-- ✅ Registro de `ReplacedByTokenHash`
-- ✅ Manejo de tokens expirados, revocados o inexistentes
-- ✅ Una base preparada para logout y detección de reutilización
-
----
-
-# Antes de empezar: la decisión arquitectónica
-
-Una arquitectura típica utiliza:
+La capa de persistencia ya debería permitir trabajar conceptualmente con:
 
 ```text
-Access Token
-    ↓
-JWT
-    ↓
-corta duración
-    ↓
-stateless
-
-Refresh Token
-    ↓
-valor aleatorio opaco
-    ↓
-larga duración
-    ↓
-stateful
+RefreshToken
+├── TokenHash
+├── UserId
+├── ExpiresAt
+├── RevokedAt
+├── ReplacedByTokenHash
+└── CreatedAt
 ```
 
-Ejemplo conceptual:
+y disponer de operaciones equivalentes a:
+
+```text
+FindByHashAsync
+AddAsync
+Revoke
+SaveChangesAsync
+```
+
+Ahora vamos a construir encima de esa infraestructura:
 
 ```text
 Login
- │
- ├── Access Token JWT
- │      └── 15 minutos, por ejemplo
- │
- └── Refresh Token opaco
-        └── varios días o semanas
+  ↓
+crear access token
+  ↓
+crear refresh token
+  ↓
+SHA-256
+  ↓
+guardar hash
+  ↓
+enviar token real como cookie HttpOnly
 ```
 
-El access token demuestra:
+y posteriormente:
 
 ```text
-"Este usuario está autorizado durante un período corto."
+POST /auth/refresh
+       ↓
+leer cookie
+       ↓
+SHA-256
+       ↓
+buscar hash
+       ↓
+validar
+       ↓
+revocar token anterior
+       ↓
+crear reemplazo
+       ↓
+guardar cambios juntos
+       ↓
+enviar nueva cookie
+       ↓
+devolver nuevo access token
 ```
-
-El refresh token representa:
-
-```text
-"Esta sesión puede solicitar nuevas credenciales."
-```
-
-Son responsabilidades diferentes y por eso no necesitan tener el mismo formato.
 
 ---
 
-# Paso 1: No utilizar otro JWT solamente porque ya usamos JWT
+# Objetivo arquitectónico
 
-Una pregunta común al implementar refresh tokens es:
-
-> ¿Por qué no generar simplemente otro JWT con una expiración mayor?
-
-Técnicamente es posible.
-
-Podrías tener:
+La separación de responsabilidades debería permanecer clara:
 
 ```text
-Access JWT
-└── exp = 15 minutos
-
-Refresh JWT
-└── exp = 30 días
+Endpoint
+   │
+   │ HTTP
+   │ cookies
+   │ status codes
+   ▼
+AuthService
+   │
+   │ reglas de autenticación
+   │ generación de tokens
+   │ validación
+   │ rotación
+   ▼
+IRefreshTokenRepository
+   │
+   │ persistencia
+   ▼
+RefreshTokenRepository
+   │
+   │ EF Core
+   ▼
+PostgreSQL
 ```
 
-Pero que sea posible no significa que sea necesariamente la opción más conveniente.
+La regla central es:
+
+> **El endpoint administra HTTP. El servicio administra autenticación. El
+> repositorio administra persistencia.**
+
+No introduzcas `HttpResponse`, `CookieOptions` o `HttpContext` dentro de
+Application.
+
+Tampoco introduzcas `AppDbContext` dentro de `AuthService`.
 
 ---
 
-## Problema conceptual
+# Antes de empezar: access token y refresh token cumplen roles diferentes
 
-El beneficio principal de un JWT es que puede ser validado sin consultar estado en el servidor.
+## Access token
 
-```text
-JWT
- ↓
-validar firma
- ↓
-validar exp
- ↓
-leer claims
- ↓
-aceptar
-```
-
-Eso funciona muy bien para access tokens de corta duración.
-
-Pero un refresh token normalmente necesita responder:
+Normalmente:
 
 ```text
-¿Fue revocado?
-
-¿Ya fue utilizado?
-
-¿Fue reemplazado?
-
-¿Esta sesión sigue habilitada?
-
-¿El usuario cerró sesión?
-
-¿Este token pertenece a una cadena de rotación comprometida?
-```
-
-En cuanto necesitás responder esas preguntas, necesitás estado en el servidor.
-
-Entonces incluso utilizando un JWT como refresh token probablemente terminarías consultando la base de datos.
-
-El JWT deja de aportar gran parte de su principal beneficio.
-
----
-
-## Alternativa recomendada
-
-Usar:
-
-```text
-valor aleatorio criptográficamente seguro
+Access Token
+├── JWT
+├── corta duración
+├── contiene claims
+├── firmado
+├── enviado mediante Authorization: Bearer
+└── normalmente stateless
 ```
 
 Por ejemplo:
 
-```text
-TBBUpIdAwzp4pOon9EMKBSGJyOmGF3GUYdo0-FWPkWU
+```http
+Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
 ```
 
-El token no contiene:
+Puede durar:
+
+```text
+15 minutos
+```
+
+y contener:
 
 ```text
 UserId
 Email
-Roles
-Claims
-Expiration
+Jti
+Exp
 Issuer
 Audience
 ```
 
-No significa nada por sí solo.
-
-Por eso se denomina:
+Su trabajo es:
 
 ```text
-opaque token
-```
-
-u:
-
-```text
-token opaco
+demostrar autorización durante poco tiempo
 ```
 
 ---
 
-# Paso 2: Entender qué significa "opaco"
+## Refresh token
 
-Un token opaco es simplemente un valor cuya estructura interna no tiene significado para el cliente.
+Normalmente:
+
+```text
+Refresh Token
+├── larga duración
+├── secreto
+├── opaco
+├── aleatorio
+├── no contiene claims útiles
+├── representa una sesión renovable
+└── requiere estado del servidor
+```
+
+Su trabajo es:
+
+```text
+conseguir nuevos access tokens
+```
+
+No debería utilizarse directamente para acceder a endpoints de negocio.
+
+---
+
+# ¿Por qué usar un refresh token opaco y no otro JWT?
+
+Un refresh token también podría técnicamente ser un JWT.
 
 Por ejemplo:
 
 ```text
-TBBUpIdAwzp4pOon9EMKBSGJyOmGF3GUYdo0-FWPkWU
+Access token
+JWT
+15 minutos
+
+Refresh token
+JWT
+7 días
 ```
 
-No podés decodificarlo y obtener:
+Sin embargo, si necesitás:
+
+```text
+revocación;
+logout;
+rotación;
+detección de expiración;
+historial de sesión;
+invalidación inmediata;
+```
+
+vas a necesitar estado en el servidor de todas formas.
+
+Entonces el principal beneficio de un JWT:
+
+```text
+ser autocontenido y no consultar almacenamiento
+```
+
+prácticamente desaparece.
+
+Un token opaco es más simple:
+
+```text
+random bytes
+    ↓
+Base64URL
+    ↓
+refresh token
+```
+
+No contiene:
+
+```text
+UserId
+Email
+Exp
+Claims
+Roles
+```
+
+El servidor obtiene toda la información desde su propia base de datos.
+
+Una arquitectura habitual queda:
+
+```text
+Access Token
+────────────
+JWT
+15 min
+stateless
+
+
+Refresh Token
+─────────────
+opaque random
+7 días
+stateful
+hash persistido
+```
+
+---
+
+# Paso 1: definir la configuración
+
+No disperses números mágicos por el código.
+
+Una configuración puede incluir:
 
 ```json
 {
-  "sub": "...",
-  "email": "...",
-  "exp": "..."
+  "Jwt": {
+    "Issuer": "my-api",
+    "Audience": "my-frontend",
+    "SecretKey": "...",
+    "ExpiryMinutes": 15,
+    "RefreshTokenLifetimeDays": 7,
+    "RefreshTokenSizeInBytes": 32
+  }
 }
 ```
 
-Es únicamente:
-
-```text
-una credencial secreta aleatoria
-```
-
-Su significado está del lado del servidor:
-
-```text
-token
-  ↓
-hash(token)
-  ↓
-RefreshTokens.TokenHash
-  ↓
-UserId
-ExpiresAt
-RevokedAt
-...
-```
-
-Esto es parecido conceptualmente a una llave.
-
-La llave no necesita contener los datos de la casa.
-
-Solo necesita ser imposible de adivinar y permitir identificar qué acceso representa.
-
----
-
-# Paso 3: ¿Qué significa "un valor aleatorio de 256 bits"?
-
-Cuando hablamos de un refresh token aleatorio de:
-
-```text
-256 bits
-```
-
-estamos hablando de la cantidad de **entropía aleatoria** utilizada para construirlo.
-
-Recordá:
-
-```text
-8 bits = 1 byte
-```
-
-Entonces:
-
-```text
-256 bits / 8 = 32 bytes
-```
-
-Por eso generaremos:
+Y su options class:
 
 ```csharp
-32 bytes aleatorios
+using System.ComponentModel.DataAnnotations;
+
+namespace MyProject.Application.Identity.Options;
+
+public sealed class JwtOptions
+{
+    public const string SectionName = "Jwt";
+
+    [Required]
+    public string Issuer { get; init; } = string.Empty;
+
+    [Required]
+    public string Audience { get; init; } = string.Empty;
+
+    [Required]
+    [MinLength(32)]
+    public string SecretKey { get; init; } = string.Empty;
+
+    [Range(1, int.MaxValue)]
+    public int ExpiryMinutes { get; init; }
+
+    [Range(1, int.MaxValue)]
+    public int RefreshTokenLifetimeDays { get; init; }
+
+    [Range(32, int.MaxValue)]
+    public int RefreshTokenSizeInBytes { get; init; }
+}
 ```
 
----
-
-## No significa que el string tenga 256 caracteres
-
-Esto es importante.
-
-Tenemos:
-
-```text
-32 bytes aleatorios
-```
-
-Internamente:
-
-```text
-256 bits
-```
-
-Pero después necesitamos convertir esos bytes a texto para transportarlos por HTTP.
-
-Por ejemplo:
-
-```text
-32 bytes
-   ↓
-Base64URL
-   ↓
-aproximadamente 43 caracteres
-```
-
-Entonces algo como:
-
-```text
-JSSIvE2GeA6waBJMeQEPSVzcxlZG9Ac0smTdTuCGHjs
-```
-
-puede representar perfectamente 256 bits de aleatoriedad aunque tenga solamente unos 43 caracteres.
-
----
-
-# Paso 4: ¿Por qué 256 bits?
-
-Un refresh token funciona como una credencial.
-
-Si alguien lo conoce, potencialmente puede utilizarlo para obtener un nuevo access token.
-
-Por eso necesitamos que sea extremadamente difícil de adivinar.
-
-Con 256 bits existen:
-
-```text
-2^256
-```
-
-posibles valores.
-
-Aproximadamente:
-
-```text
-1.15 × 10^77
-```
-
-posibilidades.
-
-No intentamos hacer que el token:
-
-```text
-parezca complicado
-```
-
-Intentamos hacer que sea:
-
-```text
-criptográficamente impredecible
-```
-
----
-
-# Paso 5: Nunca utilizar `Random`
-
-No hagas:
+Después registrá:
 
 ```csharp
-var random = new Random();
+builder.Services
+    .AddOptions<JwtOptions>()
+    .Bind(
+        builder.Configuration.GetRequiredSection(
+            JwtOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
 ```
 
-ni construyas un token usando:
+## ¿Por qué validar al arrancar?
+
+Es preferible detectar:
+
+```text
+RefreshTokenLifetimeDays = 0
+```
+
+al iniciar la aplicación y no cuando un usuario intente hacer login.
+
+---
+
+# Paso 2: generar un refresh token criptográficamente seguro
+
+No uses:
 
 ```csharp
-random.Next()
+Random
 ```
 
-`System.Random` está diseñado para:
-
-```text
-simulaciones;
-juegos;
-valores pseudoaleatorios generales.
-```
-
-No para generar secretos.
-
-Para seguridad necesitamos un:
-
-```text
-CSPRNG
-```
-
-que significa:
-
-```text
-Cryptographically Secure
-Pseudo-Random Number Generator
-```
-
-En .NET utilizamos:
+No uses:
 
 ```csharp
-System.Security.Cryptography.RandomNumberGenerator
+DateTime.Now.Ticks
 ```
 
----
+No uses:
 
-# Paso 6: Generar 32 bytes aleatorios
+```text
+UserId + timestamp
+```
 
-.NET permite hacerlo directamente:
+No construyas secretos predecibles.
+
+Utilizá:
 
 ```csharp
-using System.Security.Cryptography;
-
-byte[] bytes = RandomNumberGenerator.GetBytes(32);
+RandomNumberGenerator
 ```
 
-Ahora:
+de:
 
-```text
-bytes.Length = 32
+```csharp
+System.Security.Cryptography
 ```
-
-y:
-
-```text
-32 bytes × 8 bits = 256 bits
-```
-
-Ese es el material criptográfico del refresh token.
-
----
-
-# Paso 7: Convertir los bytes a Base64URL
-
-Los bytes binarios no son cómodos para:
-
-```text
-cookies;
-JSON;
-URLs;
-headers;
-logs de desarrollo.
-```
-
-Por eso necesitamos una representación textual.
-
-Una opción natural es:
-
-```text
-Base64URL
-```
-
----
-
-## Base64 tradicional
-
-Un Base64 convencional puede contener:
-
-```text
-A-Z
-a-z
-0-9
-+
-/
-=
-```
-
-Por ejemplo:
-
-```text
-xE7/8tzZKyY+4g==
-```
-
-Los caracteres:
-
-```text
-+
-/
-=
-```
-
-pueden ser incómodos en algunos contextos HTTP y URLs.
-
----
-
-## Base64URL
-
-Base64URL adapta Base64 utilizando:
-
-```text
-- en lugar de +
-_ en lugar de /
-```
-
-y normalmente elimina:
-
-```text
-=
-```
-
-del padding final.
 
 Ejemplo:
 
-```text
-JSSIvE2GeA6waBJMeQEPSVzcxlZG9Ac0smTdTuCGHjs
-```
-
-Es más cómodo para tokens.
-
----
-
-# Paso 8: Implementar la codificación Base64URL
-
-Dependiendo de la versión y librerías utilizadas por el proyecto, podés encapsular la conversión.
-
-Por ejemplo:
-
 ```csharp
-private static string ToBase64Url(byte[] bytes)
+private string GenerateRefreshToken()
 {
+    var bytes = RandomNumberGenerator.GetBytes(
+        _jwtOptions.RefreshTokenSizeInBytes);
+
     return Convert
         .ToBase64String(bytes)
         .TrimEnd('=')
@@ -550,425 +427,24 @@ private static string ToBase64Url(byte[] bytes)
 }
 ```
 
-Ahora:
-
-```csharp
-var bytes = RandomNumberGenerator.GetBytes(32);
-
-var token = ToBase64Url(bytes);
-```
-
-Flujo:
-
-```text
-RandomNumberGenerator
-        ↓
-     32 bytes
-        ↓
-     256 bits
-        ↓
-    Base64URL
-        ↓
-refresh token real
-```
-
 ---
 
-# Paso 9: Crear un generador reusable
+# ¿Por qué 32 bytes?
 
-No queremos tener esto repetido dentro del login:
-
-```csharp
-RandomNumberGenerator.GetBytes(...)
-```
-
-Podemos encapsular la responsabilidad.
-
-Por ejemplo:
-
-```csharp
-public interface IRefreshTokenGenerator
-{
-    string Generate();
-}
-```
-
-Implementación:
-
-```csharp
-using System.Security.Cryptography;
-
-public sealed class RefreshTokenGenerator
-    : IRefreshTokenGenerator
-{
-    private const int TokenSizeInBytes = 32;
-
-    public string Generate()
-    {
-        var bytes = RandomNumberGenerator.GetBytes(
-            TokenSizeInBytes);
-
-        return Convert
-            .ToBase64String(bytes)
-            .TrimEnd('=')
-            .Replace('+', '-')
-            .Replace('/', '_');
-    }
-}
-```
-
-Ahora el resto de la aplicación simplemente conoce:
-
-```csharp
-var refreshToken = _refreshTokenGenerator.Generate();
-```
-
-No necesita saber cómo se genera.
-
----
-
-# Paso 10: Registrar el generador en DI
-
-Por ejemplo:
-
-```csharp
-services.AddSingleton<
-    IRefreshTokenGenerator,
-    RefreshTokenGenerator>();
-```
-
-El generador:
+Un byte contiene:
 
 ```text
-no tiene estado;
-no usa DbContext;
-no depende de una request.
+8 bits
 ```
 
-Por eso puede ser `Singleton`.
-
-También podría ser `Transient` sin cambiar el comportamiento.
-
----
-
-# Paso 11: El token generado NO debe persistirse directamente
-
-Supongamos que generamos:
+Por lo tanto:
 
 ```text
-JSSIvE2GeA6waBJMeQEPSVzcxlZG9Ac0smTdTuCGHjs
+32 bytes × 8 bits
+= 256 bits
 ```
 
-Ese valor será entregado al cliente.
-
-Pero la base de datos no debería almacenar:
-
-```text
-TokenHash
-───────────────────────────────────────────
-JSSIvE2GeA6waBJMeQEPSVzcxlZG9Ac0smTdTuCGHjs
-```
-
-Necesitamos transformar el token antes de persistirlo.
-
-Aquí entra:
-
-```text
-SHA-256
-```
-
----
-
-# SHA-256: explicación conceptual
-
-Antes de escribir código es importante entender qué estamos haciendo.
-
----
-
-## ¿Qué es SHA-256?
-
-SHA-256 significa:
-
-```text
-Secure Hash Algorithm 256-bit
-```
-
-Es una función hash criptográfica perteneciente a la familia SHA-2.
-
-Conceptualmente recibe:
-
-```text
-entrada de cualquier tamaño
-```
-
-y produce:
-
-```text
-256 bits
-```
-
-de salida.
-
-Es decir:
-
-```text
-Input
-   ↓
-SHA-256
-   ↓
-32 bytes
-```
-
-Siempre.
-
----
-
-## Ejemplo conceptual
-
-Tenemos:
-
-```text
-hello
-```
-
-Aplicamos:
-
-```text
-SHA256("hello")
-```
-
-y obtenemos un valor fijo de 256 bits.
-
-Si utilizamos hexadecimal para mostrar esos bytes tendremos:
-
-```text
-64 caracteres hexadecimales
-```
-
-porque:
-
-```text
-1 carácter hexadecimal = 4 bits
-```
-
-Entonces:
-
-```text
-256 / 4 = 64
-```
-
----
-
-# Propiedad 1: SHA-256 es determinístico
-
-La misma entrada produce siempre la misma salida.
-
-```text
-SHA256("token-A")
-        ↓
-hash-X
-
-SHA256("token-A")
-        ↓
-hash-X
-```
-
-Esto es precisamente lo que necesitamos.
-
-Cuando el usuario vuelva posteriormente con su refresh token:
-
-```text
-token-A
-```
-
-podemos calcular otra vez:
-
-```text
-SHA256(token-A)
-```
-
-y buscar:
-
-```text
-TokenHash = hash-X
-```
-
-en PostgreSQL.
-
----
-
-# Propiedad 2: pequeños cambios producen hashes completamente diferentes
-
-Por ejemplo:
-
-```text
-token-A
-token-B
-```
-
-aunque sean muy parecidos como texto, sus hashes serán completamente diferentes.
-
-Conceptualmente:
-
-```text
-token-A
-   ↓
-2F32A8...
-
-token-B
-   ↓
-9C41E7...
-```
-
-Esto se conoce como:
-
-```text
-avalanche effect
-```
-
-Un cambio pequeño en la entrada provoca un cambio importante en la salida.
-
----
-
-# Propiedad 3: SHA-256 es unidireccional
-
-SHA-256 no es cifrado.
-
-Esto es muy importante.
-
-Con cifrado:
-
-```text
-plaintext
-   ↓ encrypt(key)
-ciphertext
-   ↓ decrypt(key)
-plaintext
-```
-
-Existe una operación inversa.
-
-Con hashing:
-
-```text
-token
-  ↓
-SHA-256
-  ↓
-hash
-```
-
-no existe:
-
-```text
-SHA256.Decrypt(hash)
-```
-
-El algoritmo no está diseñado para recuperar la entrada original.
-
----
-
-# Hashing no es encryption
-
-No confundas:
-
-```text
-hash
-```
-
-con:
-
-```text
-encrypted value
-```
-
-Una base de datos puede almacenar:
-
-```text
-TokenHash
-```
-
-sin que la aplicación necesite volver a obtener el token original.
-
-Eso funciona porque la validación utiliza:
-
-```text
-comparación de hashes
-```
-
-y no recuperación del secreto.
-
----
-
-# Paso 12: ¿Por qué SHA-256 es apropiado para refresh tokens?
-
-Alguien podría preguntar:
-
-> ¿No deberían utilizarse bcrypt, Argon2 o PBKDF2?
-
-Para contraseñas, sí.
-
-Para refresh tokens aleatorios de alta entropía, normalmente no es necesario.
-
-La diferencia está en la entrada.
-
----
-
-## Contraseña humana
-
-Una contraseña como:
-
-```text
-perrito123
-```
-
-tiene relativamente poca entropía.
-
-Un atacante puede probar:
-
-```text
-password
-password123
-123456
-perrito
-perrito123
-...
-```
-
-Por eso los passwords necesitan funciones deliberadamente costosas como:
-
-```text
-Argon2
-bcrypt
-PBKDF2
-scrypt
-```
-
-para hacer los ataques de fuerza bruta más lentos.
-
----
-
-## Refresh token
-
-Nuestro refresh token tiene:
-
-```text
-256 bits aleatorios
-```
-
-No fue inventado por un humano.
-
-No viene de un diccionario.
-
-Un atacante no puede realizar razonablemente:
-
-```text
-dictionary attack
-```
-
-contra él.
-
-Tendría que encontrar uno de:
+El secreto tiene:
 
 ```text
 2^256
@@ -976,133 +452,414 @@ Tendría que encontrar uno de:
 
 valores posibles.
 
-Por eso un hash rápido como SHA-256 es apropiado para este tipo de secreto aleatorio.
+Ese espacio de búsqueda es tan grande que intentar todos los valores mediante
+fuerza bruta no es una estrategia práctica.
 
 ---
 
-# ¿Necesitamos salt?
+# ¿Qué hace Base64URL?
 
-Normalmente no para este caso.
-
-Un `salt` es especialmente importante para contraseñas porque usuarios diferentes pueden utilizar exactamente la misma contraseña.
-
-Sin salt:
+Después de generar los bytes:
 
 ```text
+01101010
+10100101
+...
+```
+
+necesitamos transportarlos cómodamente como texto.
+
+Base64 los convierte en caracteres.
+
+Ejemplo conceptual:
+
+```text
+random bytes
+    ↓
+Base64
+    ↓
+dGVzdC8rPQ==
+```
+
+Pero Base64 tradicional puede contener:
+
+```text
++
+/
+=
+```
+
+que pueden resultar incómodos en URLs, cookies o headers.
+
+Por eso usamos una variante URL-safe:
+
+```text
++  →  -
+/  →  _
+=  →  eliminado al final
+```
+
+Resultado:
+
+```text
+qW83koYRNdxOdfdoYsmWLDODLr8pTuv7WkUy6uvqpck
+```
+
+---
+
+# Importante: Base64 NO es seguridad
+
+Base64 es reversible.
+
+Esto:
+
+```text
+bytes
+  ↓
+Base64
+  ↓
+string
+```
+
+también puede hacerse al revés.
+
+Por eso:
+
+> **Base64 es encoding, no encryption y no hashing.**
+
+Recordá:
+
+```text
+Encoding
+────────
+Base64
+reversible
+no protege secretos
+
+
+Encryption
+──────────
+AES
+reversible usando una clave
+
+
+Hashing
+───────
+SHA-256
+no reversible
+produce una huella
+```
+
+---
+
+# Paso 3: entender SHA-256 antes de implementarlo
+
+SHA significa:
+
+```text
+Secure Hash Algorithm
+```
+
+SHA-256 es una función hash criptográfica.
+
+Conceptualmente:
+
+```text
+entrada arbitraria
+       ↓
+    SHA-256
+       ↓
+256 bits de salida
+```
+
+Por ejemplo:
+
+```text
+"hola"
+   ↓
+SHA-256
+   ↓
+un digest de 256 bits
+```
+
+La entrada puede tener:
+
+```text
+5 bytes
+50 bytes
+5 MB
+```
+
+pero el resultado de SHA-256 siempre tendrá:
+
+```text
+256 bits
+```
+
+---
+
+# Hashing no es cifrado
+
+Un algoritmo de cifrado tiene dos direcciones:
+
+```text
+plaintext
+   ↓
+encrypt(key)
+   ↓
+ciphertext
+   ↓
+decrypt(key)
+   ↓
+plaintext
+```
+
+SHA-256 no funciona así.
+
+Existe:
+
+```text
+input
+  ↓
+SHA-256
+  ↓
+hash
+```
+
+pero no existe una operación:
+
+```text
+hash
+  ↓
+SHA256Decrypt()
+  ↓
+input
+```
+
+No hay una clave secreta que permita revertir el proceso.
+
+---
+
+# Entonces, ¿SHA-256 es imposible de romper?
+
+La frase correcta no es:
+
+```text
+"es imposible descifrar SHA-256"
+```
+
+porque realmente **no hay nada que descifrar**.
+
+Lo que un atacante puede intentar es:
+
+```text
+candidato 1
+    ↓
+SHA-256
+    ↓
+¿coincide con el hash?
+
+candidato 2
+    ↓
+SHA-256
+    ↓
+¿coincide?
+
+...
+```
+
+Eso se denomina buscar una **preimagen**.
+
+Por ejemplo, si almacenás:
+
+```text
+SHA256("1234")
+```
+
+y alguien roba el hash, puede probar:
+
+```text
+SHA256("0000")
+SHA256("0001")
+SHA256("0002")
+...
+SHA256("9999")
+```
+
+Solamente existen:
+
+```text
+10.000
+```
+
+PINs de cuatro dígitos.
+
+Aunque SHA-256 no sea reversible, el secreto puede adivinarse.
+
+---
+
+# El hash no es más fuerte que el secreto original
+
+Esta regla es fundamental:
+
+> **Hashing no agrega entropía al secreto.**
+
+Si el secreto original es:
+
+```text
+password123
+```
+
+SHA-256 no convierte mágicamente esa contraseña débil en un secreto fuerte.
+
+Un atacante puede calcular:
+
+```text
+SHA256("password")
+SHA256("123456")
 SHA256("password123")
+...
 ```
 
-sería igual para todos.
-
-Pero nuestros refresh tokens ya son:
-
-```text
-aleatorios;
-únicos;
-de alta entropía.
-```
-
-Dos usuarios no deberían compartir el mismo token.
-
-Además necesitamos poder hacer:
-
-```text
-WHERE TokenHash = ...
-```
-
-fácilmente.
-
-Por eso un hash determinístico es conveniente.
+muy rápidamente.
 
 ---
 
-# Importante: SHA-256 no convierte un token débil en uno fuerte
+# ¿Por qué SHA-256 está bien para refresh tokens pero no para contraseñas?
 
-Esto sería incorrecto:
-
-```text
-token = Guid.NewGuid().ToString()
-hash = SHA256(token)
-```
-
-y concluir:
+Porque el refresh token:
 
 ```text
-"Ahora tengo seguridad de 256 bits porque SHA-256 produce 256 bits."
+no lo escoge un humano
 ```
 
-La seguridad depende principalmente de la entropía de la entrada.
+Lo genera:
 
-Si una entrada solo tuviera:
-
-```text
-64 bits de entropía
+```csharp
+RandomNumberGenerator.GetBytes(32)
 ```
 
-hacer:
-
-```text
-SHA256(input)
-```
-
-no crea mágicamente:
+Entonces tiene aproximadamente:
 
 ```text
 256 bits de entropía
 ```
 
-Por eso primero hacemos:
+No existe un diccionario útil de:
 
 ```text
-RandomNumberGenerator.GetBytes(32)
+password
+admin
+123456
+qwerty
 ```
 
-y después:
+El atacante tendría que buscar dentro de un espacio aproximado de:
 
 ```text
+2^256
+```
+
+posibilidades.
+
+Por eso:
+
+```text
+random 256-bit refresh token
+        +
 SHA-256
 ```
 
-Las dos operaciones cumplen responsabilidades diferentes.
+es una combinación apropiada.
 
 ---
 
-# Modelo mental: random y hash no hacen lo mismo
+# En cambio, una contraseña necesita un algoritmo lento
 
-```text
-RandomNumberGenerator
-        ↓
-crea el secreto
+Una contraseña suele tener poca entropía.
 
-SHA-256
-        ↓
-crea una representación segura
-para almacenarlo
+Por eso no deberías hacer:
+
+```csharp
+SHA256(password)
 ```
 
-En otras palabras:
+para almacenar passwords.
+
+Para contraseñas se utilizan funciones deliberadamente costosas como:
 
 ```text
-RNG → seguridad del token
+Argon2
+BCrypt
+scrypt
+PBKDF2
+```
 
-SHA-256 → protección en persistencia
+Conceptualmente:
+
+```text
+PASSWORD
+────────
+humano
+predecible
+baja entropía
+
+→ password hashing lento
+
+
+REFRESH TOKEN
+─────────────
+máquina
+aleatorio
+alta entropía
+
+→ SHA-256
 ```
 
 ---
 
-# Paso 13: Implementar SHA-256 en .NET
+# Paso 4: implementar SHA-256 para el refresh token
 
-.NET proporciona:
-
-```csharp
-SHA256.HashData(...)
-```
-
-Primero convertimos el token a bytes UTF-8:
+Podés crear:
 
 ```csharp
-Encoding.UTF8.GetBytes(token)
+private static string HashRefreshToken(
+    string refreshToken)
+{
+    var bytes =
+        Encoding.UTF8.GetBytes(refreshToken);
+
+    var hash =
+        SHA256.HashData(bytes);
+
+    return Convert.ToHexString(hash);
+}
 ```
+
+Necesitás:
+
+```csharp
+using System.Security.Cryptography;
+using System.Text;
+```
+
+---
+
+# ¿Qué ocurre exactamente aquí?
+
+Primero:
+
+```csharp
+Encoding.UTF8.GetBytes(refreshToken)
+```
+
+transforma:
+
+```text
+"qW83ko..."
+```
+
+en bytes.
 
 Después:
 
@@ -1110,1562 +867,1480 @@ Después:
 SHA256.HashData(bytes)
 ```
 
-Ejemplo:
-
-```csharp
-using System.Security.Cryptography;
-using System.Text;
-
-var tokenBytes = Encoding.UTF8.GetBytes(refreshToken);
-
-var hashBytes = SHA256.HashData(tokenBytes);
-```
-
-`hashBytes` contiene:
-
-```text
-32 bytes
-```
-
-porque SHA-256 siempre devuelve:
+produce:
 
 ```text
 256 bits
 ```
 
----
-
-# Paso 14: Representar el hash como hexadecimal
-
-Para almacenarlo cómodamente podemos convertir los bytes a hexadecimal:
+Finalmente:
 
 ```csharp
-var tokenHash = Convert.ToHexString(hashBytes);
+Convert.ToHexString(hash)
 ```
 
-Flujo:
-
-```text
-Refresh token real
-      ↓
-Encoding.UTF8
-      ↓
-bytes
-      ↓
-SHA256.HashData
-      ↓
-32-byte hash
-      ↓
-Convert.ToHexString
-      ↓
-64 caracteres
-```
-
-Ejemplo conceptual:
-
-```text
-0F5CD15A3E...
-```
+representa esos bits como hexadecimal.
 
 ---
 
-# Paso 15: Crear un servicio de hashing reusable
+# ¿Por qué el resultado hexadecimal tiene 64 caracteres?
 
-Podemos encapsular esta operación:
-
-```csharp
-public interface IRefreshTokenHasher
-{
-    string Hash(string refreshToken);
-}
-```
-
-Implementación:
-
-```csharp
-using System.Security.Cryptography;
-using System.Text;
-
-public sealed class RefreshTokenHasher
-    : IRefreshTokenHasher
-{
-    public string Hash(string refreshToken)
-    {
-        var tokenBytes = Encoding.UTF8.GetBytes(
-            refreshToken);
-
-        var hashBytes = SHA256.HashData(
-            tokenBytes);
-
-        return Convert.ToHexString(hashBytes);
-    }
-}
-```
-
-Uso:
-
-```csharp
-var tokenHash = _refreshTokenHasher.Hash(
-    refreshToken);
-```
-
----
-
-# Paso 16: Registrar el hasher
-
-Como tampoco contiene estado:
-
-```csharp
-services.AddSingleton<
-    IRefreshTokenHasher,
-    RefreshTokenHasher>();
-```
-
----
-
-# Nota sobre el tamaño de `TokenHash`
-
-Si utilizás exactamente:
-
-```csharp
-Convert.ToHexString(
-    SHA256.HashData(...))
-```
-
-el resultado siempre tiene:
+Cada carácter hexadecimal representa:
 
 ```text
-64 caracteres
+4 bits
 ```
 
-Entonces podrías utilizar:
-
-```csharp
-.HasMaxLength(64)
-```
-
-en EF Core.
-
-Si tu playbook de persistencia utiliza:
-
-```csharp
-.HasMaxLength(128)
-```
-
-también funcionará.
-
-No es un problema de seguridad.
-
-Simplemente:
+SHA-256 produce:
 
 ```text
-64 = tamaño exacto para SHA-256 hexadecimal
-
-128 = deja margen para cambiar representación
-```
-
-Lo importante es que la decisión sea consciente.
-
----
-
-# Paso 17: Separar tres valores mentalmente
-
-Durante el flujo vamos a manejar tres conceptos distintos.
-
-### 1. Bytes aleatorios
-
-```text
-32 bytes
-```
-
-Solo existen durante la generación.
-
----
-
-### 2. Refresh token real
-
-```text
-Base64URL(random bytes)
-```
-
-Ejemplo:
-
-```text
-JSSIvE2GeA6waBJMeQEPSVzcxlZG9Ac0smTdTuCGHjs
-```
-
-Este valor:
-
-```text
-lo recibe el cliente;
-debe tratarse como secreto.
-```
-
----
-
-### 3. TokenHash
-
-```text
-SHA256(refresh token real)
-```
-
-Ejemplo:
-
-```text
-89EC4A890...
-```
-
-Este valor:
-
-```text
-se almacena en PostgreSQL.
-```
-
-Nunca confundas los tres.
-
----
-
-# Paso 18: Flujo completo de generación
-
-Ahora podemos visualizar:
-
-```text
-RandomNumberGenerator.GetBytes(32)
-              ↓
-        256 bits random
-              ↓
-           Base64URL
-              ↓
-      refresh token REAL
-              │
-              ├──────────────► cliente
-              │
-              ▼
-           SHA-256
-              ↓
-          TokenHash
-              ↓
-          PostgreSQL
-```
-
-Esta imagen mental es una de las más importantes de todo el sistema.
-
----
-
-# Paso 19: Crear una operación que genere token + hash
-
-Podemos encapsular ambas cosas en un resultado.
-
-Por ejemplo:
-
-```csharp
-public sealed record GeneratedRefreshToken(
-    string Token,
-    string Hash);
-```
-
-Servicio:
-
-```csharp
-public interface IRefreshTokenService
-{
-    GeneratedRefreshToken Generate();
-}
-```
-
-Implementación conceptual:
-
-```csharp
-public sealed class RefreshTokenService(
-    IRefreshTokenGenerator tokenGenerator,
-    IRefreshTokenHasher tokenHasher)
-    : IRefreshTokenService
-{
-    public GeneratedRefreshToken Generate()
-    {
-        var token = tokenGenerator.Generate();
-
-        var hash = tokenHasher.Hash(token);
-
-        return new GeneratedRefreshToken(
-            token,
-            hash);
-    }
-}
-```
-
-Ahora:
-
-```csharp
-var generatedToken =
-    _refreshTokenService.Generate();
-```
-
-produce:
-
-```text
-generatedToken.Token
-    → cliente
-
-generatedToken.Hash
-    → database
-```
-
----
-
-# Paso 20: Nunca devolver el hash al cliente
-
-La responsabilidad debe mantenerse clara.
-
-El cliente recibe:
-
-```text
-Token
-```
-
-PostgreSQL recibe:
-
-```text
-Hash
-```
-
-No al revés.
-
-Incorrecto:
-
-```json
-{
-  "refreshTokenHash": "ABCD..."
-}
-```
-
-Correcto conceptualmente:
-
-```text
-Cookie:
-refreshToken=<TOKEN REAL>
-```
-
-La aplicación nunca necesita exponer:
-
-```text
-TokenHash
-```
-
-al cliente.
-
----
-
-# Paso 21: Generar refresh token durante login
-
-Supongamos que el login ya valida:
-
-```text
-email
-password
-```
-
-y genera:
-
-```text
-accessToken
-```
-
-Ahora agregamos:
-
-```text
-refreshToken
-```
-
-Flujo:
-
-```text
-POST /auth/login
-      ↓
-validar credentials
-      ↓
-generar access JWT
-      ↓
-generar refresh token opaco
-      ↓
-calcular SHA-256
-      ↓
-crear RefreshToken entity
-      ↓
-guardar hash
-      ↓
-devolver JWT
-      ↓
-escribir refresh token real en cookie
-```
-
----
-
-# Paso 22: Construir la entidad durante login
-
-Ejemplo conceptual:
-
-```csharp
-var generatedRefreshToken =
-    _refreshTokenService.Generate();
-
-var refreshToken = new RefreshToken
-{
-    Id = Guid.NewGuid(),
-    UserId = user.Id,
-    TokenHash = generatedRefreshToken.Hash,
-    ExpiresAt = DateTime.UtcNow.AddDays(30)
-};
-```
-
-Después:
-
-```csharp
-await _refreshTokenRepository.AddAsync(
-    refreshToken,
-    cancellationToken);
-
-await _refreshTokenRepository.SaveChangesAsync(
-    cancellationToken);
-```
-
-La DB obtiene:
-
-```text
-TokenHash
-UserId
-ExpiresAt
-...
-```
-
-pero nunca:
-
-```text
-generatedRefreshToken.Token
-```
-
----
-
-# Paso 23: ¿Dónde entregar el refresh token?
-
-Preferiblemente mediante una cookie:
-
-```text
-HttpOnly
-Secure
-SameSite
-```
-
-y no dentro de:
-
-```text
-localStorage
-```
-
----
-
-# Paso 24: ¿Por qué `HttpOnly`?
-
-Una cookie:
-
-```text
-HttpOnly
-```
-
-no puede ser leída directamente desde JavaScript.
-
-Por ejemplo:
-
-```javascript
-document.cookie;
-```
-
-no debería poder recuperar esa cookie.
-
-Esto reduce la exposición del refresh token frente a determinados ataques XSS.
-
----
-
-# Paso 25: ¿Por qué `Secure`?
-
-```text
-Secure = true
-```
-
-indica que la cookie debe enviarse mediante HTTPS.
-
-Un refresh token es una credencial sensible.
-
-No debería viajar por conexiones HTTP sin cifrar.
-
----
-
-# Paso 26: ¿Qué hace `SameSite`?
-
-`SameSite` controla cuándo el navegador envía una cookie durante solicitudes originadas desde otros sitios.
-
-Los valores principales son:
-
-```text
-Strict
-Lax
-None
-```
-
-La elección depende de la arquitectura frontend/backend.
-
-Por ejemplo:
-
-```text
-SPA y API mismo site
-```
-
-puede permitir políticas más estrictas.
-
-Mientras:
-
-```text
-frontend y backend en contextos cross-site
-```
-
-puede requerir:
-
-```text
-SameSite=None
-Secure=true
-```
-
-No copies una configuración de `SameSite` sin comprender cómo están desplegados frontend y backend.
-
----
-
-# Paso 27: Escribir la cookie
-
-Ejemplo:
-
-```csharp
-response.Cookies.Append(
-    "refreshToken",
-    generatedRefreshToken.Token,
-    new CookieOptions
-    {
-        HttpOnly = true,
-        Secure = true,
-        SameSite = SameSiteMode.Strict,
-        Expires = refreshToken.ExpiresAt
-    });
-```
-
-La configuración exacta puede variar.
-
-Lo importante es separar:
-
-```text
-Application
-└── genera token
-
-API
-└── decide cómo transportarlo por HTTP
-```
-
-El servicio de dominio/aplicación no debería necesitar conocer:
-
-```text
-HttpResponse
-CookieOptions
-```
-
----
-
-# Paso 28: Respuesta del login
-
-Una estrategia habitual es:
-
-```text
-Access token
-    ↓
-response body
-
-Refresh token
-    ↓
-HttpOnly cookie
-```
-
-Ejemplo:
-
-```json
-{
-  "accessToken": "eyJ..."
-}
-```
-
-y simultáneamente:
-
-```http
-Set-Cookie: refreshToken=...
-```
-
-El frontend puede utilizar el access token mientras el navegador administra la cookie del refresh token.
-
----
-
-# Paso 29: Qué sucede cuando expira el access token
-
-Después de unos minutos:
-
-```text
-Access Token
-      ↓
-    expired
-```
-
-El usuario no debería tener que introducir nuevamente:
-
-```text
-email + password
-```
-
-si su sesión renovable continúa activa.
-
-Entonces el cliente llama:
-
-```http
-POST /auth/refresh
-```
-
-El navegador envía:
-
-```text
-refreshToken cookie
-```
-
----
-
-# Paso 30: El servidor recibe el refresh token REAL
-
-Supongamos que recibe:
-
-```text
-JSSIvE2GeA6waBJMeQEPSVzcxlZG9Ac0smTdTuCGHjs
-```
-
-No podemos buscar directamente:
-
-```sql
-WHERE TokenHash = 'JSSIvE...'
-```
-
-porque PostgreSQL no contiene el token real.
-
-Tenemos que repetir exactamente la misma transformación:
-
-```text
-token recibido
-      ↓
-SHA-256
-      ↓
-TokenHash
-      ↓
-buscar en DB
-```
-
----
-
-# Paso 31: Calcular nuevamente el hash
-
-```csharp
-var tokenHash =
-    _refreshTokenHasher.Hash(refreshToken);
-```
-
-Ahora podemos:
-
-```csharp
-var storedToken =
-    await _refreshTokenRepository.FindByHashAsync(
-        tokenHash,
-        cancellationToken);
-```
-
----
-
-# Esto funciona gracias a que SHA-256 es determinístico
-
-Durante login:
-
-```text
-Token A
-   ↓
-SHA-256
-   ↓
-Hash X
-```
-
-Durante refresh:
-
-```text
-Token A
-   ↓
-SHA-256
-   ↓
-Hash X
+256 bits
 ```
 
 Entonces:
 
 ```text
-Hash X == Hash X
+256 / 4
+= 64
 ```
 
-y podemos localizar la sesión.
+Resultado:
+
+```text
+64 caracteres hexadecimales
+```
+
+Ejemplo conceptual:
+
+```text
+6F8DB599DE986FAB7A21625B7916589C...
+```
+
+Por eso una columna:
+
+```text
+varchar(64)
+```
+
+sería suficiente si siempre vas a utilizar SHA-256 hexadecimal.
+
+Utilizar:
+
+```text
+varchar(128)
+```
+
+también es válido si querés dejar margen.
 
 ---
 
-# Paso 32: Validaciones mínimas del refresh token
+# Paso 5: entender cómo se valida sin descifrar
 
-Encontrar el registro no significa automáticamente aceptarlo.
-
-Tenemos que validar:
+Supongamos que generamos:
 
 ```text
-1. existe;
-2. no expiró;
-3. no fue revocado.
+RT1 = qW83koYRNdxOdf...
 ```
 
-Conceptualmente:
-
-```csharp
-if (storedToken is null)
-{
-    // invalid
-}
-
-if (storedToken.ExpiresAt <= DateTime.UtcNow)
-{
-    // expired
-}
-
-if (storedToken.RevokedAt is not null)
-{
-    // revoked
-}
-```
-
----
-
-# Paso 33: No distinguir demasiado los errores hacia el cliente
-
-Internamente puede ser útil saber:
+Calculamos:
 
 ```text
-token inexistente;
-token expirado;
-token revocado.
+HASH1 = SHA256(RT1)
 ```
 
-Pero hacia el cliente normalmente no hace falta revelar todos esos detalles.
+En PostgreSQL almacenamos:
 
-Podés responder:
+```text
+HASH1
+```
+
+En el navegador:
+
+```text
+RT1
+```
+
+Cuando posteriormente llega:
 
 ```http
-401 Unauthorized
+POST /api/auth/refresh
+Cookie: refreshToken=RT1
 ```
 
-de manera uniforme.
+hacemos otra vez:
+
+```text
+SHA256(RT1)
+```
+
+y obtenemos:
+
+```text
+HASH1
+```
+
+Entonces:
+
+```sql
+SELECT ...
+FROM RefreshTokens
+WHERE TokenHash = HASH1;
+```
+
+No hacemos:
+
+```text
+HASH1
+ ↓
+descifrar
+ ↓
+RT1
+```
+
+Hacemos:
+
+```text
+RT1 recibido
+    ↓
+SHA-256
+    ↓
+HASH1
+    ↓
+comparar
+```
+
+Este es el principio que debes recordar.
+
+---
+
+# Paso 6: crear un DTO interno para el refresh token emitido
+
+Application necesita entregar el token original al endpoint para que éste pueda
+crear la cookie.
+
+Pero Application no debería conocer:
+
+```text
+HttpResponse
+CookieOptions
+SameSite
+HttpOnly
+```
+
+Creá:
+
+```csharp
+namespace MyProject.Application.Identity.DTOs;
+
+public sealed record IssuedRefreshToken(
+    string Value,
+    DateTime ExpiresAt
+);
+```
+
+Representa:
+
+```text
+"el servicio emitió esta credencial"
+```
+
+No representa:
+
+```text
+"esta credencial es una cookie"
+```
+
+La conversión a cookie pertenece a API.
+
+---
+
+# Paso 7: definir el response público de autenticación
+
+Una respuesta sencilla:
+
+```csharp
+public sealed record AuthResponse(
+    string AccessToken,
+    int ExpiresIn
+);
+```
 
 Por ejemplo:
 
 ```json
 {
-  "message": "Invalid refresh token."
+  "accessToken": "eyJhbGciOi...",
+  "expiresIn": 900
 }
 ```
 
-Esto reduce información innecesaria para un atacante.
-
----
-
-# Paso 34: Eliminar la cookie si el refresh token ya no sirve
-
-Si el token:
-
-```text
-no existe;
-expiró;
-fue revocado;
-es inválido;
-```
-
-la cookie del navegador ya no aporta nada.
-
-Podés eliminarla:
-
-```csharp
-response.Cookies.Delete("refreshToken");
-```
-
-y responder:
-
-```http
-401 Unauthorized
-```
-
-Conceptualmente:
-
-```text
-token inválido
-      ↓
-eliminar cookie
-      ↓
-401
-      ↓
-cliente debe autenticarse nuevamente
-```
-
----
-
-# Paso 35: No reutilizar indefinidamente el mismo refresh token
-
-Una implementación inicial podría hacer:
-
-```text
-Refresh Token A
-     ↓
-/refresh
-     ↓
-nuevo Access Token
-     ↓
-seguir usando A
-```
-
-Pero una implementación más robusta utiliza:
-
-```text
-refresh token rotation
-```
-
-Cada refresh token se utiliza una vez para obtener un reemplazo.
-
----
-
-# Paso 36: ¿Qué es rotación?
-
-Supongamos:
-
-```text
-Refresh Token A
-```
-
-El cliente llama:
-
-```text
-POST /auth/refresh
-```
-
-Si A es válido:
-
-```text
-A
- ↓
-revocar A
- ↓
-generar B
- ↓
-guardar B
- ↓
-entregar B
-```
-
-El siguiente refresh tendrá que utilizar:
-
-```text
-B
-```
-
-y no:
-
-```text
-A
-```
-
----
-
-# Paso 37: Flujo completo de rotación
-
-```text
-Cliente tiene A
-      │
-      ▼
-POST /refresh
-      │
-      ▼
-SHA256(A)
-      │
-      ▼
-buscar A
-      │
-      ▼
-validar
-      │
-      ├── inválido → 401
-      │
-      ▼
-generar B
-      │
-      ├── token B real
-      │
-      └── hash B
-      │
-      ▼
-revocar A
-      │
-      └── ReplacedByTokenHash = hash B
-      │
-      ▼
-insertar B
-      │
-      ▼
-SaveChanges
-      │
-      ▼
-nuevo Access Token
-      │
-      ▼
-cookie = B
-```
-
----
-
-# Paso 38: Generar el reemplazo
-
-```csharp
-var replacement =
-    _refreshTokenService.Generate();
-```
-
-Tenemos:
-
-```text
-replacement.Token
-replacement.Hash
-```
-
----
-
-# Paso 39: Crear la nueva sesión/token
-
-```csharp
-var newRefreshToken = new RefreshToken
-{
-    Id = Guid.NewGuid(),
-    UserId = storedToken.UserId,
-    TokenHash = replacement.Hash,
-    ExpiresAt = DateTime.UtcNow.AddDays(30)
-};
-```
-
----
-
-# Paso 40: Revocar el token anterior
-
-```csharp
-_refreshTokenRepository.Revoke(
-    storedToken,
-    DateTime.UtcNow,
-    replacement.Hash);
-```
-
-El registro A queda:
-
-```text
-TokenHash = hash(A)
-RevokedAt = now
-ReplacedByTokenHash = hash(B)
-```
-
-Mientras B queda:
-
-```text
-TokenHash = hash(B)
-RevokedAt = null
-ReplacedByTokenHash = null
-```
-
----
-
-# Paso 41: Agregar el reemplazo
-
-```csharp
-await _refreshTokenRepository.AddAsync(
-    newRefreshToken,
-    cancellationToken);
-```
-
-Todavía no guardamos.
-
-Tenemos en memoria:
-
-```text
-A → Modified
-B → Added
-```
-
----
-
-# Paso 42: Guardar una sola vez
-
-Ahora:
-
-```csharp
-await _refreshTokenRepository.SaveChangesAsync(
-    cancellationToken);
-```
-
-EF Core puede persistir:
-
-```text
-revocación de A
-+
-creación de B
-```
-
-dentro del mismo `SaveChanges`.
-
-Eso es exactamente por lo que en el playbook de persistencia evitamos guardar dentro de:
-
-```text
-Revoke()
-```
-
-o:
-
-```text
-AddAsync()
-```
-
-individualmente.
-
----
-
-# Paso 43: ¿Por qué debe ser una unidad atómica?
-
-No queremos:
-
-```text
-revocar A
-   ↓
-COMMIT
-
-crear B
-   ↓
-ERROR
-```
-
-porque terminaríamos:
-
-```text
-A revocado
-B inexistente
-```
-
-El usuario pierde la sesión aunque el refresh haya sido legítimo.
-
-Queremos:
-
-```text
-revocar A
-+
-crear B
-+
-commit
-```
-
-o:
-
-```text
-no aplicar ninguno
-```
-
----
-
-# Paso 44: ¿Necesitamos transacción explícita?
-
-Un único:
-
-```csharp
-SaveChangesAsync()
-```
-
-normalmente ya utiliza una transacción cuando el proveedor necesita ejecutar múltiples operaciones.
-
-Para el caso simple:
-
-```text
-modificar A
-+
-insertar B
-+
-SaveChanges
-```
-
-puede ser suficiente.
-
-Una transacción explícita puede ser necesaria si la operación incluye:
-
-```text
-múltiples SaveChanges;
-múltiples DbContexts;
-operaciones externas;
-otros recursos coordinados.
-```
-
-No agregues transacciones manuales únicamente porque "suena más seguro".
-
-Primero entendé los límites de la operación.
-
----
-
-# Paso 45: Generar el nuevo access token
-
-Después de validar la sesión podemos generar:
-
-```csharp
-var accessToken =
-    _accessTokenGenerator.Generate(user);
-```
-
-El nuevo access token puede contener:
-
-```text
-sub
-email
-roles
-jti
-exp
-...
-```
-
-según las necesidades del proyecto.
-
-Recordá:
-
-```text
-Access Token = JWT
-
-Refresh Token = opaque random value
-```
-
----
-
-# Paso 46: Reemplazar la cookie
-
-El cliente ya no debería utilizar A.
-
-Por eso escribimos:
-
-```text
-refreshToken = B
-```
-
-en la cookie.
-
-```csharp
-response.Cookies.Append(
-    "refreshToken",
-    replacement.Token,
-    cookieOptions);
-```
-
-La cookie anterior queda reemplazada.
-
----
-
-# Paso 47: Devolver el nuevo access token
-
-Respuesta conceptual:
+Nunca:
 
 ```json
 {
-  "accessToken": "new-jwt"
+  "accessToken": "...",
+  "refreshToken": "..."
 }
 ```
 
-Simultáneamente:
-
-```http
-Set-Cookie: refreshToken=<TOKEN-B>
-```
+El refresh token no debe quedar disponible para JavaScript mediante el JSON.
 
 ---
 
-# Paso 48: Algoritmo completo de `/refresh`
+# ¿Qué representa `ExpiresIn`?
 
-Mentalmente:
+Normalmente segundos.
+
+Si el JWT dura:
 
 ```text
-1. leer cookie;
-
-2. si no existe:
-      401;
-
-3. SHA256(cookie);
-
-4. buscar TokenHash;
-
-5. si no existe:
-      borrar cookie;
-      401;
-
-6. si expiró:
-      borrar cookie;
-      401;
-
-7. si fue revocado:
-      borrar cookie;
-      401;
-
-8. generar refresh token B;
-
-9. calcular hash B;
-
-10. revocar A;
-
-11. A.ReplacedByTokenHash = hash B;
-
-12. crear registro B;
-
-13. SaveChanges una sola vez;
-
-14. generar nuevo access JWT;
-
-15. guardar token B real en cookie;
-
-16. devolver nuevo access token.
+15 minutos
 ```
 
----
+entonces:
 
-# Paso 49: Ejemplo simplificado del servicio
+```text
+15 × 60
+= 900
+```
 
-Una implementación conceptual podría verse así:
+Podés calcular:
 
 ```csharp
-public async Task<RefreshResult?> RefreshAsync(
-    string refreshToken,
-    CancellationToken cancellationToken = default)
+var expiresIn =
+    _jwtOptions.ExpiryMinutes * 60;
+```
+
+---
+
+# Paso 8: ampliar el resultado del login
+
+El servicio necesita devolver dos cosas distintas:
+
+```text
+datos públicos para JSON;
+credencial privada para cookie.
+```
+
+Por ejemplo:
+
+```csharp
+public sealed record LoginResult(
+    LoginStatus Status,
+    AuthResponse? Auth = null,
+    IssuedRefreshToken? RefreshToken = null
+);
+```
+
+Un login correcto puede conceptualmente devolver:
+
+```text
+LoginResult
+├── Status = Success
+├── Auth
+│   ├── AccessToken
+│   └── ExpiresIn
+└── RefreshToken
+    ├── Value
+    └── ExpiresAt
+```
+
+El endpoint decidirá:
+
+```text
+Auth
+   → JSON
+
+RefreshToken
+   → Set-Cookie
+```
+
+---
+
+# Paso 9: inyectar `IRefreshTokenRepository` en `AuthService`
+
+Ejemplo:
+
+```csharp
+public sealed class AuthService(
+    IPasswordHasher passwordHasher,
+    IUserRepository userRepository,
+    IRefreshTokenRepository refreshTokenRepository,
+    IOptions<JwtOptions> jwtOptions)
+    : IAuthService
 {
-    var tokenHash =
-        _refreshTokenHasher.Hash(refreshToken);
-
-    var storedToken =
-        await _refreshTokenRepository.FindByHashAsync(
-            tokenHash,
-            cancellationToken);
-
-    if (storedToken is null)
-    {
-        return null;
-    }
-
-    var now = DateTime.UtcNow;
-
-    if (storedToken.ExpiresAt <= now)
-    {
-        return null;
-    }
-
-    if (storedToken.RevokedAt is not null)
-    {
-        return null;
-    }
-
-    var replacement =
-        _refreshTokenService.Generate();
-
-    var newRefreshToken = new RefreshToken
-    {
-        Id = Guid.NewGuid(),
-        UserId = storedToken.UserId,
-        TokenHash = replacement.Hash,
-        ExpiresAt = now.AddDays(30)
-    };
-
-    _refreshTokenRepository.Revoke(
-        storedToken,
-        now,
-        replacement.Hash);
-
-    await _refreshTokenRepository.AddAsync(
-        newRefreshToken,
-        cancellationToken);
-
-    await _refreshTokenRepository.SaveChangesAsync(
-        cancellationToken);
-
-    var accessToken =
-        _accessTokenGenerator.Generate(
-            storedToken.User);
-
-    return new RefreshResult(
-        accessToken,
-        replacement.Token,
-        newRefreshToken.ExpiresAt);
 }
 ```
 
-La implementación real dependerá de dónde cargues:
+El flujo permanece:
 
 ```text
-User
-Roles
-Permissions
+AuthService
+    ↓
+IRefreshTokenRepository
+    ↓
+RefreshTokenRepository
+    ↓
+AppDbContext
+```
+
+No:
+
+```text
+AuthService
+    ↓
+AppDbContext
+```
+
+---
+
+# Paso 10: modificar el login
+
+Después de validar email y contraseña:
+
+```csharp
+var accessToken =
+    GenerateJwtToken(user);
+
+var refreshToken =
+    GenerateRefreshToken();
+
+var refreshTokenHash =
+    HashRefreshToken(refreshToken);
+
+var refreshTokenExpiresAt =
+    DateTime.UtcNow.AddDays(
+        _jwtOptions.RefreshTokenLifetimeDays);
+```
+
+Ahora creá la entidad:
+
+```csharp
+var refreshTokenEntity = new RefreshToken
+{
+    TokenHash = refreshTokenHash,
+    UserId = user.Id,
+    ExpiresAt = refreshTokenExpiresAt
+};
+```
+
+Persistila:
+
+```csharp
+await refreshTokenRepository.AddAsync(
+    refreshTokenEntity,
+    cancellationToken);
+
+await refreshTokenRepository.SaveChangesAsync(
+    cancellationToken);
+```
+
+Finalmente:
+
+```csharp
+return new LoginResult(
+    LoginStatus.Success,
+    new AuthResponse(
+        accessToken,
+        _jwtOptions.ExpiryMinutes * 60),
+    new IssuedRefreshToken(
+        refreshToken,
+        refreshTokenExpiresAt));
+```
+
+---
+
+# Flujo completo del login
+
+```text
+email + password
+      │
+      ▼
+validar credenciales
+      │
+      ▼
+GenerateJwtToken
+      │
+      ├──────────────────────► access token
+      │
+      ▼
+GenerateRefreshToken
+      │
+      ├──────────────────────► token REAL
+      │
+      ▼
+HashRefreshToken
+      │
+      ▼
+TokenHash
+      │
+      ▼
+PostgreSQL
+```
+
+Después:
+
+```text
+AuthResponse
+   ↓
+JSON
+
+IssuedRefreshToken
+   ↓
+Endpoint
+   ↓
+HttpOnly cookie
+```
+
+---
+
+# Paso 11: crear la cookie `HttpOnly`
+
+La cookie debe crearse en API.
+
+Por ejemplo:
+
+```csharp
+private const string RefreshTokenCookieName =
+    "myapp.refreshToken";
+```
+
+Helper:
+
+```csharp
+private static void AppendRefreshTokenCookie(
+    HttpResponse response,
+    IssuedRefreshToken refreshToken,
+    bool isDevelopment)
+{
+    var options = new CookieOptions
+    {
+        HttpOnly = true,
+        Secure = !isDevelopment,
+        SameSite = SameSiteMode.Lax,
+        Expires = new DateTimeOffset(
+            refreshToken.ExpiresAt),
+        Path = "/api/auth"
+    };
+
+    response.Cookies.Append(
+        RefreshTokenCookieName,
+        refreshToken.Value,
+        options);
+}
+```
+
+---
+
+# ¿Qué hace `HttpOnly`?
+
+```csharp
+HttpOnly = true
+```
+
+significa que JavaScript no puede leer la cookie mediante:
+
+```javascript
+document.cookie;
+```
+
+Eso reduce la exposición del refresh token ante determinados ataques XSS.
+
+El navegador continúa enviando la cookie automáticamente cuando corresponde.
+
+---
+
+# ¿Qué hace `Secure`?
+
+```csharp
+Secure = true
+```
+
+indica:
+
+```text
+solo enviar cookie mediante HTTPS
+```
+
+En producción debería estar activado.
+
+En desarrollo local puede necesitar una estrategia distinta dependiendo de si
+utilizás HTTP o HTTPS.
+
+---
+
+# ¿Qué hace `SameSite`?
+
+Controla cuándo se envía una cookie en solicitudes entre sitios.
+
+Una configuración común:
+
+```csharp
+SameSite = SameSiteMode.Lax
+```
+
+puede funcionar cuando frontend y backend forman parte del mismo site.
+
+Si la arquitectura es completamente cross-site, puede requerirse:
+
+```csharp
+SameSite = SameSiteMode.None
+Secure = true
+```
+
+No copies `SameSite` ciegamente.
+
+Debe analizarse según:
+
+```text
+dominio frontend
+dominio backend
+HTTPS
+proxy
+CORS
+```
+
+---
+
+# ¿Por qué limitar `Path`?
+
+```csharp
+Path = "/api/auth"
+```
+
+hace que el navegador no envíe el refresh token a rutas que no lo necesitan.
+
+Por ejemplo:
+
+```text
+/api/auth/login      ✓
+/api/auth/refresh    ✓
+/api/auth/logout     ✓
+
+/api/accounts        no es necesario
+/api/categories      no es necesario
+/api/gym             no es necesario
+```
+
+Es una medida de minimización de exposición.
+
+---
+
+# Paso 12: completar el endpoint de login
+
+Ejemplo con Minimal APIs:
+
+```csharp
+private static async Task<Results<
+        Ok<AuthResponse>,
+        UnauthorizedHttpResult>>
+    LoginAsync(
+        LoginRequest request,
+        IAuthService authService,
+        HttpResponse response,
+        IWebHostEnvironment environment,
+        CancellationToken cancellationToken)
+{
+    var result = await authService.LoginAsync(
+        request,
+        cancellationToken);
+
+    if (result.Status ==
+        LoginStatus.InvalidCredentials)
+    {
+        return TypedResults.Unauthorized();
+    }
+
+    if (result.Status != LoginStatus.Success)
+    {
+        throw new InvalidOperationException(
+            $"Unknown login status: {result.Status}");
+    }
+
+    AppendRefreshTokenCookie(
+        response,
+        result.RefreshToken!,
+        environment.IsDevelopment());
+
+    return TypedResults.Ok(
+        result.Auth!);
+}
+```
+
+Responsabilidades:
+
+```text
+AuthService
+───────────
+validó
+generó
+persistió
+
+
+Endpoint
+────────
+creó cookie
+seleccionó HTTP 200/401
+```
+
+---
+
+# Paso 13: preparar la consulta para el refresh
+
+Para emitir un JWT nuevo normalmente necesitás información del usuario:
+
+```text
+UserId
+Email
 Claims
 ```
 
----
-
-# Paso 50: Separar Application de HTTP
-
-Conviene que el servicio devuelva algo como:
+Si `RefreshToken` tiene:
 
 ```csharp
-public sealed record RefreshResult(
-    string AccessToken,
-    string RefreshToken,
-    DateTime RefreshTokenExpiresAt);
+public User User { get; set; }
 ```
 
-Y que el endpoint sea quien decida:
-
-```text
-cómo escribir cookies;
-qué status code devolver;
-cómo formar la respuesta HTTP.
-```
-
-Conceptualmente:
-
-```text
-Application
-    ↓
-RefreshResult
-    ↓
-API
-    ├── Set-Cookie
-    └── 200 OK
-```
-
----
-
-# Paso 51: Ejemplo conceptual del endpoint
+podés cargarlo:
 
 ```csharp
-[HttpPost("refresh")]
-public async Task<IActionResult> Refresh(
-    CancellationToken cancellationToken)
+public Task<RefreshToken?> FindByHashAsync(
+    string tokenHash,
+    CancellationToken cancellationToken = default)
 {
-    if (!Request.Cookies.TryGetValue(
-        "refreshToken",
-        out var refreshToken))
-    {
-        return Unauthorized();
-    }
-
-    var result = await _authService.RefreshAsync(
-        refreshToken,
-        cancellationToken);
-
-    if (result is null)
-    {
-        Response.Cookies.Delete(
-            "refreshToken");
-
-        return Unauthorized();
-    }
-
-    Response.Cookies.Append(
-        "refreshToken",
-        result.RefreshToken,
-        CreateRefreshTokenCookieOptions(
-            result.RefreshTokenExpiresAt));
-
-    return Ok(new
-    {
-        accessToken = result.AccessToken
-    });
+    return _dbContext.RefreshTokens
+        .Include(refreshToken => refreshToken.User)
+        .SingleOrDefaultAsync(
+            refreshToken =>
+                refreshToken.TokenHash == tokenHash,
+            cancellationToken);
 }
 ```
 
-El controlador:
+---
 
-```text
-conoce HTTP.
+# ¿Por qué `Include(User)`?
+
+Porque EF Core no carga automáticamente la navegación salvo que tengas
+configurado lazy loading.
+
+Entonces:
+
+```csharp
+storedRefreshToken.User
 ```
 
-El servicio:
+no debería asumirse disponible si la consulta no lo incluyó.
 
-```text
-conoce autenticación.
+---
+
+# Paso 14: crear estados específicos para refresh
+
+No reutilices errores de login.
+
+Por ejemplo:
+
+```csharp
+public enum RefreshStatus
+{
+    Success,
+    InvalidToken
+}
 ```
 
-El repositorio:
+Resultado:
 
-```text
-conoce persistencia.
+```csharp
+public sealed record RefreshResult(
+    RefreshStatus Status,
+    AuthResponse? Auth = null,
+    IssuedRefreshToken? RefreshToken = null
+);
 ```
 
 ---
 
-# Paso 52: Nunca loguear el refresh token real
+# ¿Por qué un único `InvalidToken`?
 
-Evita:
-
-```csharp
-_logger.LogInformation(
-    "Refresh token: {Token}",
-    refreshToken);
-```
-
-También evitá guardar accidentalmente:
+Externamente no queremos diferenciar:
 
 ```text
-request body completo;
-cookies completas;
-headers sensibles.
+token inexistente
+token expirado
+token revocado
 ```
 
-Un refresh token debe tratarse como:
+Todos deberían producir:
 
 ```text
-password;
-API key;
-session secret.
+401 Unauthorized
 ```
 
-Si necesitás correlacionar información durante debugging, utilizá identificadores no secretos.
+Esto evita entregar información innecesaria a un atacante.
+
+Internamente sí podés registrar métricas o logs si es necesario.
 
 ---
 
-# Paso 53: No enviar el token real en excepciones
+# Paso 15: añadir `RefreshAsync` al servicio
 
-Incorrecto:
+Contrato:
 
 ```csharp
-throw new Exception(
-    $"Invalid refresh token: {refreshToken}");
+Task<RefreshResult> RefreshAsync(
+    string refreshToken,
+    CancellationToken cancellationToken = default);
 ```
 
-Eso puede terminar en:
+El endpoint entrega:
 
 ```text
-logs;
-APM;
-Sentry;
-Application Insights;
-traces.
+token REAL recibido desde cookie
 ```
 
-Correcto:
-
-```csharp
-throw new InvalidRefreshTokenException();
-```
-
-sin incluir la credencial.
+El servicio se ocupa del resto.
 
 ---
 
-# Paso 54: No comparar contra el token real en la DB
+# Paso 16: hashear el token recibido
 
-Incorrecto:
+Al comenzar:
 
 ```csharp
-FindAsync(refreshToken);
+var tokenHash =
+    HashRefreshToken(refreshToken);
 ```
 
-si PostgreSQL contiene:
+Después:
+
+```csharp
+var storedToken =
+    await refreshTokenRepository.FindByHashAsync(
+        tokenHash,
+        cancellationToken);
+```
+
+El servidor nunca necesita:
 
 ```text
-SHA256(refreshToken)
-```
-
-Correcto:
-
-```csharp
-var hash =
-    _refreshTokenHasher.Hash(refreshToken);
-
-var stored =
-    await repository.FindByHashAsync(hash);
+descifrar TokenHash
 ```
 
 Siempre:
 
 ```text
-cliente → token real
-servidor → hash
-DB → hash
+token recibido
+    ↓
+SHA-256
+    ↓
+buscar hash
 ```
 
 ---
 
-# Paso 55: Qué ocurre si la base de datos se filtra
+# Paso 17: validar el token
 
-Supongamos que un atacante obtiene:
-
-```text
-identity.RefreshTokens
-```
-
-y encuentra:
+Un refresh token debería ser inválido si:
 
 ```text
-TokenHash = 8A91F...
+no existe;
+expiró;
+fue revocado.
 ```
 
-No obtiene directamente:
+Ejemplo:
 
-```text
-JSSIvE2GeA6...
+```csharp
+var now = DateTime.UtcNow;
+
+if (storedToken is null ||
+    storedToken.RevokedAt is not null ||
+    storedToken.ExpiresAt <= now)
+{
+    return new RefreshResult(
+        RefreshStatus.InvalidToken);
+}
 ```
-
-que es el secreto enviado al cliente.
-
-Para utilizar la sesión necesitaría encontrar una entrada que produzca exactamente ese SHA-256.
-
-Pero la entrada es un valor aleatorio de:
-
-```text
-256 bits
-```
-
-por lo que probar todas las posibilidades no es viable en la práctica.
-
-Esta es la razón real para almacenar hashes.
 
 ---
 
-# Paso 56: Qué SHA-256 NO protege
-
-Hashing no soluciona todos los problemas.
-
-Si un atacante obtiene directamente:
+# Validación conceptual
 
 ```text
-la cookie del navegador;
-el refresh token antes de hashearlo;
-un log que contiene el token;
-una request capturada;
+storedToken == null
+        ↓
+desconocido
+
+
+RevokedAt != null
+        ↓
+revocado
+
+
+ExpiresAt <= now
+        ↓
+expirado
 ```
 
-entonces ya posee el secreto real.
-
-SHA-256 protege principalmente:
+Cualquiera:
 
 ```text
-el refresh token en reposo dentro de la DB.
+InvalidToken
 ```
+
+---
+
+# Paso 18: generar el nuevo access token
+
+Si el token viejo es válido:
+
+```csharp
+var newAccessToken =
+    GenerateJwtToken(storedToken.User);
+```
+
+El JWT debe tener su propia expiración corta.
+
+Ejemplo:
+
+```text
+ahora + 15 minutos
+```
+
+La expiración del nuevo JWT no debería heredarse del refresh token.
+
+---
+
+# Paso 19: generar el refresh token reemplazo
+
+```csharp
+var newRefreshToken =
+    GenerateRefreshToken();
+
+var newRefreshTokenHash =
+    HashRefreshToken(newRefreshToken);
+
+var newRefreshTokenExpiresAt =
+    now.AddDays(
+        _jwtOptions.RefreshTokenLifetimeDays);
+```
+
+Nueva entidad:
+
+```csharp
+var newRefreshTokenEntity =
+    new RefreshToken
+    {
+        TokenHash = newRefreshTokenHash,
+        UserId = storedToken.UserId,
+        ExpiresAt = newRefreshTokenExpiresAt
+    };
+```
+
+---
+
+# Paso 20: revocar el token anterior
+
+```csharp
+refreshTokenRepository.Revoke(
+    storedToken,
+    now,
+    newRefreshTokenHash);
+```
+
+Esto debería producir conceptualmente:
+
+```text
+RT1
+├── RevokedAt = now
+└── ReplacedByTokenHash = HASH_RT2
+```
+
+El token nuevo:
+
+```text
+RT2
+├── RevokedAt = null
+└── ReplacedByTokenHash = null
+```
+
+---
+
+# Paso 21: persistir la rotación de forma atómica
+
+Esta parte es crítica.
+
+Prepará ambas modificaciones:
+
+```csharp
+refreshTokenRepository.Revoke(
+    storedToken,
+    now,
+    newRefreshTokenHash);
+
+await refreshTokenRepository.AddAsync(
+    newRefreshTokenEntity,
+    cancellationToken);
+```
+
+Y recién después:
+
+```csharp
+await refreshTokenRepository.SaveChangesAsync(
+    cancellationToken);
+```
+
+---
+
+# ¿Por qué un solo `SaveChangesAsync`?
+
+No hagas:
+
+```csharp
+Revoke(old);
+await SaveChangesAsync();
+
+await AddAsync(new);
+await SaveChangesAsync();
+```
+
+Porque puede ocurrir:
+
+```text
+revocar RT1
+   ↓
+COMMIT ✓
+
+crear RT2
+   ↓
+ERROR ✗
+```
+
+Resultado:
+
+```text
+RT1 revocado
+RT2 inexistente
+```
+
+La sesión queda destruida.
+
+Queremos:
+
+```text
+Change Tracker
+├── RT1 Modified
+└── RT2 Added
+        ↓
+SaveChangesAsync
+        ↓
+transacción
+```
+
+Si falla:
+
+```text
+rollback
+```
+
+Si funciona:
+
+```text
+commit
+```
+
+---
+
+# ¿Necesito `BeginTransactionAsync()`?
+
+Para una única llamada a `SaveChangesAsync`, EF Core normalmente ya ejecuta
+los cambios dentro de una transacción cuando el proveedor soporta
+transacciones.
+
+Por eso no es necesario introducir inmediatamente:
+
+```csharp
+_dbContext.Database.BeginTransactionAsync()
+```
+
+en `AuthService`.
+
+Además eso acoplaría Application con EF Core.
+
+La regla práctica:
+
+```text
+una operación lógica
++
+un DbContext
++
+un SaveChanges
+```
+
+suele ser suficiente para este caso básico.
+
+Si en el futuro la operación cruza:
+
+```text
+varios SaveChanges;
+varios DbContext;
+servicios externos;
+colas;
+```
+
+entonces el problema transaccional cambia.
+
+---
+
+# Importante: atomicidad no es lo mismo que concurrencia
+
+Un único `SaveChanges` protege frente a:
+
+```text
+fallo durante persistencia
+```
+
+pero no necesariamente resuelve por sí solo:
+
+```text
+dos requests concurrentes utilizando RT1 al mismo tiempo
+```
+
+Por ejemplo:
+
+```text
+Request A ─┐
+           ├── ambos leen RT1 activo
+Request B ─┘
+```
+
+Ese escenario requiere mecanismos adicionales como:
+
+```text
+optimistic concurrency;
+bloqueo;
+token family;
+reuse detection;
+restricciones adicionales.
+```
+
+Puede tratarse como una mejora posterior si no forma parte del alcance inicial.
+
+---
+
+# Paso 22: devolver el resultado de refresh
+
+```csharp
+return new RefreshResult(
+    RefreshStatus.Success,
+    new AuthResponse(
+        newAccessToken,
+        _jwtOptions.ExpiryMinutes * 60),
+    new IssuedRefreshToken(
+        newRefreshToken,
+        newRefreshTokenExpiresAt));
+```
+
+De nuevo:
+
+```text
+AuthResponse
+   → JSON
+
+IssuedRefreshToken
+   → cookie
+```
+
+---
+
+# Paso 23: implementar `RefreshAsync` completo
+
+Una implementación base:
+
+```csharp
+public async Task<RefreshResult> RefreshAsync(
+    string refreshToken,
+    CancellationToken cancellationToken = default)
+{
+    if (string.IsNullOrWhiteSpace(refreshToken))
+    {
+        return new RefreshResult(
+            RefreshStatus.InvalidToken);
+    }
+
+    var tokenHash =
+        HashRefreshToken(refreshToken);
+
+    var storedToken =
+        await refreshTokenRepository.FindByHashAsync(
+            tokenHash,
+            cancellationToken);
+
+    var now = DateTime.UtcNow;
+
+    if (storedToken is null ||
+        storedToken.RevokedAt is not null ||
+        storedToken.ExpiresAt <= now)
+    {
+        return new RefreshResult(
+            RefreshStatus.InvalidToken);
+    }
+
+    var newAccessToken =
+        GenerateJwtToken(storedToken.User);
+
+    var newRefreshToken =
+        GenerateRefreshToken();
+
+    var newRefreshTokenHash =
+        HashRefreshToken(newRefreshToken);
+
+    var newRefreshTokenExpiresAt =
+        now.AddDays(
+            _jwtOptions.RefreshTokenLifetimeDays);
+
+    var newRefreshTokenEntity =
+        new RefreshToken
+        {
+            TokenHash = newRefreshTokenHash,
+            UserId = storedToken.UserId,
+            ExpiresAt = newRefreshTokenExpiresAt
+        };
+
+    refreshTokenRepository.Revoke(
+        storedToken,
+        now,
+        newRefreshTokenHash);
+
+    await refreshTokenRepository.AddAsync(
+        newRefreshTokenEntity,
+        cancellationToken);
+
+    await refreshTokenRepository.SaveChangesAsync(
+        cancellationToken);
+
+    return new RefreshResult(
+        RefreshStatus.Success,
+        new AuthResponse(
+            newAccessToken,
+            _jwtOptions.ExpiryMinutes * 60),
+        new IssuedRefreshToken(
+            newRefreshToken,
+            newRefreshTokenExpiresAt));
+}
+```
+
+---
+
+# Paso 24: registrar `POST /auth/refresh`
+
+En Minimal APIs:
+
+```csharp
+auth.MapPost("/refresh", RefreshAsync)
+    .WithName("Refresh")
+    .Produces<AuthResponse>(
+        StatusCodes.Status200OK)
+    .Produces(
+        StatusCodes.Status401Unauthorized)
+    .WithSummary(
+        "Refreshes the authentication session")
+    .WithDescription(
+        "Rotates the refresh token and returns a new access token");
+```
+
+No requiere body.
+
+No requiere:
+
+```json
+{
+  "refreshToken": "..."
+}
+```
+
+El refresh token viene de la cookie.
+
+---
+
+# Paso 25: implementar el handler `/refresh`
+
+```csharp
+private static async Task<Results<
+        Ok<AuthResponse>,
+        UnauthorizedHttpResult>>
+    RefreshAsync(
+        HttpRequest request,
+        HttpResponse response,
+        IAuthService authService,
+        IWebHostEnvironment environment,
+        CancellationToken cancellationToken)
+{
+    if (!request.Cookies.TryGetValue(
+            RefreshTokenCookieName,
+            out var refreshToken) ||
+        string.IsNullOrWhiteSpace(refreshToken))
+    {
+        DeleteRefreshTokenCookie(response);
+
+        return TypedResults.Unauthorized();
+    }
+
+    var result =
+        await authService.RefreshAsync(
+            refreshToken,
+            cancellationToken);
+
+    if (result.Status ==
+        RefreshStatus.InvalidToken)
+    {
+        DeleteRefreshTokenCookie(response);
+
+        return TypedResults.Unauthorized();
+    }
+
+    if (result.Status !=
+        RefreshStatus.Success)
+    {
+        throw new InvalidOperationException(
+            $"Unknown refresh status: {result.Status}");
+    }
+
+    AppendRefreshTokenCookie(
+        response,
+        result.RefreshToken!,
+        environment.IsDevelopment());
+
+    return TypedResults.Ok(
+        result.Auth!);
+}
+```
+
+---
+
+# Paso 26: eliminar cookies inválidas
+
+Helper:
+
+```csharp
+private static void DeleteRefreshTokenCookie(
+    HttpResponse response)
+{
+    response.Cookies.Delete(
+        RefreshTokenCookieName,
+        new CookieOptions
+        {
+            Path = "/api/auth"
+        });
+}
+```
+
+Es importante utilizar el mismo `Path` con el que fue creada.
+
+---
+
+# Flujo completo de `/refresh`
+
+```text
+POST /api/auth/refresh
+       │
+       ▼
+leer cookie
+       │
+       ▼
+¿existe?
+   │       │
+   no      sí
+   │       │
+   ▼       ▼
+401     SHA-256
+delete      │
+cookie      ▼
+         DB lookup
+             │
+             ▼
+       ¿token válido?
+         │       │
+         no      sí
+         │       │
+         ▼       ▼
+        401    JWT nuevo
+      delete       +
+      cookie    RT nuevo
+                   │
+             ┌─────┴─────┐
+             ▼           ▼
+         revoke old    add new
+             │           │
+             └─────┬─────┘
+                   ▼
+             SaveChanges
+                   │
+                   ▼
+             Set-Cookie
+                   +
+               JSON JWT
+```
+
+---
+
+# Paso 27: respuesta HTTP esperada
+
+Login:
+
+```http
+POST /api/auth/login
+```
+
+Response:
+
+```json
+{
+  "accessToken": "eyJ...",
+  "expiresIn": 900
+}
+```
+
+Header:
+
+```http
+Set-Cookie:
+myapp.refreshToken=<opaque-token>;
+HttpOnly;
+Path=/api/auth;
+...
+```
+
+Refresh:
+
+```http
+POST /api/auth/refresh
+```
+
+Response:
+
+```json
+{
+  "accessToken": "nuevo-jwt",
+  "expiresIn": 900
+}
+```
+
+Y:
+
+```http
+Set-Cookie:
+myapp.refreshToken=<nuevo-refresh-token>;
+...
+```
+
+---
+
+# Paso 28: entender la rotación visualmente
+
+Después del login:
+
+```text
+RT1
+active
+```
+
+Primer refresh:
+
+```text
+RT1
+revoked
+replacedBy → RT2
+
+RT2
+active
+```
+
+Segundo refresh:
+
+```text
+RT1
+revoked
+replacedBy → RT2
+
+RT2
+revoked
+replacedBy → RT3
+
+RT3
+active
+```
+
+La base de datos conserva el historial.
+
+---
+
+# Paso 29: qué ocurre si alguien roba la base de datos
+
+Supongamos que PostgreSQL contiene:
+
+```text
+TokenHash
+────────────────────────────
+A93BC16F...
+83910B0A...
+F219DC04...
+```
+
+Un atacante no obtiene:
+
+```text
+RT1
+RT2
+RT3
+```
+
+Si intenta usar:
+
+```text
+A93BC16F...
+```
+
+como cookie, el servidor calculará:
+
+```text
+SHA256("A93BC16F...")
+```
+
+y obtendrá:
+
+```text
+otro hash
+```
+
+No coincidirá con el hash almacenado.
+
+Esto reduce significativamente el impacto de una filtración exclusivamente de
+la base de datos.
+
+---
+
+# Paso 30: qué ocurre si alguien roba el refresh token real
+
+El hashing no protege contra esto.
+
+Si un atacante obtiene:
+
+```text
+RT1
+```
+
+desde:
+
+```text
+navegador comprometido;
+malware;
+proxy malicioso;
+logs inseguros;
+XSS combinado con otras técnicas;
+```
+
+puede intentar utilizarlo mientras siga válido.
 
 Por eso también necesitamos:
 
@@ -2673,1331 +2348,877 @@ Por eso también necesitamos:
 HTTPS
 HttpOnly
 Secure
-protección XSS
-protección CSRF adecuada
-no loguear secretos
+SameSite
 rotación
+expiración
 revocación
 ```
 
-La seguridad se construye por capas.
+La seguridad no depende únicamente de SHA-256.
 
 ---
 
-# Paso 57: ¿Qué ocurre cuando alguien intenta reutilizar A?
+# Paso 31: CORS y cookies cross-origin
 
-Después de la rotación:
+Si frontend y backend están en orígenes diferentes, el navegador puede
+requerir credenciales explícitas.
 
-```text
-A.RevokedAt != null
-```
-
-Entonces una nueva request con A debería fallar.
-
-```text
-A
- ↓
-SHA-256
- ↓
-registro encontrado
- ↓
-RevokedAt != null
- ↓
-rechazar
-```
-
-Esto es una ventaja importante de la rotación.
-
----
-
-# Paso 58: Detección de reutilización
-
-Una implementación más avanzada puede distinguir:
-
-```text
-token expirado
-```
-
-de:
-
-```text
-token revocado porque ya fue rotado
-```
-
-Supongamos:
-
-```text
-A → B → C
-```
-
-y después alguien intenta utilizar nuevamente:
-
-```text
-A
-```
-
-Eso podría significar:
-
-```text
-el token A fue robado;
-el cliente antiguo todavía lo posee;
-existe una carrera entre requests.
-```
-
-Una política de seguridad puede considerar comprometida toda la familia:
-
-```text
-A
- ↓
-B
- ↓
-C
-```
-
-y revocar C también.
-
-Eso se conoce como:
-
-```text
-refresh token reuse detection
-```
-
-Puede implementarse posteriormente.
-
-No es obligatorio para entender la rotación básica, pero es importante saber por qué almacenamos:
-
-```text
-ReplacedByTokenHash
-```
-
----
-
-# Paso 59: `ReplacedByTokenHash` crea una cadena
-
-Ejemplo:
-
-```text
-A
-TokenHash = hashA
-ReplacedByTokenHash = hashB
-
-B
-TokenHash = hashB
-ReplacedByTokenHash = hashC
-
-C
-TokenHash = hashC
-ReplacedByTokenHash = null
-```
-
-Visualmente:
-
-```text
-A ───► B ───► C
-```
-
-Esto permite reconstruir el historial de una sesión.
-
----
-
-# Paso 60: Logout
-
-Logout es conceptualmente mucho más sencillo ahora.
-
-El cliente envía:
-
-```text
-refresh token actual
-```
-
-El servidor:
-
-```text
-1. calcula SHA-256;
-2. busca la sesión;
-3. si existe, la revoca;
-4. guarda cambios;
-5. elimina la cookie.
-```
-
-Conceptualmente:
-
-```text
-POST /auth/logout
-      ↓
-cookie
-      ↓
-SHA256
-      ↓
-FindByHash
-      ↓
-Revoke
-      ↓
-SaveChanges
-      ↓
-Delete cookie
-```
-
----
-
-# Paso 61: Logout no necesita blacklist del access token necesariamente
-
-Después del logout, el access token que ya fue emitido puede continuar siendo técnicamente válido hasta:
-
-```text
-exp
-```
-
-si mantenemos access tokens stateless.
-
-Por eso conviene que tengan una duración corta.
-
-Ejemplo:
-
-```text
-Access Token → 15 minutos
-Refresh Token → varios días
-```
-
-Al cerrar sesión:
-
-```text
-Refresh Token → revocado inmediatamente
-Access Token → muere naturalmente pronto
-```
-
-Agregar una blacklist de JWT es otra decisión arquitectónica y añade estado adicional.
-
-No debería hacerse accidentalmente al implementar refresh tokens.
-
----
-
-# Paso 62: Logout de todos los dispositivos
-
-Gracias al modelo:
-
-```text
-User 1:N RefreshToken
-```
-
-podemos posteriormente implementar:
-
-```text
-RevokeAllForUserAsync(userId)
-```
-
-y revocar:
-
-```text
-Laptop
-Phone
-Tablet
-```
-
-simultáneamente.
-
-Esto es útil para:
-
-```text
-cambio de contraseña;
-cuenta comprometida;
-"cerrar sesión en todos los dispositivos".
-```
-
----
-
-# Paso 63: Manejar el tiempo consistentemente
-
-Para autenticación utilizá siempre una convención clara.
-
-Normalmente:
-
-```text
-UTC
-```
-
-Por ejemplo:
+Servidor:
 
 ```csharp
-DateTime.UtcNow
+policy
+    .WithOrigins(allowedOrigins)
+    .AllowAnyHeader()
+    .AllowAnyMethod()
+    .AllowCredentials();
 ```
 
-y PostgreSQL:
+Cliente Axios:
 
-```text
-timestamp with time zone
+```typescript
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_BACKEND_URL,
+  withCredentials: true,
+});
 ```
 
-Evitá comparar:
-
-```text
-hora local del servidor
-```
-
-con:
-
-```text
-UTC
-```
-
-sin una estrategia definida.
-
----
-
-# Paso 64: Mejorar testabilidad mediante `TimeProvider`
-
-En proyectos modernos puede ser conveniente evitar llamadas directas dispersas a:
+No uses:
 
 ```csharp
-DateTime.UtcNow
+AllowAnyOrigin()
 ```
 
-y utilizar:
+junto con:
 
 ```csharp
-TimeProvider
+AllowCredentials()
 ```
 
-De esta forma, durante tests podés controlar el reloj.
-
-Conceptualmente:
+Si utilizás un proxy de Vite:
 
 ```text
-Production
-    ↓
-System TimeProvider
-
-Tests
-    ↓
-Fake TimeProvider
+frontend → /api → proxy → backend
 ```
 
-Esto facilita probar:
+durante desarrollo muchas de estas diferencias pueden quedar ocultas porque
+desde el navegador la petición parece same-origin.
 
-```text
-token activo;
-token exactamente expirado;
-token expirado hace un segundo.
-```
+Por eso también conviene probar el despliegue real.
 
 ---
 
-# Paso 65: Condición exacta de expiración
+# Paso 32: no implementar el refresh automático todavía si está fuera de alcance
 
-Definí claramente:
-
-```csharp
-ExpiresAt <= now
-```
-
-como expirado.
-
-No:
-
-```csharp
-ExpiresAt < now
-```
-
-si querés que exactamente en el instante `ExpiresAt` el token ya no sea válido.
-
-Regla mental:
+Existe una diferencia entre:
 
 ```text
-now < ExpiresAt
-    → válido
-
-now >= ExpiresAt
-    → expirado
+backend soporta /refresh
 ```
 
----
-
-# Paso 66: No renovar tokens expirados
-
-No hagas:
+y:
 
 ```text
-"Está vencido solamente hace cinco minutos,
-generemos otro."
+frontend detecta automáticamente un 401
+y utiliza /refresh
 ```
 
-Si expiró:
+Este playbook resuelve principalmente el backend.
+
+La integración automática del frontend normalmente requiere:
 
 ```text
-la sesión renovable terminó.
-```
-
-El usuario debe volver a autenticarse.
-
-De lo contrario, la expiración deja de tener sentido.
-
----
-
-# Paso 67: No renovar tokens revocados
-
-Igualmente:
-
-```text
-RevokedAt != null
-```
-
-significa:
-
-```text
-esta credencial ya no es válida.
-```
-
-No importa que:
-
-```text
-ExpiresAt > now
-```
-
-La revocación tiene prioridad.
-
----
-
-# Paso 68: Estado válido de un refresh token
-
-Podés pensar en:
-
-```text
-IsActive =
-    RevokedAt == null
-    &&
-    ExpiresAt > now
-```
-
-Conceptualmente:
-
-```csharp
-var isActive =
-    refreshToken.RevokedAt is null
-    && refreshToken.ExpiresAt > now;
-```
-
-Podría convertirse en comportamiento de dominio si encaja con la arquitectura.
-
----
-
-# Paso 69: Compilar por bloques
-
-Como en el playbook anterior, no implementes todo antes de verificar.
-
-Orden recomendado:
-
-```text
-1. RefreshTokenGenerator
-2. build
-
-3. RefreshTokenHasher
-4. build
-
-5. RefreshTokenService
-6. build
-
-7. modificar login
-8. build
-
-9. endpoint /refresh
-10. build
-
-11. rotación
-12. build
-
-13. logout
-14. build
-```
-
-Ejecutá:
-
-```bash
-dotnet build
-```
-
-frecuentemente.
-
----
-
-# Paso 70: Probar manualmente el login
-
-Después de login deberías verificar:
-
-```text
-HTTP response
-├── access token presente
-└── Set-Cookie refreshToken
-```
-
-En PostgreSQL:
-
-```text
-RefreshTokens
-└── TokenHash
-```
-
-El contenido de la DB:
-
-```text
-NO debe coincidir
-```
-
-con el contenido de la cookie.
-
----
-
-# Paso 71: Verificar manualmente SHA-256
-
-Podés hacer temporalmente una prueba controlada.
-
-Supongamos:
-
-```text
-cookieToken
-```
-
-Calculás:
-
-```csharp
-var hash =
-    _refreshTokenHasher.Hash(cookieToken);
-```
-
-y comprobás que:
-
-```text
-hash == RefreshTokens.TokenHash
-```
-
-Una vez confirmado, eliminá cualquier debugging que imprima tokens reales.
-
----
-
-# Paso 72: Probar `/refresh`
-
-Caso válido:
-
-```text
-login
- ↓
-obtener cookie A
- ↓
+request
+   ↓
+401
+   ↓
+response interceptor
+   ↓
 POST /refresh
- ↓
+   ↓
+nuevo access token
+   ↓
+actualizar memoria
+   ↓
+retry request
+```
+
+Debe tratarse cuidadosamente para evitar:
+
+```text
+loops infinitos;
+varios refresh concurrentes;
+reintentar /refresh;
+reintentar más de una vez.
+```
+
+---
+
+# Paso 33: probar login antes de probar refresh
+
+No intentes validar todo al mismo tiempo.
+
+Primero probá:
+
+```text
+POST /login
+```
+
+y verificá:
+
+```text
+200 OK
+accessToken presente
+expiresIn presente
+refreshToken NO presente en JSON
+cookie presente
+HttpOnly activo
+registro presente en DB
+TokenHash != cookie
+ExpiresAt correcto
+RevokedAt = null
+```
+
+---
+
+# Paso 34: inspeccionar PostgreSQL después del login
+
+Consulta:
+
+```sql
+SELECT
+    "Id",
+    "TokenHash",
+    "UserId",
+    "ExpiresAt",
+    "RevokedAt",
+    "ReplacedByTokenHash",
+    "CreatedAt"
+FROM identity."RefreshTokens"
+ORDER BY "CreatedAt" DESC;
+```
+
+Deberías ver:
+
+```text
+TokenHash             HASH_RT1
+ExpiresAt             ahora + 7 días
+RevokedAt             null
+ReplacedByTokenHash   null
+```
+
+Nunca deberías ver el token real.
+
+---
+
+# Paso 35: probar el primer refresh
+
+Llamá:
+
+```http
+POST /api/auth/refresh
+```
+
+Esperá:
+
+```text
 200
- ↓
-nuevo access JWT
- ↓
-cookie B
+nuevo access token
+nueva cookie
 ```
 
 En DB:
 
 ```text
-A.RevokedAt != null
-A.ReplacedByTokenHash == B.TokenHash
+RT1
+RevokedAt != null
+ReplacedByTokenHash = HASH_RT2
 
-B.RevokedAt == null
+RT2
+RevokedAt = null
 ```
 
 ---
 
-# Paso 73: Confirmar que A ya no funciona
+# Paso 36: probar un segundo refresh
 
-Después de rotar:
+Esperá:
 
 ```text
-A → B
+RT1 → revoked → RT2
+RT2 → revoked → RT3
+RT3 → active
 ```
 
-intentá utilizar nuevamente A.
+Esto confirma que realmente existe rotación.
 
-Esperado:
+---
+
+# Paso 37: probar cookie inexistente
+
+Eliminar la cookie manualmente.
+
+Después:
 
 ```http
+POST /api/auth/refresh
+```
+
+Esperá:
+
+```text
 401 Unauthorized
 ```
 
 No:
 
-```http
-200 OK
+```text
+500
 ```
 
 ---
 
-# Paso 74: Confirmar que B sí funciona
+# Paso 38: probar token desconocido
 
-Ahora:
+Enviar una cookie aleatoria.
 
-```text
-B
- ↓
-/refresh
- ↓
-C
-```
-
-En DB deberías terminar con:
-
-```text
-A → B → C
-```
-
-donde:
-
-```text
-A revoked
-B revoked
-C active
-```
-
----
-
-# Paso 75: Probar token inexistente
-
-Enviá un valor aleatorio distinto.
-
-El servidor:
-
-```text
-SHA256(fakeToken)
- ↓
-FindByHash
- ↓
-null
- ↓
-401
-```
-
-No debería generar:
-
-```text
-500 Internal Server Error
-```
-
----
-
-# Paso 76: Probar token expirado
-
-Creá una sesión con:
-
-```text
-ExpiresAt <= now
-```
-
-Resultado esperado:
+Esperá:
 
 ```text
 401
 cookie eliminada
-ningún nuevo token creado
+```
+
+La respuesta no debería indicar:
+
+```text
+"token not found"
 ```
 
 ---
 
-# Paso 77: Probar token revocado
+# Paso 39: probar token expirado
 
-Utilizá un registro con:
+Podés modificar temporalmente:
 
 ```text
-RevokedAt != null
+ExpiresAt
 ```
 
-Resultado esperado:
+en entorno de desarrollo.
+
+Esperá:
 
 ```text
 401
-```
-
-Nunca:
-
-```text
-rotarlo otra vez normalmente
+cookie eliminada
 ```
 
 ---
 
-# Paso 78: Probar persistencia atómica
+# Paso 40: probar token revocado
 
-Simulá un fallo antes de:
+Utilizá un token que ya haya sido rotado.
 
-```text
-SaveChangesAsync
-```
-
-y verificá que no termines con un estado parcial.
-
-La propiedad importante es:
+Esperá:
 
 ```text
-A revocado + B creado
-```
-
-deben formar la misma unidad lógica.
-
----
-
-# Arquitectura recomendada
-
-Una posible estructura:
-
-```text
-src/
-├── MyProject.Domain/
-│   └── Identity/
-│       └── Entities/
-│           └── RefreshToken.cs
-│
-├── MyProject.Application/
-│   └── Identity/
-│       ├── Interfaces/
-│       │   ├── IRefreshTokenGenerator.cs
-│       │   ├── IRefreshTokenHasher.cs
-│       │   └── IRefreshTokenRepository.cs
-│       │
-│       ├── Services/
-│       │   ├── RefreshTokenGenerator.cs
-│       │   ├── RefreshTokenHasher.cs
-│       │   └── AuthService.cs
-│       │
-│       └── Models/
-│           ├── GeneratedRefreshToken.cs
-│           └── RefreshResult.cs
-│
-├── MyProject.Infrastructure/
-│   └── Persistence/
-│       └── RefreshTokenRepository.cs
-│
-└── MyProject.Api/
-    ├── Controllers/
-    │   └── AuthController.cs
-    │
-    └── Authentication/
-        └── RefreshTokenCookieOptions.cs
-```
-
-La ubicación exacta depende de la arquitectura.
-
-La separación conceptual importa más que las carpetas:
-
-```text
-Generator
-    → crea secreto
-
-Hasher
-    → transforma secreto para persistencia
-
-Repository
-    → persiste sesión
-
-AuthService
-    → coordina el flujo
-
-API
-    → maneja HTTP y cookies
+401
+cookie eliminada
 ```
 
 ---
 
-# Flujo completo: login
+# Paso 41: probar compilación de backend y frontend
 
-```text
-Usuario
-  │
-  │ email/password
-  ▼
-POST /auth/login
-  │
-  ▼
-validar credenciales
-  │
-  ├─────────────► generar Access JWT
-  │
-  ▼
-RandomNumberGenerator.GetBytes(32)
-  │
-  ▼
-Base64URL
-  │
-  ├─────────────► Refresh Token real
-  │
-  ▼
-SHA-256
-  │
-  ▼
-TokenHash
-  │
-  ▼
-PostgreSQL
+Backend:
 
-Refresh Token real
-  │
-  ▼
-HttpOnly Cookie
-
-Access JWT
-  │
-  ▼
-Response body
+```bash
+dotnet build
 ```
 
----
+Frontend:
 
-# Flujo completo: refresh
-
-```text
-HttpOnly Cookie
-      │
-      ▼
-Refresh Token A
-      │
-      ▼
-SHA-256
-      │
-      ▼
-Hash A
-      │
-      ▼
-PostgreSQL
-      │
-      ▼
-RefreshToken A
-      │
-      ├── existe?
-      ├── expiró?
-      └── revocado?
-      │
-      ▼
-válido
-      │
-      ├────────────► nuevo Access JWT
-      │
-      ▼
-generar Token B
-      │
-      ▼
-SHA-256(B)
-      │
-      ▼
-Hash B
-      │
-      ├── A.RevokedAt = now
-      ├── A.ReplacedByTokenHash = Hash B
-      └── INSERT B
-      │
-      ▼
-SaveChanges
-      │
-      ▼
-Cookie = Token B real
+```bash
+pnpm build
 ```
 
----
-
-# Flujo completo: logout
-
-```text
-Cookie
-  │
-  ▼
-Token
-  │
-  ▼
-SHA-256
-  │
-  ▼
-FindByHash
-  │
-  ▼
-Revoke
-  │
-  ▼
-SaveChanges
-  │
-  ▼
-Delete Cookie
-```
+No consideres terminada la implementación solo porque el happy path funciona.
 
 ---
 
 # Errores comunes
 
-| Error                                          | Por qué está mal                                       | Solución                                             |
-| ---------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------- |
-| Usar otro JWT como refresh token sin necesidad | Añade complejidad sin eliminar la necesidad de estado  | Preferir token opaco aleatorio                       |
-| Utilizar `Random`                              | No es criptográficamente seguro                        | `RandomNumberGenerator`                              |
-| Confundir 256 bits con 256 caracteres          | Bits representan entropía, no longitud textual         | 32 bytes = 256 bits                                  |
-| Generar menos entropía y luego usar SHA-256    | Hashing no crea entropía                               | Generar 32 bytes aleatorios primero                  |
-| Guardar token real                             | Una fuga de DB expone sesiones activas                 | Persistir SHA-256                                    |
-| Pensar que SHA-256 cifra                       | No existe decrypt                                      | Comparar hashes                                      |
-| Usar bcrypt para token aleatorio sin necesidad | Añade costo innecesario                                | SHA-256 es suficiente para secretos de alta entropía |
-| Utilizar SHA-256 directamente para passwords   | Passwords tienen poca entropía                         | Argon2/bcrypt/PBKDF2                                 |
-| Devolver `TokenHash` al frontend               | No aporta nada y mezcla responsabilidades              | Cliente recibe token real                            |
-| Guardar refresh token en `localStorage`        | Mayor exposición ante JavaScript/XSS                   | Cookie HttpOnly                                      |
-| Loguear el token                               | Los logs se convierten en almacenamiento de secretos   | Nunca registrar credenciales                         |
-| Reutilizar indefinidamente el mismo token      | Un token robado conserva utilidad durante mucho tiempo | Rotación                                             |
-| Rotar pero no revocar el anterior              | Dos tokens continúan funcionando                       | Revocar A al crear B                                 |
-| Revocar A y guardar antes de crear B           | Puede romper la sesión ante un fallo                   | Un único `SaveChanges`                               |
-| Renovar un token expirado                      | La expiración deja de tener sentido                    | 401                                                  |
-| Renovar un token revocado                      | Rompe la revocación                                    | 401                                                  |
-| Crear blacklist JWT automáticamente            | Mezcla access y refresh tokens                         | Mantener access token stateless                      |
-| Configurar `SameSite` copiando ejemplos        | Depende del despliegue                                 | Analizar frontend/API                                |
+| Error                                              | Por qué ocurre                                        | Solución                                               |
+| -------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------ |
+| Usar `Random`                                      | No es un CSPRNG                                       | Usar `RandomNumberGenerator`                           |
+| Creer que Base64 protege el token                  | Base64 es encoding reversible                         | La seguridad viene de la aleatoriedad y SHA-256        |
+| Guardar el token real                              | Una fuga de DB permite usar las sesiones directamente | Persistir solo `TokenHash`                             |
+| Intentar descifrar SHA-256                         | Hashing no es encryption                              | Hashear nuevamente el token recibido y comparar        |
+| Usar SHA-256 para passwords                        | Es demasiado rápido para secretos humanos             | Usar BCrypt, Argon2, scrypt o PBKDF2                   |
+| Devolver refresh token en JSON                     | JavaScript puede acceder a él                         | Enviarlo mediante `HttpOnly` cookie                    |
+| Guardarlo en `localStorage`                        | Mayor exposición ante XSS                             | Mantenerlo en cookie `HttpOnly`                        |
+| Guardar dos veces durante rotación                 | Puede dejar una sesión inconsistente                  | Revocar + agregar + un solo `SaveChanges`              |
+| Añadir `AppDbContext` a AuthService                | Rompe separación Application/Infrastructure           | Usar repositorios/contratos                            |
+| Dar error diferente por token inexistente/revocado | Filtra información                                    | Responder 401 genérico                                 |
+| Crear el reemplazo sin revocar el anterior         | Deja múltiples tokens válidos                         | Rotar siempre                                          |
+| Reutilizar el mismo refresh token                  | No existe rotación real                               | Generar uno nuevo en cada refresh                      |
+| Usar `AddMinutes(RefreshTokenLifetimeDays)`        | Error de unidad temporal                              | Usar `AddDays(...)`                                    |
+| Olvidar cargar `User`                              | No se puede regenerar JWT                             | Usar `Include` o consulta específica                   |
+| Borrar cookie con otro `Path`                      | El navegador puede conservarla                        | Usar el mismo Path                                     |
+| Pensar que un `SaveChanges` soluciona concurrencia | Atomicidad y concurrencia son problemas diferentes    | Añadir estrategia específica si el alcance lo requiere |
 
 ---
 
-# Preguntas frecuentes
+# Sobre SHA-256: propiedades que conviene recordar
 
-## ¿El refresh token es un JWT?
+## Determinismo
 
-No necesariamente.
-
-En este diseño:
+Misma entrada:
 
 ```text
-Access Token = JWT
-Refresh Token = opaque random token
+SHA256(X)
+```
+
+siempre produce:
+
+```text
+mismo hash
 ```
 
 ---
 
-## ¿Por qué 32 bytes?
+## Avalanche effect
 
-Porque:
+Un cambio mínimo:
 
 ```text
-32 × 8 = 256 bits
+"ceres"
+"Ceres"
 ```
 
-de entropía aleatoria.
+produce hashes completamente diferentes.
 
 ---
 
-## ¿Por qué Base64URL?
+## Resistencia a preimagen
 
-Porque necesitamos representar bytes aleatorios como texto de forma compacta y cómoda para HTTP.
-
----
-
-## ¿Base64URL agrega seguridad?
-
-No.
-
-Base64URL es:
+Dado:
 
 ```text
-encoding
+HASH
 ```
 
-no:
+debería ser computacionalmente impracticable encontrar:
 
 ```text
-encryption
+INPUT
 ```
 
-La seguridad proviene de:
+tal que:
 
 ```text
-RandomNumberGenerator
+SHA256(INPUT) = HASH
 ```
 
 ---
 
-## ¿SHA-256 agrega aleatoriedad?
+## Resistencia a segunda preimagen
 
-No.
-
-SHA-256 transforma una entrada en un digest de 256 bits.
-
-La entropía viene de:
+Dado un mensaje:
 
 ```text
-RandomNumberGenerator.GetBytes(32)
+M1
+```
+
+debería ser impracticable encontrar:
+
+```text
+M2 != M1
+```
+
+que produzca el mismo hash.
+
+---
+
+## Resistencia a colisiones
+
+Debería ser impracticable encontrar dos mensajes arbitrarios:
+
+```text
+M1 != M2
+```
+
+tales que:
+
+```text
+SHA256(M1) = SHA256(M2)
 ```
 
 ---
 
-## ¿Por qué almacenar SHA-256?
+# ¿Por qué pueden existir colisiones matemáticamente?
 
-Para que una filtración de PostgreSQL no revele directamente los refresh tokens utilizables.
-
----
-
-## ¿Por qué podemos buscar el hash?
-
-Porque SHA-256 es determinístico.
+SHA-256 acepta entradas prácticamente arbitrarias:
 
 ```text
-SHA256(Token A) = Hash A
+cantidad gigantesca de inputs
 ```
 
-siempre.
-
----
-
-## ¿Por qué no necesitamos recuperar el token desde el hash?
-
-Porque el servidor nunca necesita recuperar el token original.
-
-El cliente presenta el original.
-
-El servidor calcula:
+pero solamente dispone de:
 
 ```text
-SHA256(original)
+2^256
 ```
 
-y compara.
+outputs posibles.
+
+Por el principio del palomar necesariamente existen entradas distintas con el
+mismo hash.
+
+Lo importante criptográficamente es que encontrarlas sea impracticable.
 
 ---
 
-## ¿Por qué SHA-256 y no bcrypt?
+# Diferencia entre hash, salt y pepper
 
-Porque bcrypt está diseñado principalmente para secretos de baja entropía, especialmente passwords humanos.
+Para refresh tokens aleatorios de alta entropía normalmente no necesitás
+agregar un salt para defenderte de ataques de diccionario como ocurre con
+passwords.
 
-Nuestro token tiene:
+¿Por qué?
+
+Porque cada token ya es esencialmente:
 
 ```text
 256 bits aleatorios
 ```
 
-y no es vulnerable a ataques prácticos de diccionario.
+Dos tokens generados correctamente prácticamente nunca serán iguales.
 
----
-
-## ¿Necesita salt?
-
-Normalmente no para un token aleatorio de alta entropía utilizado como identificador secreto y buscado por hash.
-
-Los propios tokens ya son valores aleatorios únicos.
-
----
-
-## ¿Puede haber colisiones SHA-256?
-
-Matemáticamente cualquier función con salida finita puede tener colisiones.
-
-Pero con SHA-256 la probabilidad relevante para este caso es tan pequeña que no representa una preocupación práctica.
-
-Además el índice único protege el modelo de persistencia.
-
----
-
-## ¿Por qué rotar?
-
-Para limitar el tiempo durante el cual un refresh token capturado continúa siendo útil.
-
-Después de utilizar A:
+En cambio, passwords humanos pueden repetirse:
 
 ```text
-A → revoked
-B → active
+password123
+password123
+password123
+```
+
+y por eso requieren mecanismos diseñados específicamente para password
+hashing.
+
+No copies automáticamente el esquema de password hashing al almacenamiento de
+refresh tokens.
+
+---
+
+# Arquitectura final esperada
+
+```text
+MyProject.Api
+└── Identity/
+    └── AuthEndpoints.cs
+        ├── POST /login
+        ├── POST /refresh
+        ├── AppendRefreshTokenCookie
+        └── DeleteRefreshTokenCookie
+
+
+MyProject.Application
+└── Identity/
+    ├── DTOs/
+    │   ├── AuthResponse.cs
+    │   ├── LoginResult.cs
+    │   ├── RefreshResult.cs
+    │   └── IssuedRefreshToken.cs
+    │
+    ├── Enums/
+    │   ├── LoginStatus.cs
+    │   └── RefreshStatus.cs
+    │
+    ├── Interfaces/
+    │   ├── IAuthService.cs
+    │   └── IRefreshTokenRepository.cs
+    │
+    ├── Options/
+    │   └── JwtOptions.cs
+    │
+    └── Services/
+        └── AuthService.cs
+            ├── GenerateJwtToken
+            ├── GenerateRefreshToken
+            ├── HashRefreshToken
+            ├── LoginAsync
+            └── RefreshAsync
+
+
+MyProject.Infrastructure
+└── Repositories/
+    └── RefreshTokenRepository.cs
 ```
 
 ---
 
-## ¿Por qué conservar `ReplacedByTokenHash`?
-
-Para poder reconstruir:
+# Flujo final de login
 
 ```text
-A → B → C
+POST /login
+email + password
+       │
+       ▼
+AuthService
+       │
+       ├── validar password
+       │
+       ├── crear JWT
+       │
+       ├── crear RT1 random
+       │
+       ├── SHA256(RT1)
+       │
+       └── guardar HASH_RT1
+       │
+       ▼
+Endpoint
+       │
+       ├── JSON:
+       │   ├── accessToken
+       │   └── expiresIn
+       │
+       └── Cookie:
+           └── RT1
 ```
-
-y posteriormente implementar detección de reutilización y revocación de familias de tokens.
 
 ---
 
-# Checklist de implementación
+# Flujo final de refresh
+
+```text
+POST /refresh
+cookie RT1
+    │
+    ▼
+SHA256(RT1)
+    │
+    ▼
+HASH_RT1
+    │
+    ▼
+FindByHash
+    │
+    ▼
+validar
+    │
+    ├── expired? → 401
+    ├── revoked? → 401
+    └── unknown? → 401
+    │
+    ▼
+crear JWT2
+crear RT2
+SHA256(RT2)
+    │
+    ▼
+revocar RT1
+ReplacedBy = HASH_RT2
+    │
+    ▼
+Add RT2
+    │
+    ▼
+SaveChanges
+    │
+    ▼
+Endpoint
+    ├── cookie = RT2
+    └── JSON = JWT2
+```
+
+---
+
+# Checklist final
 
 ## Generación
 
-- [ ] Utilizo `RandomNumberGenerator`
-- [ ] Genero 32 bytes
-- [ ] Entiendo que 32 bytes = 256 bits
-- [ ] Convierto a Base64URL
-- [ ] No utilizo `Random`
-- [ ] No dependo de timestamps para generar secretos
-- [ ] No utilizo información predecible del usuario
+- [ ] El refresh token usa `RandomNumberGenerator`
+- [ ] Se generan al menos 32 bytes aleatorios
+- [ ] El token se representa mediante Base64URL u otra codificación segura para transporte
+- [ ] No se utilizan timestamps, `Random`, IDs de usuario ni valores predecibles
 
 ## SHA-256
 
-- [ ] Convierto el token a UTF-8
-- [ ] Utilizo `SHA256.HashData`
-- [ ] Convierto el resultado a hexadecimal
-- [ ] Sé que SHA-256 devuelve 32 bytes
-- [ ] Sé que hexadecimal produce 64 caracteres
-- [ ] Entiendo que hashing no es encryption
-- [ ] Entiendo que SHA-256 no agrega entropía
-- [ ] No utilizo SHA-256 de esta manera para passwords humanos
-
-## Persistencia
-
-- [ ] La DB almacena `TokenHash`
-- [ ] La DB nunca almacena el token real
-- [ ] `TokenHash` tiene unique index
-- [ ] `ExpiresAt` está en UTC
-- [ ] `RevokedAt` es nullable
-- [ ] `ReplacedByTokenHash` está disponible
+- [ ] El refresh token real se convierte a bytes
+- [ ] Se calcula SHA-256
+- [ ] PostgreSQL guarda solamente el hash
+- [ ] Se entiende que SHA-256 no se descifra
+- [ ] La validación consiste en volver a hashear y comparar
+- [ ] No se utiliza SHA-256 como reemplazo de un password hasher
 
 ## Login
 
-- [ ] Genero access JWT
-- [ ] Genero refresh token
-- [ ] Calculo hash
-- [ ] Persisto hash
-- [ ] Entrego token real solamente al cliente
-- [ ] La cookie es `HttpOnly`
-- [ ] La cookie utiliza `Secure` en producción
-- [ ] Configuré conscientemente `SameSite`
+- [ ] El login sigue validando credenciales
+- [ ] Se genera un access token
+- [ ] Se genera un refresh token
+- [ ] Se persiste exclusivamente su hash
+- [ ] La expiración del refresh token utiliza días correctamente
+- [ ] La respuesta JSON no contiene el refresh token
+- [ ] El refresh token se envía como `HttpOnly` cookie
+
+## Cookie
+
+- [ ] `HttpOnly = true`
+- [ ] `Secure = true` en producción
+- [ ] `SameSite` fue decidido conscientemente
+- [ ] `Path` limita dónde se envía la cookie
+- [ ] El token no se almacena en `localStorage`
+- [ ] El token no se almacena en `sessionStorage`
+- [ ] El token no se coloca en React Context
 
 ## Refresh
 
-- [ ] Leo refresh token desde cookie
-- [ ] Calculo SHA-256
-- [ ] Busco por hash
-- [ ] Rechazo token inexistente
-- [ ] Rechazo token expirado
-- [ ] Rechazo token revocado
-- [ ] Genero reemplazo
-- [ ] Revoco token anterior
-- [ ] Registro `ReplacedByTokenHash`
-- [ ] Creo nuevo registro
-- [ ] Guardo rotación conjuntamente
-- [ ] Genero nuevo access JWT
-- [ ] Reemplazo la cookie
+- [ ] Existe `POST /auth/refresh`
+- [ ] El endpoint no recibe el refresh token en JSON
+- [ ] Lee el token desde la cookie
+- [ ] El servicio calcula SHA-256
+- [ ] Busca por `TokenHash`
+- [ ] Comprueba existencia
+- [ ] Comprueba expiración
+- [ ] Comprueba revocación
+- [ ] Genera un nuevo access token
+- [ ] Genera un nuevo refresh token
+- [ ] Revoca el anterior
+- [ ] Completa `ReplacedByTokenHash`
+- [ ] Persiste el reemplazo
+- [ ] Actualiza la cookie
+- [ ] Devuelve `{ accessToken, expiresIn }`
 
-## Seguridad
+## Atomicidad
 
-- [ ] No logueo refresh tokens
-- [ ] No devuelvo hashes al cliente
-- [ ] No incluyo tokens en excepciones
-- [ ] No guardo refresh tokens en `localStorage`
-- [ ] No renuevo tokens expirados
-- [ ] No renuevo tokens revocados
-- [ ] No creé blacklist JWT sin necesitarla
+- [ ] Revocación y creación utilizan el mismo `DbContext`
+- [ ] Se preparan ambos cambios antes de persistir
+- [ ] Se ejecuta un único `SaveChangesAsync`
+- [ ] Application no depende directamente de `AppDbContext`
+
+## Errores
+
+- [ ] Cookie ausente → 401
+- [ ] Token desconocido → 401
+- [ ] Token expirado → 401
+- [ ] Token revocado → 401
+- [ ] La cookie se elimina cuando el refresh es inválido
+- [ ] La respuesta no explica cuál condición exacta falló
+
+## Pruebas
+
+- [ ] Login funciona
+- [ ] La cookie existe
+- [ ] La cookie es HttpOnly
+- [ ] DB contiene hash y no token real
+- [ ] Primer refresh funciona
+- [ ] Primer token queda revocado
+- [ ] Segundo token queda activo
+- [ ] Segundo refresh produce un tercer token
+- [ ] Token revocado no puede reutilizarse
+- [ ] Token expirado falla
+- [ ] Token desconocido falla
+- [ ] Backend compila
+- [ ] Frontend compila si el contrato cambió
 
 ---
 
-# Modelo mental definitivo
+# Modelo mental para recordar SHA-256
 
-Si dentro de seis meses olvidás la implementación, recordá solamente esto:
-
-```text
-GENERAR
-───────
-
-RandomNumberGenerator.GetBytes(32)
-            ↓
-        256 bits
-            ↓
-        Base64URL
-            ↓
-      TOKEN REAL
-       ↙       ↘
- cliente      SHA-256
-                 ↓
-             TOKEN HASH
-                 ↓
-                 DB
-```
-
-Cuando vuelve el cliente:
+Si dentro de seis meses olvidás cómo funciona, recordá:
 
 ```text
-VALIDAR
-───────
-
 TOKEN REAL
-    ↓
-SHA-256
-    ↓
-TOKEN HASH
-    ↓
-buscar en DB
-    ↓
-existe?
-    ↓
-no expiró?
-    ↓
-no revocado?
+    │
+    │ SHA-256
+    ▼
+HASH
 ```
 
-Si es válido:
+No existe:
 
 ```text
-ROTAR
-─────
-
-Token A
-   ↓
-generar B
-   ↓
-revocar A
-   ↓
-A.ReplacedByTokenHash = Hash(B)
-   ↓
-guardar B
-   ↓
-SaveChanges
-   ↓
-cliente recibe B
+HASH
+    │
+    │ decrypt
+    ▼
+TOKEN REAL
 ```
 
-La idea central es:
+Para validar:
 
-> **El refresh token real es una credencial aleatoria que solamente posee el cliente. El servidor no necesita conocer su valor permanentemente: necesita poder reconocerlo cuando regrese. SHA-256 permite reconocerlo sin persistir el secreto original.**
+```text
+token recibido
+      │
+      ▼
+   SHA-256
+      │
+      ▼
+hash calculado
+      │
+      ▼
+¿igual al hash guardado?
+      │
+   sí / no
+```
 
-Y la distinción más importante de todas:
+Y la seguridad depende de que el token original sea:
+
+```text
+aleatorio
+impredecible
+alta entropía
+```
+
+Por eso:
 
 ```text
 RandomNumberGenerator
-    → crea el secreto.
-
-Base64URL
-    → representa el secreto como texto.
-
+        +
+256 bits
+        +
 SHA-256
-    → crea una huella determinística para almacenarlo.
+```
 
-PostgreSQL
-    → recuerda la sesión.
+funciona bien para refresh tokens.
 
-Rotación
-    → invalida el secreto anterior y entrega uno nuevo.
+---
+
+# Modelo mental completo de una sesión
+
+```text
+ACCESS TOKEN
+────────────
+JWT
+corto
+claims
+Authorization header
+normalmente no persistido
+
+
+REFRESH TOKEN
+─────────────
+opaque
+largo
+random 256 bits
+HttpOnly cookie
+SHA-256 en DB
+revocable
+rotatable
+```
+
+Login:
+
+```text
+credentials
+   ↓
+JWT1 + RT1
+```
+
+Refresh:
+
+```text
+RT1
+ ↓
+JWT2 + RT2
+```
+
+Refresh:
+
+```text
+RT2
+ ↓
+JWT3 + RT3
+```
+
+Logout:
+
+```text
+RT3
+ ↓
+revocar
+ ↓
+borrar cookie
 ```
 
 ---
 
-# Orden recomendado para implementarlo desde cero
+# Qué implementar después
 
-Si volvés a este playbook en otro proyecto:
+Una vez terminado este playbook, los siguientes bloques naturales son:
 
-```text
-1. Implementar persistencia de RefreshToken.
+1. **Refresh automático en el frontend**
 
-2. Crear IRefreshTokenGenerator.
+   - interceptor de responses;
+   - detectar 401;
+   - llamar `/refresh`;
+   - actualizar access token;
+   - reintentar request;
+   - evitar múltiples refresh simultáneos;
+   - evitar loops infinitos.
 
-3. Generar 32 bytes con RandomNumberGenerator.
+2. **Logout backend**
 
-4. Convertirlos a Base64URL.
+   - leer refresh cookie;
+   - hashear;
+   - encontrar sesión;
+   - revocarla;
+   - eliminar cookie;
+   - responder `204 No Content`;
+   - mantener comportamiento idempotente.
 
-5. Crear IRefreshTokenHasher.
+3. **Protección de rutas**
 
-6. Implementar SHA-256.
+   - distinguir sesión inicializando;
+   - sesión autenticada;
+   - sesión no autenticada;
+   - intentar restaurar sesión mediante `/refresh` al arrancar.
 
-7. Crear servicio que devuelva:
-      Token
-      Hash
+4. **Mejoras avanzadas**
 
-8. Modificar login:
-      generar access JWT;
-      generar refresh token;
-      persistir hash;
-      escribir cookie.
-
-9. Crear POST /auth/refresh.
-
-10. Leer cookie.
-
-11. Hashear valor recibido.
-
-12. Buscar TokenHash.
-
-13. Validar:
-      existe;
-      no expiró;
-      no está revocado.
-
-14. Generar token B.
-
-15. Revocar A.
-
-16. Asignar:
-      A.ReplacedByTokenHash = Hash(B)
-
-17. Insertar B.
-
-18. Guardar A + B juntos.
-
-19. Generar nuevo access JWT.
-
-20. Reemplazar cookie con B.
-
-21. Probar reutilización de A.
-
-22. Implementar logout.
-
-23. Después, si el proyecto lo necesita:
-      reuse detection;
-      revoke all sessions;
-      cleanup;
-      integration tests.
-```
+   - detección de reutilización;
+   - familias de refresh tokens;
+   - revocación de todas las sesiones;
+   - sesiones por dispositivo;
+   - concurrency control;
+   - limpieza de tokens expirados;
+   - integration tests.
 
 ---
 
 # Qué revisar la próxima vez
 
-- [ ] ¿Por qué el refresh token es opaco en vez de JWT?
-- [ ] ¿Qué significa realmente "256 bits"?
-- [ ] ¿Por qué son exactamente 32 bytes?
-- [ ] ¿Qué diferencia existe entre random, encoding y hashing?
-- [ ] ¿Qué es un CSPRNG?
-- [ ] ¿Por qué `RandomNumberGenerator` y no `Random`?
-- [ ] ¿Qué hace Base64URL?
-- [ ] ¿Qué hace SHA-256?
-- [ ] ¿Por qué SHA-256 siempre genera 256 bits?
-- [ ] ¿Por qué hexadecimal produce 64 caracteres?
-- [ ] ¿Por qué hashing no es encryption?
-- [ ] ¿Por qué SHA-256 es suficiente para un token aleatorio pero no para passwords?
-- [ ] ¿Por qué no necesitamos recuperar el refresh token desde la DB?
-- [ ] ¿Cómo funciona la validación mediante rehash?
-- [ ] ¿Por qué usamos cookie `HttpOnly`?
-- [ ] ¿Cómo escoger `SameSite`?
-- [ ] ¿Por qué rotar refresh tokens?
-- [ ] ¿Por qué revocación + creación deben guardarse juntas?
-- [ ] ¿Qué significa `ReplacedByTokenHash`?
-- [ ] ¿Cómo detectar reutilización?
-- [ ] ¿Cómo implementar logout?
-- [ ] ¿Cómo revocar todas las sesiones?
-- [ ] ¿Cómo probar el flujo completo?
+- [ ] Diferencia entre encoding, encryption y hashing
+- [ ] Por qué Base64URL no brinda seguridad
+- [ ] Qué significa que SHA-256 sea unidireccional
+- [ ] Qué es un ataque de preimagen
+- [ ] Por qué SHA-256 sirve para tokens aleatorios pero no para passwords
+- [ ] Cómo generar 256 bits con `RandomNumberGenerator`
+- [ ] Por qué el refresh token real solo debe existir en cliente y memoria temporal del servidor
+- [ ] Por qué la DB guarda `TokenHash`
+- [ ] Cómo se valida un token sin descifrar el hash
+- [ ] Cómo configurar `HttpOnly`, `Secure`, `SameSite` y `Path`
+- [ ] Cómo funciona la rotación
+- [ ] Por qué revocación + creación deben guardarse juntas
+- [ ] Diferencia entre atomicidad y concurrencia
+- [ ] Cómo manejar 401 sin filtrar información
+- [ ] Cómo implementar logout
+- [ ] Cómo implementar refresh automático en Axios
+- [ ] Cómo detectar reutilización de un token antiguo
 
 ---
 
-# Referencias conceptuales rápidas
+# Referencias útiles
 
-```text
-Token opaco
-    = secreto aleatorio sin claims.
-
-256 bits
-    = 32 bytes de entropía.
-
-CSPRNG
-    = generador pseudoaleatorio apto para criptografía.
-
-Base64URL
-    = encoding binario → texto seguro para URLs/HTTP.
-
-SHA-256
-    = función hash criptográfica con salida de 256 bits.
-
-Hash
-    = huella irreversible y determinística.
-
-Rotation
-    = reemplazar cada refresh token después de utilizarlo.
-
-Revocation
-    = marcar una sesión como no válida.
-
-Reuse Detection
-    = detectar el uso de un token que ya había sido rotado.
-```
-
----
-
-# Resumen en una frase
-
-> **Generá el refresh token con 256 bits aleatorios, entregá el valor real únicamente al cliente, almacená `SHA-256(token)` en la base de datos y reemplazá el token por uno nuevo cada vez que se utilice para renovar la sesión.**
+- [ASP.NET Core Security](https://learn.microsoft.com/aspnet/core/security/)
+- [System.Security.Cryptography](https://learn.microsoft.com/dotnet/api/system.security.cryptography)
+- [RandomNumberGenerator](https://learn.microsoft.com/dotnet/api/system.security.cryptography.randomnumbergenerator)
+- [SHA256](https://learn.microsoft.com/dotnet/api/system.security.cryptography.sha256)
+- [ASP.NET Core Cookies](https://learn.microsoft.com/aspnet/core/security/authentication/cookie)
+- [EF Core Saving Data](https://learn.microsoft.com/ef/core/saving/)
+- [EF Core Transactions](https://learn.microsoft.com/ef/core/saving/transactions)
+- [OAuth 2.0 Security Best Current Practice](https://www.rfc-editor.org/rfc/rfc9700)
+- [OAuth 2.0 Authorization Framework](https://www.rfc-editor.org/rfc/rfc6749)
+- [NIST Secure Hash Standard](https://csrc.nist.gov/pubs/fips/180-4/upd1/final)
