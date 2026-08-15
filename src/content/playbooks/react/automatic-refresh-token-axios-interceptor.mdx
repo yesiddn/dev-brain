@@ -1,0 +1,3580 @@
+---
+title: "Cómo implementar Refresh Token automático con Axios Interceptors en React"
+description: "Guía práctica y conceptual para renovar automáticamente access tokens expirados desde React usando Axios, cookies HttpOnly, un interceptor de respuestas, control de concurrencia y reintentos seguros"
+goal: "Implementar un cliente HTTP capaz de detectar access tokens expirados, renovar la sesión mediante un refresh token HttpOnly, actualizar el estado de autenticación y reintentar peticiones sin generar loops ni múltiples refresh simultáneos"
+tech:
+  ["react", "typescript", "axios", "jwt", "refresh-token", "http-only-cookie"]
+tags:
+  [
+    "authentication",
+    "refresh-token",
+    "axios",
+    "interceptor",
+    "jwt",
+    "react",
+    "typescript",
+    "security",
+    "concurrency",
+    "cookies",
+  ]
+level: "medio"
+status: "active"
+prerequisites:
+  - "Frontend React + TypeScript configurado"
+  - "Axios configurado como cliente HTTP compartido"
+  - "Login funcionando"
+  - "Access token JWT mantenido en memoria"
+  - "AuthContext o mecanismo equivalente de estado de autenticación"
+  - "Backend con POST /auth/refresh funcionando"
+  - "Refresh token enviado por backend mediante cookie HttpOnly"
+  - "Backend capaz de rotar el refresh token"
+estimatedTime: "60-90 min"
+updatedAt: 2026-08-14
+createdAt: 2026-08-14
+summary: "Implementación reusable de refresh automático en Axios: withCredentials, interceptor de respuestas, detección de 401, refresh compartido, control de concurrencia, retry único, prevención de loops, actualización inmediata del token y cierre de sesión ante refresh inválido"
+related:
+  [
+    "Cómo implementar emisión y rotación segura de Refresh Tokens en .NET",
+    "Cómo implementar persistencia segura de Refresh Tokens en .NET + EF Core",
+  ]
+---
+
+import { Code } from "astro:components";
+
+# Contexto
+
+> **¿Cuándo usar este playbook?**
+>
+> Cuando el backend ya soporta sesiones renovables mediante access tokens y
+> refresh tokens, pero el frontend todavía obliga al usuario a iniciar sesión
+> nuevamente cada vez que expira el access token.
+
+Este playbook comienza donde termina la implementación backend del refresh.
+
+Ya deberías tener un flujo similar a:
+
+```text
+POST /auth/login
+      │
+      ▼
+backend
+      │
+      ├── access token JWT
+      │       ↓
+      │     JSON
+      │
+      └── refresh token opaco
+              ↓
+         HttpOnly cookie
+```
+
+Y también:
+
+```text
+POST /auth/refresh
+      │
+      │ cookie enviada automáticamente
+      ▼
+backend
+      │
+      ├── validar refresh token
+      ├── revocar token anterior
+      ├── crear reemplazo
+      ├── crear nuevo access token
+      │
+      ▼
+200 OK
+{
+  "accessToken": "...",
+  "expiresIn": 900
+}
+```
+
+El problema que falta resolver es:
+
+```text
+¿Cómo sabe el frontend cuándo debe llamar /refresh?
+```
+
+Una aplicación real no debería obligar a cada componente a hacer esto:
+
+```typescript
+try {
+  await apiClient.get("/accounts");
+} catch (error) {
+  if (error.status === 401) {
+    await refresh();
+    await apiClient.get("/accounts");
+  }
+}
+```
+
+Eso produciría lógica duplicada por toda la aplicación.
+
+Queremos centralizarla:
+
+```text
+Component
+   │
+   ▼
+apiClient
+   │
+   ▼
+Backend
+   │
+   ▼
+401 Unauthorized
+   │
+   ▼
+Axios Response Interceptor
+   │
+   ├── POST /auth/refresh
+   ├── actualizar access token
+   └── repetir request original
+```
+
+Desde el punto de vista del componente:
+
+```typescript
+const accounts = await apiClient.get("/accounts");
+```
+
+debería continuar funcionando aunque el access token haya expirado, siempre que
+el refresh token siga siendo válido.
+
+---
+
+# Objetivo arquitectónico
+
+Queremos mantener responsabilidades separadas:
+
+```text
+React Components
+       │
+       │ consumen API
+       ▼
+apiClient
+       │
+       │ HTTP
+       ▼
+AuthInterceptor
+       │
+       ├── añade Authorization
+       ├── detecta 401
+       ├── coordina refresh
+       └── reintenta requests
+       │
+       ▼
+AuthContext
+       │
+       ├── user
+       ├── accessToken
+       └── estado de sesión
+```
+
+Mientras tanto:
+
+```text
+Browser
+   │
+   └── Refresh Token
+       HttpOnly Cookie
+```
+
+La regla central es:
+
+> **Axios administra transporte y reintentos. React administra el estado de
+> autenticación. El navegador administra el refresh token HttpOnly.**
+
+No mezcles estas responsabilidades.
+
+---
+
+# Modelo mental de la sesión
+
+Antes de implementar código, recordá esta división:
+
+```text
+ACCESS TOKEN
+────────────
+JWT
+corta duración
+guardado en memoria
+JavaScript puede acceder a él
+enviado con Authorization: Bearer
+
+
+REFRESH TOKEN
+─────────────
+token opaco
+larga duración
+cookie HttpOnly
+JavaScript NO puede leerlo
+enviado automáticamente por navegador
+```
+
+El frontend conoce:
+
+```text
+accessToken
+```
+
+pero no conoce:
+
+```text
+refreshToken
+```
+
+Esto es intencional.
+
+---
+
+# Flujo final que queremos conseguir
+
+```text
+GET /api/accounts
+Authorization: Bearer JWT1
+        │
+        ▼
+backend
+        │
+        ▼
+401 Unauthorized
+        │
+        ▼
+response interceptor
+        │
+        ▼
+POST /api/auth/refresh
+Cookie: refreshToken=RT1
+        │
+        ▼
+backend
+        │
+        ├── RT1 → revoked
+        ├── crear RT2
+        ├── crear JWT2
+        │
+        ▼
+200
+{
+  accessToken: JWT2
+}
+Set-Cookie: RT2
+        │
+        ▼
+actualizar AuthContext
+        │
+        ▼
+actualizar accessTokenRef
+        │
+        ▼
+repetir GET /api/accounts
+Authorization: Bearer JWT2
+        │
+        ▼
+200 OK
+```
+
+Para el componente original todo ocurre transparentemente.
+
+---
+
+# Paso 1: utilizar una única instancia compartida de Axios
+
+No crees Axios directamente dentro de cada servicio.
+
+Evita:
+
+```typescript
+axios.get(...)
+axios.post(...)
+```
+
+dispersos por toda la aplicación.
+
+Crea una instancia compartida:
+
+```typescript
+import axios from "axios";
+
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_BACKEND_URL || "/api",
+  headers: {
+    "Content-Type": "application/json",
+  },
+  withCredentials: true,
+});
+
+export default apiClient;
+```
+
+La arquitectura queda:
+
+```text
+LoginService ───────┐
+AccountService ─────┤
+CategoryService ────┼──► apiClient
+TransactionService ─┤
+GymService ─────────┘
+```
+
+## ¿Por qué una sola instancia?
+
+Porque los interceptores se registran sobre una instancia concreta.
+
+Si tienes:
+
+```typescript
+const authClient = axios.create(...);
+const accountClient = axios.create(...);
+const transactionClient = axios.create(...);
+```
+
+tendrías que mantener los interceptores sincronizados entre todos.
+
+Una única instancia reduce esa complejidad.
+
+---
+
+# Paso 2: habilitar `withCredentials`
+
+El cliente debe permitir que el navegador envíe cookies cuando corresponda:
+
+```typescript
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_BACKEND_URL || "/api",
+  withCredentials: true,
+});
+```
+
+## ¿Significa que Axios puede leer la cookie HttpOnly?
+
+No.
+
+`withCredentials` no hace esto:
+
+```typescript
+const token = document.cookie;
+```
+
+Simplemente permite:
+
+```text
+Axios
+  ↓
+Browser
+  ↓
+adjuntar cookies válidas
+  ↓
+HTTP Request
+```
+
+El refresh token continúa inaccesible desde JavaScript.
+
+---
+
+# Diferencia importante: enviar una cookie no significa leerla
+
+El navegador puede hacer:
+
+```http
+POST /api/auth/refresh
+Cookie: myapp.refreshToken=RT1
+```
+
+sin que React conozca:
+
+```text
+RT1
+```
+
+Este es precisamente el comportamiento deseado.
+
+---
+
+# Paso 3: considerar CORS y desarrollo con proxy
+
+Si frontend y backend están realmente en orígenes diferentes:
+
+```text
+https://app.example.com
+https://api.example.com
+```
+
+el backend normalmente necesitará permitir credenciales:
+
+```csharp
+policy
+    .WithOrigins(allowedOrigins)
+    .AllowAnyHeader()
+    .AllowAnyMethod()
+    .AllowCredentials();
+```
+
+No combines:
+
+```csharp
+AllowAnyOrigin()
+```
+
+con:
+
+```csharp
+AllowCredentials()
+```
+
+porque las credenciales requieren un origen explícito.
+
+---
+
+## Proxy de Vite
+
+Durante desarrollo podrías tener:
+
+```text
+Browser
+   ↓
+http://localhost:5173/api
+   ↓
+Vite Proxy
+   ↓
+http://localhost:5170
+```
+
+Desde la perspectiva del navegador:
+
+```text
+frontend → /api
+```
+
+parece same-origin.
+
+Por eso un proxy puede ocultar problemas reales de CORS.
+
+Recordá siempre probar también la configuración que usarás en producción.
+
+---
+
+# Paso 4: reutilizar el mismo contrato de autenticación
+
+Si login y refresh devuelven:
+
+```json
+{
+  "accessToken": "...",
+  "expiresIn": 900
+}
+```
+
+no necesitas:
+
+```typescript
+LoginResponse;
+RefreshResponse;
+```
+
+con exactamente las mismas propiedades.
+
+Puedes tener:
+
+```typescript
+export interface AuthResponse {
+  accessToken: string;
+  expiresIn: number;
+}
+```
+
+Y utilizarlo para:
+
+```text
+login()
+refresh()
+```
+
+---
+
+# ¿Por qué importa nombrar bien el contrato?
+
+Porque conceptualmente:
+
+```text
+Login
+  ↓
+AuthResponse
+
+
+Refresh
+  ↓
+AuthResponse
+```
+
+Ambas operaciones están emitiendo:
+
+```text
+estado autenticado renovado
+```
+
+No son respuestas estructuralmente diferentes.
+
+---
+
+# Paso 5: crear la operación `refresh()` en el servicio de autenticación
+
+Suponiendo:
+
+```typescript
+import apiClient from "@/shared/services/api/apiClient";
+```
+
+puedes implementar:
+
+```typescript
+export async function refresh(): Promise<AuthResponse> {
+  const response = await apiClient.post<AuthResponse>("/auth/refresh");
+
+  return response.data;
+}
+```
+
+Observa que no enviamos:
+
+```typescript
+{
+  refreshToken;
+}
+```
+
+No existe:
+
+```typescript
+refresh(token);
+```
+
+La función simplemente ejecuta:
+
+```text
+POST /auth/refresh
+```
+
+El navegador hace el resto.
+
+---
+
+# ¿Por qué no enviar un body?
+
+Porque el backend espera:
+
+```http
+Cookie: myapp.refreshToken=...
+```
+
+y no:
+
+```json
+{
+  "refreshToken": "..."
+}
+```
+
+Esto mantiene el token fuera del runtime de JavaScript.
+
+---
+
+# Paso 6: mantener el refresh token fuera de AuthContext
+
+Un contexto de autenticación puede verse así:
+
+```typescript
+export interface AuthContextValue {
+  user: AuthUser | null;
+  accessToken: string | null;
+  isAuthenticated: boolean;
+  login: (accessToken: string) => void;
+  logout: () => void;
+}
+```
+
+No agregues:
+
+```typescript
+refreshToken: string;
+```
+
+Ni:
+
+```typescript
+setRefreshToken(...)
+```
+
+Ni:
+
+```typescript
+const refreshToken = localStorage.getItem("refreshToken");
+```
+
+La separación correcta es:
+
+```text
+React
+─────
+user
+accessToken
+isAuthenticated
+
+
+Browser
+───────
+refreshToken HttpOnly
+```
+
+---
+
+# Paso 7: mantener el access token en memoria
+
+Un provider sencillo puede utilizar:
+
+```typescript
+const [accessToken, setAccessToken] = useState<string | null>(null);
+
+const [user, setUser] = useState<AuthUser | null>(null);
+```
+
+Después:
+
+```typescript
+const login = (token: string) => {
+  const authenticatedUser = getUserFromAccessToken(token);
+
+  setAccessToken(token);
+  setUser(authenticatedUser);
+};
+```
+
+Y:
+
+```typescript
+const logout = () => {
+  setAccessToken(null);
+  setUser(null);
+};
+```
+
+El access token vive únicamente durante la ejecución de la aplicación.
+
+---
+
+# Paso 8: estabilizar callbacks del AuthProvider
+
+Si `login` y `logout` van a utilizarse como dependencias de un interceptor
+registrado mediante `useEffect`, es útil estabilizar sus referencias.
+
+En lugar de:
+
+```typescript
+const login = (token: string) => {
+  // ...
+};
+```
+
+utiliza:
+
+```typescript
+const login = useCallback((token: string) => {
+  const authenticatedUser = getUserFromAccessToken(token);
+
+  setAccessToken(token);
+  setUser(authenticatedUser);
+}, []);
+```
+
+Y:
+
+```typescript
+const logout = useCallback(() => {
+  setAccessToken(null);
+  setUser(null);
+}, []);
+```
+
+## ¿Por qué?
+
+En JavaScript:
+
+```typescript
+const functionA = () => {};
+const functionB = () => {};
+```
+
+son referencias diferentes aunque hagan lo mismo.
+
+Sin `useCallback`, cada render del provider puede crear:
+
+```text
+login #1
+login #2
+login #3
+```
+
+Si el interceptor depende de:
+
+```typescript
+useEffect(() => {
+  ...
+}, [login, logout]);
+```
+
+cada nueva referencia provocaría:
+
+```text
+cleanup
+↓
+eject interceptor
+↓
+register interceptor again
+```
+
+No necesariamente rompe la aplicación, pero es trabajo innecesario y hace más
+difícil razonar sobre concurrencia.
+
+Con `useCallback`:
+
+```text
+login
+logout
+```
+
+mantienen referencias estables.
+
+---
+
+# Paso 9: entender por qué necesitamos un `ref` para el access token
+
+Un interceptor de Axios vive fuera del ciclo normal de renderizado de un
+componente.
+
+Podrías pensar en hacer:
+
+```typescript
+useEffect(() => {
+  apiClient.interceptors.request.use((config) => {
+    if (accessToken) {
+      config.headers.set("Authorization", `Bearer ${accessToken}`);
+    }
+
+    return config;
+  });
+}, []);
+```
+
+Pero existe un problema.
+
+El callback captura el valor de:
+
+```text
+accessToken
+```
+
+existente cuando se creó el efecto.
+
+Esto se denomina:
+
+```text
+stale closure
+```
+
+Podría ocurrir:
+
+```text
+render inicial
+accessToken = null
+       ↓
+crear interceptor
+       ↓
+login
+       ↓
+accessToken = JWT1
+       ↓
+interceptor todavía recuerda null
+```
+
+---
+
+# Paso 10: usar `useRef` como puente entre React y Axios
+
+Crea:
+
+```typescript
+const accessTokenRef = useRef<string | null>(accessToken);
+```
+
+Después mantenlo sincronizado:
+
+```typescript
+useLayoutEffect(() => {
+  accessTokenRef.current = accessToken;
+}, [accessToken]);
+```
+
+Ahora el interceptor consulta:
+
+```typescript
+accessTokenRef.current;
+```
+
+en el momento exacto de ejecutar la request.
+
+---
+
+# ¿Por qué `useRef`?
+
+Porque cambiar:
+
+```typescript
+ref.current;
+```
+
+no requiere volver a registrar el interceptor.
+
+Conceptualmente:
+
+```text
+React state
+   │
+   │ sincroniza
+   ▼
+accessTokenRef
+   │
+   ▼
+Axios interceptor
+```
+
+Es un puente entre:
+
+```text
+mundo React
+```
+
+y:
+
+```text
+mundo Axios
+```
+
+---
+
+# Paso 11: implementar el request interceptor
+
+El primer interceptor solamente agrega el JWT.
+
+```typescript
+const requestInterceptorId = apiClient.interceptors.request.use((config) => {
+  const currentAccessToken = accessTokenRef.current;
+
+  if (currentAccessToken) {
+    config.headers.set("Authorization", `Bearer ${currentAccessToken}`);
+  } else {
+    config.headers.delete("Authorization");
+  }
+
+  return config;
+});
+```
+
+Resultado:
+
+```text
+accessToken existe
+      ↓
+Authorization: Bearer JWT
+```
+
+Si no existe:
+
+```text
+Authorization eliminado
+```
+
+---
+
+# Paso 12: entender qué debe hacer el response interceptor
+
+El response interceptor reaccionará solamente ante determinados `401`.
+
+Flujo:
+
+```text
+response
+   │
+   ├── 200 → devolver normalmente
+   ├── 400 → devolver error
+   ├── 403 → devolver error
+   ├── 404 → devolver error
+   ├── 500 → devolver error
+   │
+   └── 401
+        ↓
+      evaluar
+        ↓
+      refresh
+```
+
+No todos los errores deben iniciar una renovación de sesión.
+
+---
+
+# Paso 13: detectar correctamente errores Axios
+
+El error recibido debería tratarse inicialmente como:
+
+```typescript
+unknown;
+```
+
+Ejemplo:
+
+```typescript
+async (error: unknown) => {
+  if (!axios.isAxiosError(error) || error.response?.status !== 401) {
+    return Promise.reject(error);
+  }
+
+  // refresh logic
+};
+```
+
+Esto evita asumir que cualquier excepción tiene:
+
+```typescript
+error.response.status;
+```
+
+---
+
+# Paso 14: excluir endpoints de autenticación
+
+No todo `401` significa:
+
+```text
+access token expirado
+```
+
+Por ejemplo:
+
+```text
+POST /auth/login
+↓
+401
+```
+
+puede simplemente significar:
+
+```text
+email/password incorrectos
+```
+
+No queremos:
+
+```text
+login
+↓
+401
+↓
+refresh
+```
+
+Por eso define una lista:
+
+```typescript
+const REFRESH_EXCLUDED_ENDPOINTS = [
+  "/auth/login",
+  "/auth/register",
+  "/auth/refresh",
+  "/auth/logout",
+];
+```
+
+Helper:
+
+```typescript
+function isRefreshExcluded(url?: string) {
+  const path = url?.split("?")[0];
+
+  return REFRESH_EXCLUDED_ENDPOINTS.some((endpoint) =>
+    path?.endsWith(endpoint),
+  );
+}
+```
+
+---
+
+# ¿Por qué excluir `/auth/refresh`?
+
+Porque si el refresh token ya no es válido:
+
+```text
+POST /auth/refresh
+↓
+401
+```
+
+Si el interceptor intenta refrescar esa misma petición:
+
+```text
+refresh
+↓
+401
+↓
+refresh
+↓
+401
+↓
+refresh
+↓
+...
+```
+
+generarías un loop infinito.
+
+---
+
+# ¿Por qué excluir `/auth/logout`?
+
+Logout puede responder de formas relacionadas con sesión inválida y además
+forma parte del sistema de autenticación.
+
+No queremos que cerrar sesión pueda disparar una renovación automática.
+
+---
+
+# Paso 15: agregar una marca `_retry`
+
+Axios no sabe si una request ya pasó por el flujo de renovación.
+
+Podemos extender su configuración:
+
+```typescript
+import type { InternalAxiosRequestConfig } from "axios";
+
+interface RetryableRequestConfig extends InternalAxiosRequestConfig {
+  _retry?: boolean;
+}
+```
+
+Cuando recibamos `401`:
+
+```typescript
+if (originalRequest._retry) {
+  return Promise.reject(error);
+}
+
+originalRequest._retry = true;
+```
+
+---
+
+# ¿Qué problema resuelve `_retry`?
+
+Sin la marca:
+
+```text
+GET /accounts
+↓
+401
+↓
+refresh
+↓
+retry /accounts
+↓
+401
+↓
+refresh
+↓
+retry
+↓
+401
+...
+```
+
+Con `_retry`:
+
+```text
+GET /accounts
+↓
+401
+↓
+_retry = true
+↓
+refresh
+↓
+retry
+↓
+401
+↓
+rechazar
+```
+
+Una request original puede renovarse:
+
+```text
+máximo una vez
+```
+
+---
+
+# Paso 16: entender el problema más importante: concurrencia
+
+Supongamos que una pantalla carga al mismo tiempo:
+
+```text
+GET /accounts
+GET /categories
+GET /transactions
+GET /budgets
+```
+
+El access token acaba de expirar.
+
+Entonces recibes:
+
+```text
+/accounts      → 401
+/categories    → 401
+/transactions  → 401
+/budgets       → 401
+```
+
+La implementación ingenua sería:
+
+```text
+401 → POST /refresh
+401 → POST /refresh
+401 → POST /refresh
+401 → POST /refresh
+```
+
+Esto es especialmente peligroso si el backend utiliza **refresh token
+rotation**.
+
+---
+
+# Paso 17: entender por qué la rotación convierte la concurrencia en un problema
+
+Supongamos que la cookie contiene:
+
+```text
+RT1
+```
+
+La primera petición ejecuta:
+
+```text
+POST /refresh
+RT1
+↓
+revocar RT1
+↓
+crear RT2
+```
+
+Ahora RT1 ya no es válido.
+
+Si otras peticiones concurrentes también intentan usar RT1, podrían obtener:
+
+```text
+401 Invalid Refresh Token
+```
+
+Entonces un access token expirado normal podría terminar destruyendo una
+sesión válida simplemente porque varias requests fallaron al mismo tiempo.
+
+---
+
+# Paso 18: no resolver esto solamente con `isRefreshing`
+
+Podrías pensar:
+
+```typescript
+let isRefreshing = false;
+```
+
+Pero un booleano solamente informa:
+
+```text
+hay un refresh ejecutándose
+```
+
+No proporciona a las demás requests:
+
+```text
+el resultado de ese refresh
+```
+
+Necesitamos que todas puedan hacer:
+
+```text
+await mismo refresh
+```
+
+Por eso es mejor utilizar:
+
+```typescript
+Promise<string> | null;
+```
+
+---
+
+# Paso 19: crear una `refreshPromise` compartida
+
+Dentro del efecto que registra los interceptores:
+
+```typescript
+let refreshPromise: Promise<string> | null = null;
+```
+
+La regla será:
+
+```text
+refreshPromise == null
+        ↓
+crear refresh
+
+
+refreshPromise != null
+        ↓
+esperar refresh existente
+```
+
+---
+
+# Paso 20: implementar `getFreshAccessToken`
+
+Ejemplo:
+
+```typescript
+const getFreshAccessToken = () => {
+  if (!refreshPromise) {
+    refreshPromise = refreshRequest()
+      .then(({ accessToken }) => {
+        accessTokenRef.current = accessToken;
+
+        login(accessToken);
+
+        return accessToken;
+      })
+      .catch((error: unknown) => {
+        accessTokenRef.current = null;
+
+        logout();
+
+        window.location.replace("/login");
+
+        throw error;
+      })
+      .finally(() => {
+        refreshPromise = null;
+      });
+  }
+
+  return refreshPromise;
+};
+```
+
+Esta pequeña función contiene una de las partes más importantes de toda la
+implementación.
+
+---
+
+# Paso 21: entender cómo funciona la Promise compartida
+
+Primera request:
+
+```text
+401
+↓
+refreshPromise == null
+↓
+crear Promise
+↓
+POST /refresh
+```
+
+Segunda request:
+
+```text
+401
+↓
+refreshPromise != null
+↓
+return refreshPromise
+```
+
+Tercera:
+
+```text
+401
+↓
+return misma Promise
+```
+
+Entonces:
+
+```text
+Request A ─┐
+Request B ─┼──► refreshPromise ─► POST /refresh
+Request C ─┘
+```
+
+Solo existe:
+
+```text
+1 request de refresh
+```
+
+---
+
+# Paso 22: actualizar `accessTokenRef.current` inmediatamente
+
+Este detalle es fácil de olvidar y puede producir un bug difícil de detectar.
+
+Cuando `/refresh` devuelve:
+
+```text
+JWT2
+```
+
+podrías pensar que basta:
+
+```typescript
+login(accessToken);
+```
+
+Pero `login()` actualiza React state.
+
+Eso implica:
+
+```text
+setState
+↓
+React agenda render
+↓
+render
+↓
+useLayoutEffect
+↓
+actualizar ref
+```
+
+No necesariamente ocurre antes de reintentar la request.
+
+---
+
+# Posible race condition
+
+Supongamos:
+
+```text
+refresh devuelve JWT2
+↓
+login(JWT2)
+↓
+retry request inmediatamente
+↓
+request interceptor
+↓
+accessTokenRef todavía = JWT1
+```
+
+Entonces el request interceptor puede sobrescribir:
+
+```http
+Authorization: Bearer JWT2
+```
+
+con:
+
+```http
+Authorization: Bearer JWT1
+```
+
+el token expirado.
+
+Por eso antes de hacer el retry debes ejecutar:
+
+```typescript
+accessTokenRef.current = accessToken;
+```
+
+y después:
+
+```typescript
+login(accessToken);
+```
+
+---
+
+# Regla importante
+
+Cuando un valor externo debe utilizarse **inmediatamente** antes del siguiente
+render:
+
+```text
+actualizar ref
+    ↓
+actualizar React state
+```
+
+Para este caso:
+
+```typescript
+accessTokenRef.current = accessToken;
+login(accessToken);
+```
+
+---
+
+# Paso 23: implementar el response interceptor
+
+Estructura base:
+
+```typescript
+const responseInterceptorId = apiClient.interceptors.response.use(
+  (response) => response,
+
+  async (error: unknown) => {
+    if (!axios.isAxiosError(error) || error.response?.status !== 401) {
+      return Promise.reject(error);
+    }
+
+    const originalRequest = error.config as RetryableRequestConfig | undefined;
+
+    if (!originalRequest) {
+      return Promise.reject(error);
+    }
+
+    if (isRefreshExcluded(originalRequest.url)) {
+      return Promise.reject(error);
+    }
+
+    if (originalRequest._retry) {
+      return Promise.reject(error);
+    }
+
+    originalRequest._retry = true;
+
+    try {
+      const newAccessToken = await getFreshAccessToken();
+
+      originalRequest.headers.set("Authorization", `Bearer ${newAccessToken}`);
+
+      return apiClient(originalRequest);
+    } catch (refreshError: unknown) {
+      return Promise.reject(refreshError);
+    }
+  },
+);
+```
+
+Ahora analicemos cada parte.
+
+---
+
+# Paso 24: filtrar solamente `401`
+
+```typescript
+if (!axios.isAxiosError(error) || error.response?.status !== 401) {
+  return Promise.reject(error);
+}
+```
+
+No deberías utilizar refresh para:
+
+```text
+400 Bad Request
+403 Forbidden
+404 Not Found
+409 Conflict
+500 Internal Server Error
+```
+
+Un refresh solamente intenta resolver:
+
+```text
+sesión de acceso expirada
+```
+
+---
+
+# Importante: `401` y `403` no significan lo mismo
+
+De forma simplificada:
+
+```text
+401
+────────────
+no hay autenticación válida
+token ausente
+token expirado
+token inválido
+
+
+403
+────────────
+sí hay identidad válida
+pero no tiene permisos
+```
+
+No refresques automáticamente un `403`.
+
+Un token nuevo normalmente no cambiará los permisos del usuario.
+
+---
+
+# Paso 25: obtener la request original
+
+Axios incluye la configuración que produjo el error:
+
+```typescript
+error.config;
+```
+
+La convertimos:
+
+```typescript
+const originalRequest = error.config as RetryableRequestConfig | undefined;
+```
+
+Después:
+
+```typescript
+if (!originalRequest) {
+  return Promise.reject(error);
+}
+```
+
+No asumas que siempre existe.
+
+---
+
+# Paso 26: excluir las rutas de auth
+
+```typescript
+if (isRefreshExcluded(originalRequest.url)) {
+  return Promise.reject(error);
+}
+```
+
+Esto protege:
+
+```text
+login incorrecto
+refresh inválido
+logout
+register
+```
+
+de entrar al flujo automático.
+
+---
+
+# Paso 27: marcar la request antes de hacer refresh
+
+Haz:
+
+```typescript
+originalRequest._retry = true;
+```
+
+antes:
+
+```typescript
+await getFreshAccessToken();
+```
+
+Esto deja explícito que esa request ya consumió su intento de recuperación.
+
+---
+
+# Paso 28: esperar el access token nuevo
+
+```typescript
+const newAccessToken = await getFreshAccessToken();
+```
+
+Puede ocurrir uno de dos escenarios:
+
+```text
+no había refresh
+↓
+esta request inicia el refresh
+```
+
+o:
+
+```text
+otra request ya refresca
+↓
+esta espera la misma Promise
+```
+
+Desde aquí no importa cuál inició el proceso.
+
+---
+
+# Paso 29: actualizar Authorization de la request original
+
+Después:
+
+```typescript
+originalRequest.headers.set("Authorization", `Bearer ${newAccessToken}`);
+```
+
+La request que falló originalmente contenía:
+
+```text
+JWT1
+```
+
+Ahora debe contener:
+
+```text
+JWT2
+```
+
+---
+
+# Paso 30: reintentar mediante el mismo `apiClient`
+
+Haz:
+
+```typescript
+return apiClient(originalRequest);
+```
+
+No:
+
+```typescript
+return axios(originalRequest);
+```
+
+¿Por qué?
+
+Porque queremos mantener:
+
+```text
+baseURL
+headers
+withCredentials
+request interceptor
+response interceptor
+```
+
+de la instancia compartida.
+
+---
+
+# Paso 31: entender por qué volverá a pasar por el request interceptor
+
+Cuando haces:
+
+```typescript
+apiClient(originalRequest);
+```
+
+la request vuelve a atravesar:
+
+```text
+request interceptors
+```
+
+Por eso era tan importante actualizar:
+
+```typescript
+accessTokenRef.current;
+```
+
+antes.
+
+El flujo queda:
+
+```text
+original request
+      ↓
+401
+      ↓
+refresh → JWT2
+      ↓
+accessTokenRef = JWT2
+      ↓
+originalRequest Authorization = JWT2
+      ↓
+apiClient(originalRequest)
+      ↓
+request interceptor
+      ↓
+lee JWT2
+      ↓
+backend
+```
+
+---
+
+# Paso 32: qué hacer cuando el refresh falla
+
+Puede fallar porque:
+
+```text
+cookie no existe;
+refresh token expiró;
+refresh token fue revocado;
+refresh token es desconocido;
+sesión terminó;
+servidor devuelve 401.
+```
+
+En ese momento ya no tenemos una sesión recuperable.
+
+Debemos:
+
+```text
+limpiar sesión local
+↓
+redirigir a login
+```
+
+Ejemplo:
+
+```typescript
+.catch((error: unknown) => {
+  accessTokenRef.current = null;
+
+  logout();
+
+  window.location.replace(
+    "/login",
+  );
+
+  throw error;
+});
+```
+
+---
+
+# ¿Por qué limpiar también el ref?
+
+No basta:
+
+```typescript
+logout();
+```
+
+porque nuevamente React state puede actualizarse en un render posterior.
+
+Queremos que desde ese instante:
+
+```text
+accessTokenRef = null
+```
+
+para evitar que otra request inmediata use un token viejo.
+
+---
+
+# Paso 33: evitar múltiples logout concurrentes
+
+Una ventaja adicional de colocar el fallo dentro de:
+
+```text
+refreshPromise
+```
+
+es que todas las requests están esperando la misma Promise.
+
+Por tanto:
+
+```text
+Request A ─┐
+Request B ─┼── refreshPromise
+Request C ─┘        ↓
+                  falla
+                    ↓
+                  logout
+```
+
+No necesitas ejecutar:
+
+```text
+logout
+logout
+logout
+```
+
+desde cada request esperando.
+
+La Promise centraliza también el failure path.
+
+---
+
+# Paso 34: elegir cómo redirigir al login
+
+Si el interceptor se encuentra dentro del contexto de React Router puedes
+utilizar una estrategia basada en navegación del router.
+
+Pero a veces la jerarquía es:
+
+```tsx
+<AuthProvider>
+  <AuthInterceptor />
+  <RouterProvider router={router} />
+</AuthProvider>
+```
+
+En ese caso:
+
+```text
+AuthInterceptor
+```
+
+está fuera del contexto del router.
+
+Por tanto no puede simplemente llamar:
+
+```typescript
+useNavigate();
+```
+
+Una solución sencilla para una sesión definitivamente inválida es:
+
+```typescript
+window.location.replace("/login");
+```
+
+---
+
+# ¿Por qué `replace` y no `href`?
+
+`replace` sustituye la entrada actual del historial.
+
+Después de perder la sesión no queremos necesariamente:
+
+```text
+Back
+↓
+volver a página autenticada inválida
+```
+
+Además una navegación completa elimina:
+
+```text
+estado React en memoria
+```
+
+lo cual es razonable cuando la sesión ya no puede recuperarse.
+
+---
+
+# Importante: esto depende de la arquitectura
+
+No copies:
+
+```typescript
+window.location.replace(...)
+```
+
+como una regla universal.
+
+Si el interceptor está dentro de React Router y tienes una estrategia de
+navegación centralizada, podrías hacerlo de otra manera.
+
+Lo importante es separar:
+
+```text
+detectar sesión irrecuperable
+```
+
+de:
+
+```text
+cómo navega tu aplicación
+```
+
+---
+
+# Paso 35: hacer cleanup de los interceptores
+
+`interceptors.use()` devuelve un identificador.
+
+Debes conservarlo:
+
+```typescript
+const requestInterceptorId =
+  apiClient.interceptors.request.use(...);
+
+const responseInterceptorId =
+  apiClient.interceptors.response.use(...);
+```
+
+Y en cleanup:
+
+```typescript
+return () => {
+  apiClient.interceptors.request.eject(requestInterceptorId);
+
+  apiClient.interceptors.response.eject(responseInterceptorId);
+};
+```
+
+---
+
+# ¿Qué ocurre si no haces `eject()`?
+
+Cada montaje podría agregar otro interceptor:
+
+```text
+interceptor #1
+interceptor #2
+interceptor #3
+```
+
+Entonces una request podría pasar varias veces por la misma lógica.
+
+Esto puede ser especialmente confuso durante desarrollo con:
+
+```text
+React StrictMode
+```
+
+donde los efectos pueden montarse y limpiarse más de una vez para detectar
+problemas.
+
+---
+
+# Paso 36: estructura completa recomendada
+
+Conceptualmente:
+
+```typescript
+export function AuthInterceptor() {
+  const { accessToken, login, logout } = useAuth();
+
+  const accessTokenRef = useRef<string | null>(accessToken);
+
+  useLayoutEffect(() => {
+    accessTokenRef.current = accessToken;
+  }, [accessToken]);
+
+  useEffect(() => {
+    let refreshPromise: Promise<string> | null = null;
+
+    const getFreshAccessToken = () => {
+      // shared refresh
+    };
+
+    const requestInterceptorId =
+      apiClient.interceptors.request.use(
+        // Authorization
+      );
+
+    const responseInterceptorId =
+      apiClient.interceptors.response.use(
+        // response
+        // 401 handling
+      );
+
+    return () => {
+      apiClient.interceptors.request.eject(requestInterceptorId);
+
+      apiClient.interceptors.response.eject(responseInterceptorId);
+    };
+  }, [login, logout]);
+
+  return null;
+}
+```
+
+---
+
+# Responsabilidad final de cada pieza
+
+## `apiClient`
+
+```text
+configuración HTTP común
+base URL
+headers
+withCredentials
+```
+
+---
+
+## `authService`
+
+```text
+login()
+register()
+refresh()
+logout() futuro
+```
+
+No administra React.
+
+---
+
+## `AuthProvider`
+
+```text
+user
+accessToken
+isAuthenticated
+login
+logout
+```
+
+No administra Axios.
+
+---
+
+## `AuthInterceptor`
+
+```text
+Authorization
+401
+refresh
+concurrencia
+retry
+```
+
+Es el puente entre:
+
+```text
+Axios
++
+AuthContext
+```
+
+---
+
+# Paso 37: no mezclar el interceptor dentro del provider
+
+Podrías técnicamente hacer:
+
+```typescript
+function AuthProvider() {
+  useEffect(() => {
+    apiClient.interceptors...
+  });
+
+  // estado...
+}
+```
+
+Pero empiezas a mezclar:
+
+```text
+state management
+HTTP transport
+retry
+concurrency
+```
+
+en un único componente.
+
+Una separación más clara es:
+
+```tsx
+<AuthProvider>
+  <AuthInterceptor />
+  {children}
+</AuthProvider>
+```
+
+Así:
+
+```text
+AuthProvider
+────────────
+estado
+
+
+AuthInterceptor
+───────────────
+integración Axios
+```
+
+El interceptor puede consumir:
+
+```typescript
+useAuth();
+```
+
+porque está dentro del provider.
+
+---
+
+# Paso 38: no colocar la Promise globalmente sin necesidad
+
+Una opción tentadora sería:
+
+```typescript
+let refreshPromise: Promise<string> | null = null;
+```
+
+fuera de React y fuera del componente.
+
+No siempre es necesario.
+
+Si tienes una única instancia de `AuthInterceptor`, puedes mantenerla dentro
+del efecto:
+
+```typescript
+useEffect(() => {
+  let refreshPromise = null;
+
+  ...
+}, []);
+```
+
+Eso mantiene el estado de coordinación unido al ciclo de vida del interceptor.
+
+Si en otra arquitectura tienes múltiples instancias o varios consumidores
+independientes del interceptor, debes reconsiderar el scope.
+
+---
+
+# Paso 39: entender qué significa "single-flight refresh"
+
+El patrón que implementamos se conoce conceptualmente como:
+
+```text
+single flight
+```
+
+Varias operaciones solicitan el mismo trabajo:
+
+```text
+refresh session
+```
+
+pero solamente la primera lo inicia.
+
+Las demás reutilizan su resultado.
+
+```text
+A ─┐
+B ─┼──► operation
+C ─┘
+```
+
+Es distinto de una cola explícita, pero para este caso produce un efecto
+similar.
+
+---
+
+# Paso 40: Promise compartida vs cola
+
+Una implementación con cola podría mantener:
+
+```text
+waitingRequests[]
+```
+
+y después resolver manualmente cada entrada.
+
+Eso funciona, pero añade más estado:
+
+```text
+queue
+resolve
+reject
+flush
+```
+
+Para un caso simple donde todas las requests necesitan exactamente:
+
+```text
+el mismo nuevo access token
+```
+
+una Promise compartida es más sencilla:
+
+```typescript
+await refreshPromise;
+```
+
+Menos código implica menos estados intermedios que razonar.
+
+---
+
+# Paso 41: por qué la concurrencia del frontend también protege al backend
+
+El backend podría tener mecanismos contra reutilización concurrente de refresh
+tokens.
+
+Pero el frontend no debería provocar ese escenario innecesariamente.
+
+Si sabes que:
+
+```text
+RT1 es single-use
+```
+
+no deberías enviar:
+
+```text
+RT1
+RT1
+RT1
+RT1
+```
+
+simultáneamente.
+
+La Promise compartida convierte:
+
+```text
+N requests expiradas
+```
+
+en:
+
+```text
+1 refresh
+```
+
+Esto coopera correctamente con la rotación backend.
+
+---
+
+# Paso 42: qué ocurre después de un refresh correcto
+
+Supongamos:
+
+```text
+4 requests → 401
+```
+
+Todas esperan:
+
+```text
+refreshPromise
+```
+
+El backend devuelve:
+
+```text
+JWT2
+```
+
+Entonces cada request recibe:
+
+```typescript
+newAccessToken === JWT2;
+```
+
+y ejecuta:
+
+```text
+retry original request
+```
+
+Resultado:
+
+```text
+refresh          → 1 request
+business retries → 4 requests
+```
+
+Esto es correcto.
+
+No queremos convertir las cuatro peticiones de negocio en una sola.
+
+Solo centralizamos:
+
+```text
+la renovación de sesión
+```
+
+---
+
+# Paso 43: no refrescar preventivamente si no es necesario
+
+Otra estrategia consiste en leer:
+
+```text
+exp
+```
+
+del JWT y hacer refresh antes de que expire.
+
+Eso puede ser válido, pero añade:
+
+```text
+timers
+clock synchronization
+app sleep/wake
+background tabs
+race conditions
+```
+
+Para una primera implementación robusta, reaccionar al:
+
+```text
+401
+```
+
+es mucho más sencillo.
+
+El backend continúa siendo la fuente de verdad sobre si el access token es
+válido.
+
+---
+
+# Paso 44: tener cuidado con un `401` que no representa expiración
+
+Dependiendo de tu API, algunos endpoints podrían responder `401` por razones
+diferentes.
+
+El interceptor asume:
+
+```text
+401 de endpoint autenticado
+→ intentar renovar sesión una vez
+```
+
+Por eso es importante:
+
+```text
+excluir endpoints de autenticación
+```
+
+y establecer contratos HTTP consistentes en backend.
+
+Si necesitas distinguir causas más finamente en el futuro, puedes utilizar un
+código de error estructurado.
+
+Para una implementación inicial no es obligatorio.
+
+---
+
+# Paso 45: probar primero el refresh manual
+
+Antes de probar todo el interceptor:
+
+1. Inicia sesión.
+2. Verifica la cookie.
+3. Ejecuta manualmente:
+
+```http
+POST /api/auth/refresh
+```
+
+1. Comprueba:
+
+```text
+200 OK
+nuevo accessToken
+nueva cookie
+```
+
+Si esto falla, el problema no está todavía en la lógica automática.
+
+---
+
+# Regla de debugging
+
+Valida el sistema por capas:
+
+```text
+1. login
+2. cookie
+3. /refresh manual
+4. interceptor
+5. concurrency
+```
+
+No intentes depurar las cinco cosas simultáneamente.
+
+---
+
+# Paso 46: comprobar la cookie en DevTools
+
+Después del login:
+
+```text
+DevTools
+→ Application
+→ Cookies
+```
+
+Busca:
+
+```text
+myapp.refreshToken
+```
+
+Verifica:
+
+```text
+HttpOnly ✓
+Secure según entorno
+Path correcto
+SameSite correcto
+Expires correcto
+```
+
+No esperes poder leerla con:
+
+```javascript
+document.cookie;
+```
+
+Si `HttpOnly` está funcionando correctamente, JavaScript no tendrá acceso al
+valor.
+
+---
+
+# Paso 47: reducir temporalmente la vida del access token
+
+Esperar 15 minutos para probar cada refresh es incómodo.
+
+En desarrollo puedes configurar temporalmente:
+
+```text
+ExpiryMinutes = 1
+```
+
+Entonces:
+
+```text
+login
+↓
+esperar 1 minuto
+↓
+hacer request protegida
+```
+
+Después de probar restaura el valor original.
+
+No modifiques valores de producción solamente para facilitar pruebas locales.
+
+---
+
+# Paso 48: utilizar temporalmente un endpoint protegido
+
+Si el proyecto todavía no tiene endpoints protegidos, puedes crear durante
+desarrollo:
+
+```csharp
+api.MapGet(
+    "/debug/auth",
+    () => TypedResults.Ok()
+)
+.RequireAuthorization();
+```
+
+Esto permite probar:
+
+```text
+JWT válido   → 200
+JWT expirado → 401
+```
+
+El endpoint debe eliminarse antes del commit si solo existe para debugging.
+
+---
+
+# Paso 49: probar el happy path del interceptor
+
+Secuencia:
+
+```text
+1. login
+2. obtener JWT1
+3. esperar expiración
+4. llamar endpoint protegido
+```
+
+Network debería mostrar:
+
+```text
+GET /debug/auth
+→ 401
+
+POST /auth/refresh
+→ 200
+
+GET /debug/auth
+→ 200
+```
+
+El componente original debería recibir únicamente el resultado final correcto.
+
+---
+
+# Paso 50: probar concurrencia
+
+Este test es fundamental.
+
+Después de que expire el JWT:
+
+```typescript
+await Promise.all([
+  apiClient.get("/debug/auth"),
+  apiClient.get("/debug/auth"),
+  apiClient.get("/debug/auth"),
+]);
+```
+
+Observa Network.
+
+Esperado:
+
+```text
+GET /debug/auth → 401
+GET /debug/auth → 401
+GET /debug/auth → 401
+
+POST /auth/refresh → 200
+                    ↑
+                  SOLO UNO
+
+GET /debug/auth → 200
+GET /debug/auth → 200
+GET /debug/auth → 200
+```
+
+Si ves:
+
+```text
+POST /auth/refresh
+POST /auth/refresh
+POST /auth/refresh
+```
+
+la protección de concurrencia está incorrecta.
+
+---
+
+# Paso 51: inspeccionar la rotación backend durante la prueba
+
+Si tu backend guarda historial:
+
+Antes:
+
+```text
+RT1
+active
+```
+
+Después del refresh concurrente debería existir:
+
+```text
+RT1
+revoked
+replacedBy → RT2
+
+RT2
+active
+```
+
+No:
+
+```text
+RT1 → RT2
+RT1 → RT3
+RT1 → RT4
+```
+
+Esto confirma que el frontend solamente inició un refresh.
+
+---
+
+# Paso 52: probar refresh inválido
+
+Haz login.
+
+Después elimina manualmente la cookie:
+
+```text
+refresh token
+```
+
+Espera a que expire el access token.
+
+Haz una request protegida.
+
+Esperado:
+
+```text
+business request
+↓
+401
+↓
+POST /auth/refresh
+↓
+401
+↓
+AuthContext logout
+↓
+accessTokenRef = null
+↓
+redirect /login
+```
+
+---
+
+# Paso 53: comprobar que no existe loop
+
+En Network deberías ver:
+
+```text
+GET /protected
+↓
+401
+
+POST /auth/refresh
+↓
+401
+```
+
+y terminar.
+
+Nunca:
+
+```text
+POST /auth/refresh → 401
+POST /auth/refresh → 401
+POST /auth/refresh → 401
+POST /auth/refresh → 401
+...
+```
+
+La exclusión de:
+
+```text
+/auth/refresh
+```
+
+es la defensa principal contra ese loop.
+
+---
+
+# Paso 54: comprobar `_retry`
+
+También debes asegurar que una request que sigue respondiendo `401` después de
+renovar el access token no genera refresh infinito.
+
+Esperado:
+
+```text
+GET /protected
+↓
+401
+
+refresh
+↓
+200
+
+GET /protected retry
+↓
+401
+
+STOP
+```
+
+Porque:
+
+```typescript
+originalRequest._retry === true;
+```
+
+---
+
+# Paso 55: probar login incorrecto
+
+Ingresa credenciales inválidas.
+
+Esperado:
+
+```text
+POST /auth/login
+↓
+401
+↓
+mostrar "credenciales incorrectas"
+```
+
+No:
+
+```text
+POST /auth/login
+↓
+401
+↓
+POST /auth/refresh
+```
+
+Esto verifica que:
+
+```text
+/auth/login
+```
+
+está excluido correctamente.
+
+---
+
+# Paso 56: verificar cleanup en desarrollo
+
+Si utilizas React StrictMode, revisa Network y logs para asegurarte de que una
+respuesta `401` no provoca múltiples ejecuciones inesperadas.
+
+Confirma que existen:
+
+```typescript
+apiClient.interceptors.request.eject(requestInterceptorId);
+
+apiClient.interceptors.response.eject(responseInterceptorId);
+```
+
+---
+
+# Paso 57: ejecutar compilación y lint
+
+No consideres terminado el trabajo porque el navegador parece funcionar.
+
+Ejecuta:
+
+```bash
+pnpm build
+```
+
+Si tienes lint:
+
+```bash
+pnpm lint
+```
+
+En un proyecto TypeScript esto detecta errores que el happy path manual puede
+no mostrar.
+
+---
+
+# Paso 58: errores comunes
+
+| Error                                                  | Problema                                           | Solución                                       |
+| ------------------------------------------------------ | -------------------------------------------------- | ---------------------------------------------- |
+| Guardar refresh token en React                         | Expone un secreto innecesariamente                 | Mantenerlo en cookie HttpOnly                  |
+| Guardarlo en `localStorage`                            | JavaScript y XSS pueden acceder directamente       | Cookie HttpOnly                                |
+| No usar `withCredentials`                              | La cookie puede no viajar cuando corresponde       | Configurar cliente                             |
+| Crear varios clientes Axios                            | Los interceptores quedan fragmentados              | Compartir una instancia                        |
+| Capturar `accessToken` directamente en `useEffect([])` | Stale closure                                      | Usar `useRef`                                  |
+| Actualizar solamente React state después del refresh   | El retry inmediato puede leer JWT viejo            | Actualizar primero `accessTokenRef.current`    |
+| Refrescar todos los `401`                              | Login incorrecto puede disparar refresh            | Excluir auth endpoints                         |
+| No excluir `/auth/refresh`                             | Loop infinito                                      | Lista de exclusiones                           |
+| No utilizar `_retry`                                   | Request puede renovarse infinitamente              | Marcar request original                        |
+| Usar solamente `isRefreshing`                          | Las demás requests no tienen resultado que esperar | Promise compartida                             |
+| Lanzar múltiples refresh simultáneos                   | Rompe fácilmente token rotation                    | Single-flight refresh                          |
+| No hacer `eject()`                                     | Acumulación de interceptores                       | Cleanup                                        |
+| Crear callbacks nuevos en cada render                  | Re-registro innecesario                            | `useCallback`                                  |
+| Usar `axios(originalRequest)`                          | Pierdes configuración compartida                   | `apiClient(originalRequest)`                   |
+| Refrescar un `403`                                     | Un token nuevo no arregla permisos                 | Refrescar solo 401                             |
+| Leer cookie HttpOnly desde JS                          | Contradice el modelo de seguridad                  | Dejar que el navegador la envíe                |
+| Probar todo al mismo tiempo                            | Debugging difícil                                  | Validar login → cookie → refresh → interceptor |
+| Confiar solamente en proxy local                       | Puede ocultar problemas CORS                       | Probar arquitectura desplegada                 |
+
+---
+
+# Paso 59: arquitectura de archivos sugerida
+
+```text
+src/
+├── modules/
+│   └── auth/
+│       ├── components/
+│       │   └── AuthInterceptor.tsx
+│       │
+│       ├── context/
+│       │   └── AuthContext.ts
+│       │
+│       ├── hooks/
+│       │   └── useAuth.ts
+│       │
+│       ├── providers/
+│       │   └── AuthProvider.tsx
+│       │
+│       ├── services/
+│       │   └── authService.ts
+│       │
+│       └── types/
+│           └── auth.ts
+│
+└── shared/
+    └── services/
+        └── api/
+            └── apiClient.ts
+```
+
+---
+
+# Responsabilidad por archivo
+
+## `apiClient.ts`
+
+```text
+Axios instance
+baseURL
+headers
+withCredentials
+```
+
+---
+
+## `authService.ts`
+
+```text
+login
+register
+refresh
+logout futuro
+```
+
+---
+
+## `AuthProvider.tsx`
+
+```text
+React state
+user
+accessToken
+login
+logout
+```
+
+---
+
+## `AuthInterceptor.tsx`
+
+```text
+request interceptor
+response interceptor
+accessTokenRef
+refreshPromise
+retry
+```
+
+---
+
+## `auth.ts`
+
+```text
+AuthResponse
+AuthUser
+LoginRequest
+RegisterRequest
+```
+
+---
+
+# Paso 60: modelo completo del interceptor
+
+El modelo mental más importante es:
+
+```text
+                    ┌──────────────────────┐
+                    │     AuthContext      │
+                    │                      │
+                    │ accessToken          │
+                    │ user                 │
+                    │ login()              │
+                    │ logout()             │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │   AuthInterceptor    │
+                    │                      │
+                    │ accessTokenRef       │
+                    │ refreshPromise       │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │      apiClient       │
+                    │                      │
+                    │ withCredentials      │
+                    │ request interceptor  │
+                    │ response interceptor │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                            Backend
+```
+
+El refresh token nunca aparece en este diagrama dentro de React.
+
+Está aquí:
+
+```text
+Browser Cookie Storage
+        │
+        └── HttpOnly refresh token
+```
+
+---
+
+# Paso 61: flujo normal con access token válido
+
+```text
+Component
+   ↓
+apiClient
+   ↓
+request interceptor
+   ↓
+accessTokenRef = JWT1
+   ↓
+Authorization: Bearer JWT1
+   ↓
+Backend
+   ↓
+200
+   ↓
+Component
+```
+
+No hay refresh.
+
+---
+
+# Paso 62: flujo con access token expirado
+
+```text
+Component
+   ↓
+apiClient
+   ↓
+JWT1
+   ↓
+Backend
+   ↓
+401
+   ↓
+response interceptor
+   ↓
+_retry? no
+excluded? no
+   ↓
+refreshPromise
+   ↓
+POST /refresh
+   ↓
+JWT2
+   ↓
+accessTokenRef = JWT2
+   ↓
+AuthContext = JWT2
+   ↓
+retry
+   ↓
+200
+```
+
+---
+
+# Paso 63: flujo concurrente
+
+```text
+Request A ──401──┐
+Request B ──401──┤
+Request C ──401──┤
+Request D ──401──┘
+                 │
+                 ▼
+          refreshPromise
+                 │
+                 ▼
+        POST /auth/refresh
+                 │
+                 ▼
+                JWT2
+                 │
+       ┌─────────┼─────────┐
+       ▼         ▼         ▼
+   retry A   retry B   retry C ...
+```
+
+---
+
+# Paso 64: flujo de sesión irrecuperable
+
+```text
+GET /accounts
+↓
+401
+↓
+POST /refresh
+↓
+401
+↓
+accessTokenRef = null
+↓
+AuthContext logout
+↓
+redirect /login
+```
+
+La aplicación no debe continuar intentando reparar una sesión que el backend
+ya declaró inválida.
+
+---
+
+# Paso 65: relación con logout
+
+Una vez que existe este interceptor, el siguiente bloque natural es logout.
+
+El backend debería implementar:
+
+```text
+POST /auth/logout
+      │
+      ├── leer refresh cookie
+      ├── hash
+      ├── encontrar token
+      ├── revocar
+      ├── eliminar cookie
+      └── 204
+```
+
+Frontend:
+
+```text
+logout request
+↓
+backend revocation
+↓
+AuthContext logout
+↓
+redirect
+```
+
+Recuerda que:
+
+```text
+/auth/logout
+```
+
+debe estar excluido del refresh automático.
+
+No queremos:
+
+```text
+logout
+↓
+401
+↓
+refresh
+```
+
+---
+
+# Paso 66: relación con Route Guards
+
+El interceptor resuelve:
+
+```text
+sesión expira mientras la app está funcionando
+```
+
+Pero existe otro problema distinto:
+
+```text
+usuario recarga la página
+```
+
+Como el access token vive solo en memoria:
+
+```text
+F5
+↓
+React state desaparece
+↓
+accessToken = null
+```
+
+Aunque todavía exista una cookie de refresh válida.
+
+Por eso, posteriormente puedes implementar un flujo de:
+
+```text
+application startup
+↓
+POST /refresh
+↓
+¿200?
+ ├── sí → restaurar AuthContext
+ └── no → usuario anónimo
+```
+
+Eso pertenece normalmente a:
+
+```text
+session bootstrap
+route guards
+auth initialization
+```
+
+No debe confundirse con el interceptor de `401`.
+
+---
+
+# Diferencia entre interceptor y restauración inicial
+
+```text
+INTERCEPTOR
+───────────
+app ya está corriendo
+había access token
+token expira
+request obtiene 401
+renovar automáticamente
+
+
+SESSION RESTORE
+───────────────
+app acaba de arrancar
+no existe access token en memoria
+puede existir refresh cookie
+intentar restaurar sesión
+```
+
+Son problemas relacionados pero diferentes.
+
+---
+
+# Paso 67: mejoras avanzadas futuras
+
+Una vez esta implementación funcione, puedes considerar:
+
+```text
+session bootstrap;
+route guards;
+logout backend;
+logout frontend;
+refresh token reuse detection;
+token families;
+multiple devices;
+global logout;
+proactive refresh;
+network retry strategies;
+integration tests;
+observability.
+```
+
+No introduzcas todo al mismo tiempo.
+
+Primero haz robusto el caso base.
+
+---
+
+# Checklist final
+
+## Cliente HTTP
+
+- [ ] Existe una única instancia compartida de Axios
+- [ ] Tiene `baseURL` centralizado
+- [ ] Tiene `withCredentials: true`
+- [ ] Login, refresh y demás servicios utilizan esa instancia
+
+## Estado de autenticación
+
+- [ ] El access token vive en memoria
+- [ ] El usuario vive en AuthContext o estado equivalente
+- [ ] El refresh token NO vive en React
+- [ ] El refresh token NO vive en `localStorage`
+- [ ] El refresh token NO vive en `sessionStorage`
+- [ ] `login` actualiza access token y usuario
+- [ ] `logout` limpia ambos
+- [ ] Los callbacks usados por el interceptor son estables cuando corresponde
+
+## Request interceptor
+
+- [ ] Existe `accessTokenRef`
+- [ ] El ref se sincroniza con React state
+- [ ] El interceptor lee `accessTokenRef.current`
+- [ ] Agrega `Authorization: Bearer`
+- [ ] Elimina Authorization si no existe sesión
+
+## Response interceptor
+
+- [ ] Solo maneja errores Axios válidos
+- [ ] Solo intenta refresh para `401`
+- [ ] No refresca `403`
+- [ ] Recupera la request original
+- [ ] Excluye `/auth/login`
+- [ ] Excluye `/auth/register`
+- [ ] Excluye `/auth/refresh`
+- [ ] Excluye `/auth/logout`
+
+## Prevención de loops
+
+- [ ] Existe una propiedad `_retry`
+- [ ] Se marca antes de iniciar refresh
+- [ ] Una request se reintenta como máximo una vez
+- [ ] `/auth/refresh` no entra al mismo flujo automático
+
+## Concurrencia
+
+- [ ] Existe una `refreshPromise`
+- [ ] Solo la primera request inicia `/refresh`
+- [ ] Requests concurrentes esperan la misma Promise
+- [ ] Solo existe un refresh para múltiples `401`
+- [ ] Todos reciben el nuevo access token
+- [ ] Token rotation backend no recibe múltiples usos innecesarios del mismo token
+
+## Actualización del token
+
+- [ ] `accessTokenRef.current` se actualiza inmediatamente
+- [ ] React state se actualiza con el token nuevo
+- [ ] La request original recibe `Authorization` nuevo
+- [ ] El retry utiliza `apiClient`
+- [ ] El request interceptor ve el token nuevo
+
+## Refresh fallido
+
+- [ ] `accessTokenRef.current = null`
+- [ ] Se limpia AuthContext
+- [ ] Se redirige al login
+- [ ] No existen múltiples logout concurrentes
+- [ ] No existe loop de refresh
+
+## Lifecycle
+
+- [ ] Se guarda el ID del request interceptor
+- [ ] Se guarda el ID del response interceptor
+- [ ] Ambos hacen `eject()` en cleanup
+- [ ] React StrictMode no acumula interceptores
+
+## Pruebas
+
+- [ ] Login correcto funciona
+- [ ] Login incorrecto no intenta refresh
+- [ ] Cookie HttpOnly existe
+- [ ] `/refresh` manual funciona
+- [ ] Un access token expirado provoca refresh automático
+- [ ] La request original se reintenta
+- [ ] El retry utiliza el JWT nuevo
+- [ ] Varias requests concurrentes producen un solo refresh
+- [ ] Refresh inválido limpia la sesión
+- [ ] Refresh inválido redirige al login
+- [ ] No existen loops infinitos
+- [ ] Una request solo se reintenta una vez
+- [ ] `pnpm build` funciona
+- [ ] `pnpm lint` funciona
+
+---
+
+# Qué recordar dentro de seis meses
+
+Si olvidaste casi toda la implementación, recuerda estas cinco ideas.
+
+## 1. El refresh token no pertenece a React
+
+```text
+Refresh Token
+↓
+HttpOnly Cookie
+↓
+Browser
+```
+
+No:
+
+```text
+localStorage
+React Context
+sessionStorage
+```
+
+---
+
+## 2. El interceptor reacciona al 401
+
+```text
+request
+↓
+401
+↓
+refresh
+↓
+nuevo JWT
+↓
+retry
+```
+
+---
+
+## 3. Cada request solo tiene un intento
+
+```text
+_retry
+```
+
+evita:
+
+```text
+401 → refresh → retry → 401 → refresh...
+```
+
+---
+
+## 4. Muchas requests comparten un solo refresh
+
+```text
+401 ─┐
+401 ─┼── refreshPromise ─► /refresh
+401 ─┘
+```
+
+Esto es especialmente importante cuando el backend utiliza refresh token
+rotation.
+
+---
+
+## 5. Actualiza el ref antes del retry
+
+```typescript
+accessTokenRef.current = newAccessToken;
+
+login(newAccessToken);
+
+return apiClient(originalRequest);
+```
+
+No confíes solamente en que React state se actualizará antes de que Axios
+vuelva a ejecutar la request.
+
+---
+
+# Modelo mental final
+
+```text
+                           BROWSER
+                       ┌───────────────┐
+                       │ Refresh Token │
+                       │ HttpOnly      │
+                       │ RT1           │
+                       └───────┬───────┘
+                               │
+                               │ automático
+                               ▼
+                       POST /auth/refresh
+                               │
+                               ▼
+                            Backend
+                               │
+                  RT1 revoked ─┤
+                  RT2 created ─┤
+                  JWT2 created ┤
+                               │
+                 ┌─────────────┴─────────────┐
+                 ▼                           ▼
+             Set-Cookie                    JSON
+                RT2                        JWT2
+                                             │
+                                             ▼
+                                      AuthInterceptor
+                                             │
+                                   ┌─────────┴─────────┐
+                                   ▼                   ▼
+                           accessTokenRef        AuthContext
+                                 JWT2                JWT2
+                                   │
+                                   ▼
+                             retry request
+                                   │
+                                   ▼
+                        Authorization: JWT2
+```
+
+---
+
+# Secuencia completa de una sesión
+
+Login:
+
+```text
+credentials
+↓
+JWT1 + RT1
+```
+
+Uso normal:
+
+```text
+JWT1
+↓
+requests
+↓
+200
+```
+
+Expiración:
+
+```text
+JWT1 expired
+↓
+request
+↓
+401
+```
+
+Refresh automático:
+
+```text
+RT1
+↓
+POST /refresh
+↓
+JWT2 + RT2
+```
+
+Retry:
+
+```text
+request original
+↓
+JWT2
+↓
+200
+```
+
+Nueva expiración:
+
+```text
+JWT2 expired
+↓
+RT2
+↓
+JWT3 + RT3
+```
+
+Finalmente:
+
+```text
+logout
+↓
+revocar RT3
+↓
+borrar cookie
+↓
+limpiar React
+```
+
+---
+
+# Qué implementar después
+
+Después de este playbook, los siguientes bloques naturales son:
+
+1. **Logout backend**
+
+   ```text
+   POST /auth/logout
+   ↓
+   leer cookie
+   ↓
+   hash
+   ↓
+   revocar refresh token
+   ↓
+   eliminar cookie
+   ↓
+   204
+   ```
+
+2. **Logout frontend**
+
+   ```text
+   logout request
+   ↓
+   backend
+   ↓
+   limpiar AuthContext
+   ↓
+   redirect login
+   ```
+
+3. **Session bootstrap**
+
+   ```text
+   application start
+   ↓
+   accessToken = null
+   ↓
+   POST /refresh
+   ↓
+   restaurar sesión si cookie sigue válida
+   ```
+
+4. **Route Guards**
+
+   Diferenciar:
+
+   ```text
+   initializing
+   authenticated
+   unauthenticated
+   ```
+
+5. **Mejoras avanzadas**
+
+   ```text
+   refresh token families
+   reuse detection
+   sessions per device
+   revoke all sessions
+   proactive refresh
+   integration tests
+   ```
+
+---
+
+# Qué revisar la próxima vez
+
+- [ ] Por qué `withCredentials` no significa que JavaScript pueda leer la cookie
+- [ ] Por qué el refresh token debe permanecer fuera de React
+- [ ] Cómo funciona un Axios request interceptor
+- [ ] Cómo funciona un Axios response interceptor
+- [ ] Qué es una stale closure
+- [ ] Por qué utilizar `useRef` para el access token
+- [ ] Por qué actualizar el ref antes de React state durante refresh
+- [ ] Por qué no todos los 401 deben refrescar sesión
+- [ ] Por qué excluir login, register, refresh y logout
+- [ ] Cómo `_retry` evita loops
+- [ ] Por qué `isRefreshing` por sí solo no es suficiente
+- [ ] Cómo funciona una Promise compartida
+- [ ] Qué significa single-flight refresh
+- [ ] Por qué token rotation exige controlar concurrencia
+- [ ] Cómo reintentar una request con el mismo `apiClient`
+- [ ] Por qué hacer cleanup con `eject`
+- [ ] Cómo React StrictMode puede exponer interceptores duplicados
+- [ ] Por qué estabilizar `login` y `logout` con `useCallback`
+- [ ] Cómo manejar una sesión que ya no puede refrescarse
+- [ ] Diferencia entre refresh automático y restauración inicial de sesión
+- [ ] Cómo probar múltiples 401 simultáneos
+- [ ] Cómo verificar que solo existe un `/refresh`
+
+---
+
+# Referencias útiles
+
+- [Axios Interceptors](https://axios-http.com/docs/interceptors)
+- [Axios Request Config](https://axios-http.com/docs/req_config)
+- [React useRef](https://react.dev/reference/react/useRef)
+- [React useEffect](https://react.dev/reference/react/useEffect)
+- [React useLayoutEffect](https://react.dev/reference/react/useLayoutEffect)
+- [React useCallback](https://react.dev/reference/react/useCallback)
+- [MDN — HTTP 401](https://developer.mozilla.org/docs/Web/HTTP/Status/401)
+- [MDN — HTTP Cookies](https://developer.mozilla.org/docs/Web/HTTP/Cookies)
+- [MDN — Set-Cookie](https://developer.mozilla.org/docs/Web/HTTP/Headers/Set-Cookie)
