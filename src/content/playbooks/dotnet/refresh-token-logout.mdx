@@ -1,0 +1,3086 @@
+---
+title: "Cómo implementar Logout seguro con Refresh Tokens en .NET y React"
+description: "Guía práctica y conceptual para cerrar una sesión renovable de forma segura: revocar el refresh token en backend, eliminar la cookie HttpOnly y limpiar el estado de autenticación del frontend sin mezclar responsabilidades"
+goal: "Completar el ciclo de autenticación implementando un logout idempotente en .NET y una orquestación de logout en React que invalide la sesión renovable y limpie el estado local"
+tech:
+  [
+    "dotnet",
+    "csharp",
+    "aspnet-core",
+    "react",
+    "typescript",
+    "axios",
+    "jwt",
+    "refresh-token",
+    "http-only-cookie",
+    "ef-core",
+    "postgresql",
+  ]
+tags:
+  [
+    "authentication",
+    "logout",
+    "refresh-token",
+    "security",
+    "jwt",
+    "cookies",
+    "revocation",
+    "react",
+    "typescript",
+    "axios",
+    "minimal-api",
+    "idempotency",
+  ]
+level: "medio"
+status: "active"
+prerequisites:
+  - "Backend ASP.NET Core o Minimal APIs configurado"
+  - "Login con access token JWT funcionando"
+  - "Refresh tokens opacos persistidos mediante hash SHA-256"
+  - "POST /auth/refresh funcionando y rotando refresh tokens"
+  - "Cookie HttpOnly configurada para transportar el refresh token"
+  - "IRefreshTokenRepository con FindByHashAsync, Revoke y SaveChangesAsync"
+  - "Frontend React + TypeScript configurado"
+  - "Axios configurado mediante un apiClient compartido con withCredentials"
+  - "AuthContext o mecanismo equivalente que mantenga accessToken y user en memoria"
+  - "Refresh automático mediante Axios interceptor o mecanismo equivalente"
+estimatedTime: "45-60 min"
+updatedAt: 2026-08-15
+createdAt: 2026-08-15
+summary: "Implementación reusable del logout completo: endpoint idempotente, revocación del refresh token, eliminación segura de cookie HttpOnly, limpieza del estado local, separación entre logout remoto y local, integración con Axios y pruebas del ciclo completo de sesión"
+related:
+  [
+    "Cómo implementar persistencia segura de Refresh Tokens en .NET + EF Core",
+    "Cómo implementar emisión y rotación segura de Refresh Tokens en .NET",
+    "Cómo implementar Refresh Token automático con Axios Interceptors en React",
+  ]
+---
+
+import { Code } from "astro:components";
+
+# Contexto
+
+> **¿Cuándo usar este playbook?**
+>
+> Cuando ya tenés login, refresh tokens, rotación y renovación automática del
+> access token, pero todavía necesitás cerrar correctamente una sesión tanto en
+> el servidor como en el cliente.
+
+Este playbook cierra el ciclo iniciado por los playbooks anteriores:
+
+```text
+1. Persistencia
+   ↓
+RefreshToken + TokenHash + RevokedAt
+
+2. Emisión y rotación
+   ↓
+Login + cookie HttpOnly + POST /refresh
+
+3. Refresh automático
+   ↓
+Axios interceptor + retry + single-flight refresh
+
+4. Logout
+   ↓
+revocar sesión renovable
++
+eliminar cookie
++
+limpiar estado local
+```
+
+Hasta este punto una aplicación puede mantener una sesión durante mucho tiempo:
+
+```text
+Login
+  ↓
+JWT1 + RT1
+  ↓
+JWT1 expira
+  ↓
+Refresh
+  ↓
+JWT2 + RT2
+  ↓
+JWT2 expira
+  ↓
+Refresh
+  ↓
+JWT3 + RT3
+```
+
+Lo que falta resolver es:
+
+```text
+¿Qué ocurre cuando el usuario decide terminar esa sesión?
+```
+
+Una respuesta incompleta sería:
+
+```typescript
+setAccessToken(null);
+setUser(null);
+```
+
+Eso solamente limpia React.
+
+Si el refresh token continúa activo en servidor:
+
+```text
+RT3
+↓
+sigue siendo válido
+↓
+POST /refresh todavía podría renovar la sesión
+```
+
+Por eso un logout completo necesita dos operaciones:
+
+```text
+SERVIDOR
+────────
+invalidar la sesión renovable
+
+
+CLIENTE
+───────
+eliminar el estado autenticado local
+```
+
+La regla principal de este playbook es:
+
+> **Logout no es borrar un JWT. Logout es impedir que la sesión pueda seguir
+> renovándose y limpiar el estado autenticado del cliente.**
+
+---
+
+# Objetivo arquitectónico
+
+Queremos conservar la separación:
+
+```text
+Frontend
+────────────────────────────────
+
+UI / futuro botón
+       │
+       ▼
+useLogout
+       │
+       ├── authService.logout()
+       │          │
+       │          ▼
+       │      POST /auth/logout
+       │
+       └── AuthContext.logout()
+                  │
+                  ├── accessToken = null
+                  └── user = null
+
+
+Backend
+────────────────────────────────
+
+POST /api/auth/logout
+       │
+       ▼
+Auth Endpoint
+       │
+       ▼
+AuthService.LogoutAsync
+       │
+       ▼
+IRefreshTokenRepository
+       │
+       ▼
+RefreshTokenRepository
+       │
+       ▼
+EF Core
+       │
+       ▼
+PostgreSQL
+```
+
+Cada pieza tiene una responsabilidad diferente:
+
+```text
+Endpoint
+────────
+HTTP
+cookies
+status code
+
+
+AuthService
+───────────
+regla de logout
+hash
+validación de sesión
+revocación
+
+
+Repository
+──────────
+consulta
+tracking
+persistencia
+
+
+authService.ts
+──────────────
+request HTTP desde frontend
+
+
+AuthContext
+───────────
+estado local
+
+
+useLogout
+─────────
+orquestación del caso de uso
+```
+
+No mezcles estas responsabilidades.
+
+---
+
+# Antes de empezar: qué significa realmente "cerrar sesión"
+
+En este modelo existen dos credenciales.
+
+## Access token
+
+```text
+JWT
+corta duración
+stateless
+guardado en memoria
+enviado como Bearer token
+```
+
+Por ejemplo:
+
+```http
+Authorization: Bearer eyJhbGciOi...
+```
+
+Normalmente el servidor no guarda ese JWT.
+
+Por tanto, cuando fue emitido:
+
+```text
+JWT válido
+↓
+seguirá siendo criptográficamente válido
+↓
+hasta expirar
+```
+
+aunque el usuario haga logout.
+
+---
+
+## Refresh token
+
+```text
+opaco
+larga duración
+stateful
+cookie HttpOnly
+hash persistido en DB
+revocable
+```
+
+Este token representa la capacidad de continuar la sesión.
+
+Por eso:
+
+```text
+Access Token
+────────────
+permite usar la sesión ahora
+
+
+Refresh Token
+─────────────
+permite extender la sesión después
+```
+
+Logout debe destruir principalmente la segunda capacidad.
+
+---
+
+# ¿Por qué no borrar el access token desde el backend?
+
+Porque, en una arquitectura JWT stateless, el backend no tiene normalmente algo como:
+
+```text
+ActiveAccessTokens
+```
+
+contra lo cual consultar cada request.
+
+Si agregáramos:
+
+```text
+JWT jti blacklist
+```
+
+cada request autenticada podría requerir comprobar:
+
+```text
+¿este JWT fue revocado?
+```
+
+Eso cambia el modelo operativo.
+
+Para una implementación sencilla y coherente:
+
+```text
+access token
+→ corto
+→ stateless
+→ expira naturalmente
+
+
+refresh token
+→ largo
+→ stateful
+→ revocable
+```
+
+Por eso logout hace:
+
+```text
+refresh token
+↓
+RevokedAt = now
+```
+
+y el frontend hace:
+
+```text
+accessToken = null
+```
+
+El JWT antiguo podría seguir siendo técnicamente válido hasta su expiración, pero
+el cliente deja de utilizarlo y la sesión ya no puede renovarse.
+
+---
+
+# Paso 1: definir la semántica del endpoint
+
+El endpoint recomendado es:
+
+```http
+POST /api/auth/logout
+```
+
+Y su contrato es deliberadamente simple:
+
+```http
+204 No Content
+```
+
+No necesitas devolver:
+
+```json
+{
+  "success": true
+}
+```
+
+ni:
+
+```json
+{
+  "message": "Logged out"
+}
+```
+
+porque el resultado útil es el cambio de estado:
+
+```text
+antes
+─────
+sesión renovable posiblemente activa
+
+
+después
+───────
+esa sesión ya no debe poder renovarse
+```
+
+---
+
+# Paso 2: hacer logout idempotente
+
+Una de las decisiones más importantes es que logout sea **idempotente**.
+
+Una operación idempotente puede ejecutarse varias veces y mantener el mismo
+estado final.
+
+Queremos:
+
+```text
+logout #1
+↓
+204
+
+logout #2
+↓
+204
+
+logout #3
+↓
+204
+```
+
+Incluso si después del primer logout:
+
+```text
+la cookie ya no existe
+```
+
+o el refresh token:
+
+```text
+ya está revocado
+```
+
+---
+
+# ¿Qué casos deben producir 204?
+
+Como mínimo:
+
+```text
+cookie ausente
+→ 204
+
+
+token desconocido
+→ 204
+
+
+token expirado
+→ 204
+
+
+token ya revocado
+→ 204
+
+
+token activo
+→ revocar
+→ 204
+```
+
+La idea es:
+
+> **El cliente pide que la sesión termine. Si ya estaba terminada, el objetivo
+> ya está cumplido.**
+
+---
+
+# ¿Por qué no devolver 401 para un token desconocido?
+
+Podrías hacer:
+
+```text
+token válido
+→ 204
+
+token desconocido
+→ 401
+```
+
+pero eso obliga al cliente a conocer estados internos que no necesita.
+
+También crea una diferencia observable:
+
+```text
+"este token existía"
+vs
+"este token nunca existió"
+```
+
+Logout no necesita revelar esa información.
+
+Una semántica uniforme es más fácil de consumir:
+
+```text
+POST /logout
+↓
+204
+```
+
+---
+
+# Paso 3: no exigir un access token válido para logout
+
+Este punto suele olvidarse.
+
+Supongamos:
+
+```text
+15:00
+login
+
+15:15
+JWT expira
+
+15:16
+usuario pulsa "Cerrar sesión"
+```
+
+La cookie del refresh token puede seguir siendo válida.
+
+Si `/logout` exige:
+
+```http
+Authorization: Bearer <JWT vigente>
+```
+
+el usuario podría no poder cerrar correctamente la sesión.
+
+Por eso el endpoint debería poder operar usando:
+
+```text
+refresh cookie
+```
+
+como identificador de la sesión renovable.
+
+En Minimal APIs puedes dejar esto explícito:
+
+```csharp
+auth.MapPost("/logout", LogoutAsync)
+    .AllowAnonymous();
+```
+
+Aunque el grupo actual no requiera autenticación, declararlo explícitamente
+documenta una regla importante y protege el comportamiento ante refactors
+futuros.
+
+---
+
+# Paso 4: extender el contrato de `IAuthService`
+
+Si actualmente tienes:
+
+```csharp
+public interface IAuthService
+{
+    Task<LoginResult> LoginAsync(
+        LoginRequest request,
+        CancellationToken cancellationToken = default);
+
+    Task<RefreshResult> RefreshAsync(
+        string refreshToken,
+        CancellationToken cancellationToken = default);
+}
+```
+
+añade:
+
+```csharp
+Task LogoutAsync(
+    string? refreshToken,
+    CancellationToken cancellationToken = default);
+```
+
+Observa:
+
+```csharp
+string?
+```
+
+y no:
+
+```csharp
+string
+```
+
+---
+
+# ¿Por qué aceptar `null`?
+
+Porque:
+
+```text
+no existe cookie
+```
+
+no es un error para logout.
+
+El servicio debe poder recibir:
+
+```csharp
+await authService.LogoutAsync(null);
+```
+
+y simplemente concluir:
+
+```text
+no existe una sesión que revocar
+```
+
+Eso permite que la idempotencia sea parte de la lógica de Application y no un
+detalle accidental del endpoint.
+
+---
+
+# Paso 5: decidir si necesitas un `LogoutResult`
+
+Normalmente no.
+
+Login puede necesitar estados como:
+
+```text
+Success
+InvalidCredentials
+```
+
+Refresh puede necesitar:
+
+```text
+Success
+InvalidToken
+```
+
+Pero logout deliberadamente colapsa muchos estados en el mismo resultado:
+
+```text
+sin cookie
+desconocido
+expirado
+revocado
+activo revocado correctamente
+
+↓
+204
+```
+
+Por tanto esto suele ser suficiente:
+
+```csharp
+Task LogoutAsync(...)
+```
+
+Evita introducir sin necesidad:
+
+```text
+LogoutStatus
+LogoutResult
+LogoutResponse
+```
+
+La ausencia de un resultado también comunica una intención:
+
+```text
+el servicio garantiza el estado final
+```
+
+---
+
+# Paso 6: reutilizar el mismo hashing del refresh token
+
+El refresh token real no debe estar almacenado en PostgreSQL.
+
+La base ya contiene:
+
+```text
+TokenHash = SHA256(refreshToken)
+```
+
+Por tanto logout debe repetir exactamente el mismo proceso:
+
+```text
+cookie
+↓
+refresh token real
+↓
+SHA-256
+↓
+TokenHash
+↓
+buscar en DB
+```
+
+No crees un segundo algoritmo exclusivo para logout.
+
+Reutiliza:
+
+```csharp
+private static string HashRefreshToken(
+    string refreshToken)
+{
+    var bytes =
+        Encoding.UTF8.GetBytes(refreshToken);
+
+    var hash =
+        SHA256.HashData(bytes);
+
+    return Convert.ToHexString(hash);
+}
+```
+
+La propiedad que necesitamos es el determinismo:
+
+```text
+SHA256(RT1)
+↓
+HASH1
+
+SHA256(RT1)
+↓
+HASH1
+```
+
+Gracias a eso podemos validar y revocar el token sin persistir el secreto real.
+
+---
+
+# Paso 7: implementar las salidas tempranas de `LogoutAsync`
+
+Empieza con:
+
+```csharp
+public async Task LogoutAsync(
+    string? refreshToken,
+    CancellationToken cancellationToken = default)
+{
+    if (string.IsNullOrWhiteSpace(refreshToken))
+    {
+        return;
+    }
+
+    // ...
+}
+```
+
+Este primer `return` cubre:
+
+```text
+cookie ausente
+string vacío
+valor inválido trivial
+```
+
+y mantiene:
+
+```text
+logout sin sesión
+→ éxito
+```
+
+---
+
+# Paso 8: calcular el hash
+
+Después:
+
+```csharp
+var tokenHash =
+    HashRefreshToken(refreshToken);
+```
+
+Nunca hagas una consulta con:
+
+```csharp
+refreshToken == storedToken.TokenHash
+```
+
+porque son representaciones diferentes.
+
+La comparación conceptual correcta es:
+
+```text
+token real recibido
+↓
+SHA-256
+↓
+hash calculado
+↓
+comparar con TokenHash almacenado
+```
+
+---
+
+# Paso 9: buscar la sesión mediante el repositorio existente
+
+Si tu persistencia ya tiene:
+
+```csharp
+Task<RefreshToken?> FindByHashAsync(
+    string tokenHash,
+    CancellationToken cancellationToken = default);
+```
+
+úsalo:
+
+```csharp
+var storedToken =
+    await refreshTokenRepository.FindByHashAsync(
+        tokenHash,
+        cancellationToken);
+```
+
+No necesitas un método:
+
+```csharp
+LogoutAsync(...)
+```
+
+dentro del repositorio.
+
+El repositorio no debería saber qué significa "logout".
+
+Debe saber:
+
+```text
+buscar
+agregar
+revocar
+persistir
+```
+
+Mientras Application coordina:
+
+```text
+qué condiciones forman un logout válido
+```
+
+---
+
+# Nota sobre `Include(User)`
+
+Es posible que `FindByHashAsync()` exista originalmente para refresh y haga:
+
+```csharp
+.Include(refreshToken => refreshToken.User)
+```
+
+porque `RefreshAsync()` necesita al usuario para emitir un nuevo JWT.
+
+Logout probablemente no necesita esa navegación.
+
+Podrías crear una consulta más ligera, pero no es obligatorio.
+
+Antes de añadir:
+
+```text
+FindSessionByHashWithoutUserAsync
+```
+
+pregúntate:
+
+```text
+¿la optimización compensa un nuevo contrato?
+```
+
+Para la primera implementación suele ser mejor reutilizar el método existente y
+medir antes de optimizar.
+
+---
+
+# Paso 10: token desconocido significa no-op
+
+Después:
+
+```csharp
+if (storedToken is null)
+{
+    return;
+}
+```
+
+No hay nada que modificar.
+
+La postcondición deseada ya es cierta:
+
+```text
+esa credencial no representa una sesión renovable activa
+```
+
+---
+
+# Paso 11: capturar una sola vez el tiempo actual
+
+En lugar de hacer:
+
+```csharp
+DateTime.UtcNow
+```
+
+varias veces:
+
+```csharp
+if (storedToken.ExpiresAt <= DateTime.UtcNow)
+{
+    // ...
+}
+
+refreshTokenRepository.Revoke(
+    storedToken,
+    DateTime.UtcNow);
+```
+
+puedes capturar:
+
+```csharp
+var now = DateTime.UtcNow;
+```
+
+y reutilizarlo.
+
+Esto mantiene una única referencia temporal durante la operación:
+
+```csharp
+var now = DateTime.UtcNow;
+```
+
+No suele cambiar el comportamiento de forma significativa, pero hace la lógica
+más consistente y fácil de probar mentalmente.
+
+---
+
+# Paso 12: token ya revocado significa no-op
+
+Comprueba:
+
+```csharp
+if (storedToken.RevokedAt is not null)
+{
+    return;
+}
+```
+
+Si:
+
+```text
+RevokedAt = 2026-08-15T20:00:00Z
+```
+
+la sesión ya fue invalidada.
+
+Volver a asignar:
+
+```text
+RevokedAt = otra fecha
+```
+
+no aporta nada y destruye información sobre cuándo ocurrió la primera
+revocación.
+
+---
+
+# Paso 13: token expirado significa no-op
+
+Comprueba:
+
+```csharp
+if (storedToken.ExpiresAt <= now)
+{
+    return;
+}
+```
+
+Un token expirado ya no puede ser utilizado para renovar la sesión.
+
+Conceptualmente:
+
+```text
+activo
+──────
+RevokedAt == null
+AND
+ExpiresAt > now
+```
+
+Por tanto:
+
+```text
+expirado
+→ ya no es activo
+→ no necesita revocación para cumplir logout
+```
+
+---
+
+# ¿Debería marcar como revocados los tokens expirados?
+
+No es necesario para este caso de uso.
+
+Podrías decidir que toda llamada de logout escriba:
+
+```text
+RevokedAt = now
+```
+
+incluso si el token expiró.
+
+Pero eso mezcla dos estados distintos:
+
+```text
+expiró naturalmente
+```
+
+y:
+
+```text
+fue revocado explícitamente
+```
+
+Mantenerlos separados conserva más información semántica.
+
+---
+
+# Paso 14: revocar únicamente una sesión activa
+
+Si llegaste hasta aquí:
+
+```text
+storedToken != null
+AND
+RevokedAt == null
+AND
+ExpiresAt > now
+```
+
+entonces:
+
+```csharp
+refreshTokenRepository.Revoke(
+    storedToken,
+    now);
+```
+
+Si tu repositorio tiene:
+
+```csharp
+void Revoke(
+    RefreshToken refreshToken,
+    DateTime revokedAt,
+    string? replacedByTokenHash = null);
+```
+
+no pases un reemplazo.
+
+---
+
+# Diferencia entre refresh y logout
+
+Durante refresh:
+
+```text
+RT1
+↓
+RevokedAt = now
+ReplacedByTokenHash = Hash(RT2)
+```
+
+Durante logout:
+
+```text
+RT1
+↓
+RevokedAt = now
+ReplacedByTokenHash = null
+```
+
+¿Por qué?
+
+Refresh continúa la cadena:
+
+```text
+RT1 → RT2
+```
+
+Logout termina la cadena:
+
+```text
+RT1 → fin
+```
+
+Esto hace que los datos persistidos sean interpretables después.
+
+---
+
+# Paso 15: persistir la revocación
+
+Después:
+
+```csharp
+await refreshTokenRepository.SaveChangesAsync(
+    cancellationToken);
+```
+
+Si `storedToken` fue obtenido mediante EF Core con tracking, el repositorio puede
+limitarse a modificar:
+
+```csharp
+refreshToken.RevokedAt = revokedAt;
+```
+
+y `SaveChangesAsync()` detectará el cambio.
+
+No necesitas:
+
+```csharp
+_dbContext.RefreshTokens.Update(storedToken);
+```
+
+si la entidad ya está trackeada.
+
+---
+
+# Paso 16: implementación completa del servicio
+
+Una versión simple:
+
+```csharp
+public async Task LogoutAsync(
+    string? refreshToken,
+    CancellationToken cancellationToken = default)
+{
+    if (string.IsNullOrWhiteSpace(refreshToken))
+    {
+        return;
+    }
+
+    var tokenHash =
+        HashRefreshToken(refreshToken);
+
+    var storedToken =
+        await refreshTokenRepository.FindByHashAsync(
+            tokenHash,
+            cancellationToken);
+
+    if (storedToken is null)
+    {
+        return;
+    }
+
+    var now = DateTime.UtcNow;
+
+    if (storedToken.RevokedAt is not null ||
+        storedToken.ExpiresAt <= now)
+    {
+        return;
+    }
+
+    refreshTokenRepository.Revoke(
+        storedToken,
+        now);
+
+    await refreshTokenRepository.SaveChangesAsync(
+        cancellationToken);
+}
+```
+
+La lógica se puede leer como:
+
+```text
+¿hay token?
+↓
+sí
+
+¿existe sesión?
+↓
+sí
+
+¿está activa?
+↓
+sí
+
+revocar
+↓
+guardar
+```
+
+Todo lo demás es no-op.
+
+---
+
+# Paso 17: registrar el endpoint
+
+En Minimal APIs:
+
+```csharp
+auth.MapPost("/logout", LogoutAsync)
+    .AllowAnonymous()
+    .WithName("Logout")
+    .Produces(StatusCodes.Status204NoContent)
+    .WithSummary("Logs out the current session")
+    .WithDescription(
+        "Revokes the refresh token and removes its cookie");
+```
+
+Si tu grupo está montado así:
+
+```csharp
+var api =
+    app.MapGroup("/api");
+
+api.MapAuthEndpoints();
+```
+
+y luego:
+
+```csharp
+var auth =
+    api.MapGroup("/auth");
+```
+
+el endpoint final será:
+
+```text
+POST /api/auth/logout
+```
+
+---
+
+# Paso 18: leer la cookie en el endpoint
+
+El endpoint es la capa correcta para trabajar con:
+
+```text
+HttpRequest
+HttpResponse
+CookieOptions
+status codes
+```
+
+No metas `HttpContext` dentro de `AuthService`.
+
+Lee:
+
+```csharp
+request.Cookies.TryGetValue(
+    RefreshTokenCookieName,
+    out var refreshToken);
+```
+
+No necesitas retornar temprano si la cookie no existe.
+
+Puedes dejar:
+
+```text
+refreshToken = null
+```
+
+y delegarlo al servicio.
+
+---
+
+# Paso 19: llamar `LogoutAsync`
+
+Después:
+
+```csharp
+await authService.LogoutAsync(
+    refreshToken,
+    cancellationToken);
+```
+
+El endpoint no necesita conocer:
+
+```text
+SHA-256
+RevokedAt
+ExpiresAt
+repositorio
+```
+
+Eso pertenece a Application.
+
+---
+
+# Paso 20: eliminar siempre la cookie
+
+Después de intentar la revocación:
+
+```csharp
+DeleteRefreshTokenCookie(response);
+```
+
+Hazlo incluso cuando:
+
+```text
+no había token
+token desconocido
+token expirado
+token revocado
+```
+
+La postcondición cliente debe ser:
+
+```text
+no conservar la cookie de sesión
+```
+
+---
+
+# Paso 21: entender cómo se identifica una cookie
+
+Para poder eliminar una cookie de forma fiable, recuerda que su identidad está
+ligada principalmente a:
+
+```text
+Name
+Domain
+Path
+```
+
+Por ejemplo, si fue creada con:
+
+```csharp
+Path = "/api/auth";
+```
+
+y después intentas borrarla con:
+
+```csharp
+Path = "/";
+```
+
+puedes terminar actuando sobre una cookie diferente.
+
+Por eso conviene centralizar la configuración.
+
+Por ejemplo:
+
+```csharp
+private const string RefreshTokenCookieName =
+    "myapp.refreshToken";
+```
+
+y reutilizar el mismo `Path`.
+
+Si configuraste explícitamente `Domain`, también debe coincidir al eliminarla.
+
+---
+
+# Paso 22: mantener un helper para borrar la cookie
+
+Ejemplo:
+
+```csharp
+private static void DeleteRefreshTokenCookie(
+    HttpResponse response)
+{
+    response.Cookies.Delete(
+        RefreshTokenCookieName,
+        new CookieOptions
+        {
+            Path = "/api/auth"
+        });
+}
+```
+
+Si tu aplicación utiliza `Domain`, inclúyelo también en las opciones de
+eliminación.
+
+La idea es evitar duplicar strings como:
+
+```text
+"myapp.refreshToken"
+"/api/auth"
+```
+
+en múltiples lugares.
+
+---
+
+# `HttpOnly`, `Secure` y `SameSite` durante logout
+
+Al crear la cookie quizá utilizaste:
+
+```csharp
+HttpOnly = true;
+Secure = true;
+SameSite = SameSiteMode.Lax;
+Path = "/api/auth";
+```
+
+Estas opciones siguen siendo fundamentales para la seguridad y el transporte de
+la cookie.
+
+Pero, para encontrar la cookie que quieres eliminar, presta especial atención a:
+
+```text
+nombre
+path
+domain
+```
+
+Centralizar los helpers de creación y eliminación reduce inconsistencias.
+
+---
+
+# Paso 23: implementar el handler completo
+
+```csharp
+private static async Task<NoContent> LogoutAsync(
+    HttpRequest request,
+    HttpResponse response,
+    IAuthService authService,
+    CancellationToken cancellationToken)
+{
+    request.Cookies.TryGetValue(
+        RefreshTokenCookieName,
+        out var refreshToken);
+
+    await authService.LogoutAsync(
+        refreshToken,
+        cancellationToken);
+
+    DeleteRefreshTokenCookie(response);
+
+    return TypedResults.NoContent();
+}
+```
+
+El flujo queda:
+
+```text
+request
+↓
+leer cookie
+↓
+Application intenta revocar
+↓
+eliminar cookie
+↓
+204
+```
+
+---
+
+# Paso 24: no crear una migración
+
+Logout utiliza campos que deberían existir desde la persistencia:
+
+```text
+TokenHash
+ExpiresAt
+RevokedAt
+ReplacedByTokenHash
+```
+
+Por tanto:
+
+```text
+nuevo endpoint
++
+nuevo método de service
+```
+
+no implica:
+
+```text
+nuevo modelo de datos
+```
+
+No generes una migración si no cambiaste el modelo EF Core.
+
+---
+
+# Paso 25: no crear una blacklist de JWT por accidente
+
+Esta feature no requiere:
+
+```text
+AccessTokenBlacklist
+RevokedJti
+InvalidJwt
+```
+
+El modelo sigue siendo:
+
+```text
+JWT
+↓
+válido hasta expirar
+
+
+Refresh Token
+↓
+revocable en DB
+```
+
+Agregar una blacklist puede ser válido en sistemas con requisitos más estrictos,
+pero cambia el diseño y debe ser una decisión separada.
+
+---
+
+# Paso 26: implementar el request de logout en frontend
+
+Ahora pasamos al cliente.
+
+Si ya tienes:
+
+```typescript
+login()
+register()
+refresh()
+```
+
+dentro de:
+
+```text
+authService.ts
+```
+
+agrega:
+
+```typescript
+export async function logout(): Promise<void> {
+  await apiClient.post("/auth/logout");
+}
+```
+
+No necesitas:
+
+```typescript
+return response.data;
+```
+
+porque el servidor responde:
+
+```http
+204 No Content
+```
+
+Por eso el tipo natural es:
+
+```typescript
+Promise<void>
+```
+
+---
+
+# Paso 27: no enviar el refresh token desde React
+
+No hagas:
+
+```typescript
+apiClient.post("/auth/logout", {
+  refreshToken,
+});
+```
+
+Tampoco:
+
+```typescript
+const refreshToken =
+    localStorage.getItem("refreshToken");
+```
+
+Ni:
+
+```typescript
+document.cookie
+```
+
+Si el refresh token está correctamente protegido:
+
+```text
+HttpOnly
+```
+
+JavaScript no puede leerlo.
+
+La petición debe ser simplemente:
+
+```typescript
+await apiClient.post("/auth/logout");
+```
+
+---
+
+# Paso 28: dejar que el navegador envíe la cookie
+
+Si tu cliente compartido tiene:
+
+```typescript
+const apiClient = axios.create({
+  baseURL:
+    import.meta.env.VITE_BACKEND_URL || "/api",
+
+  withCredentials: true,
+});
+```
+
+el navegador puede adjuntar la cookie correspondiente.
+
+Conceptualmente:
+
+```text
+React
+↓
+POST /auth/logout
+↓
+Browser
+↓
+adjunta cookie HttpOnly
+↓
+Backend
+```
+
+React expresa la intención:
+
+```text
+"cerrar sesión"
+```
+
+pero no administra el secreto.
+
+---
+
+# Paso 29: mantener `AuthContext.logout()` local
+
+Un `AuthProvider` puede tener:
+
+```typescript
+const logout = useCallback(() => {
+  setAccessToken(null);
+  setUser(null);
+}, []);
+```
+
+Conserva esa función simple.
+
+No hagas directamente:
+
+```typescript
+const logout = useCallback(async () => {
+  await apiClient.post("/auth/logout");
+
+  setAccessToken(null);
+  setUser(null);
+}, []);
+```
+
+---
+
+# ¿Por qué no meter Axios dentro de `AuthProvider`?
+
+Porque el provider tiene una responsabilidad clara:
+
+```text
+AuthProvider
+────────────
+estado React
+```
+
+Si añades:
+
+```text
+HTTP
+```
+
+empieza a convertirse en:
+
+```text
+state manager
++
+API service
++
+session coordinator
+```
+
+También puede existir código interno, como el interceptor, que necesite:
+
+```typescript
+logout();
+```
+
+solamente para limpiar el estado local cuando una sesión ya es irrecuperable.
+
+En ese caso no quieres necesariamente iniciar otra petición `/logout`.
+
+---
+
+# Paso 30: distinguir logout local y logout remoto
+
+Esta separación es fundamental.
+
+## Logout remoto
+
+```typescript
+authService.logout()
+```
+
+significa:
+
+```text
+pedir al servidor que invalide la sesión renovable
+```
+
+## Logout local
+
+```typescript
+AuthContext.logout()
+```
+
+significa:
+
+```text
+eliminar accessToken y user del runtime React
+```
+
+## Logout completo
+
+Necesitamos una pequeña capa que coordine:
+
+```text
+remoto
++
+local
+```
+
+---
+
+# Paso 31: crear `useLogout`
+
+Una opción sencilla:
+
+```typescript
+import { useCallback } from "react";
+import { useAuth } from "./useAuth";
+import {
+  logout as logoutRequest,
+} from "../services/authService";
+
+export function useLogout() {
+  const {
+    logout: clearLocalSession,
+  } = useAuth();
+
+  return useCallback(async () => {
+    try {
+      await logoutRequest();
+    } finally {
+      clearLocalSession();
+    }
+  }, [clearLocalSession]);
+}
+```
+
+Este hook representa el caso de uso completo desde el frontend.
+
+---
+
+# Paso 32: entender el `try/finally`
+
+Esta decisión merece atención.
+
+```typescript
+try {
+  await logoutRequest();
+} finally {
+  clearLocalSession();
+}
+```
+
+significa:
+
+```text
+backend responde 204
+↓
+limpiar estado local
+```
+
+pero también:
+
+```text
+network error
+↓
+limpiar estado local
+```
+
+---
+
+# ¿Por qué limpiar localmente si el request falla?
+
+Porque el usuario pidió salir de la sesión en ese cliente.
+
+Mantener:
+
+```text
+accessToken
+user
+isAuthenticated = true
+```
+
+después de pulsar logout solamente porque hubo un error de red puede ser
+sorprendente.
+
+`finally` garantiza:
+
+```text
+estado local
+→ no autenticado
+```
+
+---
+
+# Pero existe una consecuencia importante
+
+Si la petición falla antes de llegar al servidor:
+
+```text
+Frontend
+────────
+accessToken eliminado
+user eliminado
+
+
+Backend
+───────
+refresh token quizá sigue activo
+
+
+Browser
+───────
+cookie quizá sigue presente
+```
+
+Por eso no debes ocultar el error.
+
+Con:
+
+```typescript
+try {
+  await logoutRequest();
+} finally {
+  clearLocalSession();
+}
+```
+
+la excepción continúa propagándose.
+
+Así una capa superior puede decidir:
+
+```text
+mostrar error
+registrar telemetría
+reintentar
+informar al usuario
+```
+
+sin conservar el estado autenticado local.
+
+---
+
+# Paso 33: no usar un `catch` vacío
+
+Evita:
+
+```typescript
+try {
+  await logoutRequest();
+} catch {
+  // ignorado
+}
+
+clearLocalSession();
+```
+
+porque escondería:
+
+```text
+"el backend quizá no revocó la sesión"
+```
+
+La diferencia entre:
+
+```text
+limpiar estado local
+```
+
+y:
+
+```text
+confirmar revocación remota
+```
+
+debe seguir siendo observable para quien consume el hook.
+
+---
+
+# Paso 34: no colocar navegación dentro del estado global
+
+Tampoco es necesario hacer:
+
+```typescript
+navigate("/login");
+```
+
+dentro de `AuthProvider`.
+
+Y normalmente tampoco necesitas acoplar `useLogout` a una ruta concreta.
+
+La navegación pertenece mejor a:
+
+```text
+UI
+router
+route guards
+layout
+```
+
+Entonces un futuro botón puede hacer:
+
+```typescript
+const logout = useLogout();
+const navigate = useNavigate();
+
+async function handleLogout() {
+  await logout();
+
+  navigate("/login", {
+    replace: true,
+  });
+}
+```
+
+La lógica de autenticación sigue siendo reusable incluso si mañana la ruta cambia.
+
+---
+
+# Paso 35: mantener `/auth/logout` fuera del refresh automático
+
+Si utilizas un response interceptor que reacciona a `401`, excluye endpoints de
+autenticación:
+
+```typescript
+const REFRESH_EXCLUDED_ENDPOINTS = [
+  "/auth/login",
+  "/auth/register",
+  "/auth/refresh",
+  "/auth/logout",
+];
+```
+
+Logout no debe provocar:
+
+```text
+/logout
+↓
+401
+↓
+/refresh
+↓
+renovar sesión
+```
+
+Eso sería conceptualmente contrario a la intención del usuario.
+
+La regla es:
+
+> **Nunca intentes restaurar automáticamente una sesión mientras estás
+> intentando destruirla.**
+
+---
+
+# Paso 36: entender por qué el request interceptor no rompe logout
+
+Es posible que tu request interceptor haga:
+
+```typescript
+if (accessTokenRef.current) {
+  config.headers.set(
+    "Authorization",
+    `Bearer ${accessTokenRef.current}`,
+  );
+}
+```
+
+Por tanto `/logout` puede llegar con un Bearer token si aún existe.
+
+Eso no es un problema.
+
+El punto importante es que backend **no dependa** de ese JWT para autorizar el
+logout.
+
+La sesión a revocar se identifica por la cookie.
+
+---
+
+# Paso 37: CORS y cookies cross-origin
+
+Si frontend y backend viven en orígenes distintos:
+
+```text
+https://app.example.com
+https://api.example.com
+```
+
+el cliente puede necesitar:
+
+```typescript
+withCredentials: true
+```
+
+y el backend:
+
+```csharp
+policy
+    .WithOrigins(allowedOrigins)
+    .AllowAnyHeader()
+    .AllowAnyMethod()
+    .AllowCredentials();
+```
+
+No combines:
+
+```csharp
+AllowAnyOrigin()
+```
+
+con credenciales.
+
+También revisa la política de cookie:
+
+```text
+Secure
+SameSite
+Domain
+Path
+```
+
+según tu arquitectura real.
+
+Logout no puede revocar una cookie que el navegador nunca envía.
+
+---
+
+# Paso 38: flujo completo del logout
+
+Una vez unido todo:
+
+```text
+Usuario solicita logout
+        │
+        ▼
+useLogout()
+        │
+        ▼
+authService.logout()
+        │
+        ▼
+POST /api/auth/logout
+        │
+        │ Browser adjunta HttpOnly cookie
+        ▼
+Auth Endpoint
+        │
+        ├── leer cookie
+        │
+        ▼
+AuthService.LogoutAsync
+        │
+        ├── SHA-256
+        ├── FindByHashAsync
+        ├── validar estado
+        ├── Revoke
+        └── SaveChangesAsync
+        │
+        ▼
+Endpoint
+        │
+        ├── Delete cookie
+        └── 204
+        │
+        ▼
+useLogout finally
+        │
+        ▼
+AuthContext.logout()
+        │
+        ├── accessToken = null
+        └── user = null
+```
+
+Resultado:
+
+```text
+Backend
+───────
+refresh token inutilizable
+
+
+Browser
+───────
+cookie eliminada
+
+
+React
+─────
+access token eliminado
+user eliminado
+isAuthenticated = false
+```
+
+---
+
+# Paso 39: comprobar que no necesitas modificar el repositorio
+
+Si ya dispones de:
+
+```text
+FindByHashAsync
+Revoke
+SaveChangesAsync
+```
+
+logout no necesita nuevos métodos.
+
+Esto es una buena señal arquitectónica:
+
+```text
+la persistencia fue diseñada con operaciones primitivas
+```
+
+y Application puede combinarlas para:
+
+```text
+refresh
+logout
+revocación futura
+```
+
+---
+
+# Paso 40: comprobar que no necesitas modificar la entidad
+
+Si tu entidad ya contiene:
+
+```csharp
+public DateTime ExpiresAt { get; set; }
+
+public DateTime? RevokedAt { get; set; }
+
+public string? ReplacedByTokenHash {
+    get;
+    set;
+}
+```
+
+la revocación ya está modelada.
+
+No agregues:
+
+```text
+IsLoggedOut
+IsActive
+LogoutDate
+```
+
+sin una razón adicional.
+
+El estado activo se puede derivar:
+
+```text
+RevokedAt == null
+AND
+ExpiresAt > now
+```
+
+---
+
+# Paso 41: comprobar que no necesitas modificar DI
+
+Si:
+
+```text
+IAuthService → AuthService
+```
+
+y:
+
+```text
+IRefreshTokenRepository
+→ RefreshTokenRepository
+```
+
+ya están registrados, agregar un nuevo método al contrato no requiere una nueva
+registration.
+
+Esto evita cambios accidentales fuera del alcance real.
+
+---
+
+# Paso 42: probar primero el backend de forma aislada
+
+Antes de probar React:
+
+```text
+login
+↓
+guardar cookie
+↓
+logout manual
+↓
+comprobar DB
+```
+
+Esto reduce variables.
+
+Si backend falla, todavía no involucres:
+
+```text
+hooks
+context
+interceptor
+router
+```
+
+---
+
+# Paso 43: prueba de login inicial
+
+Ejecuta:
+
+```http
+POST /api/auth/login
+Content-Type: application/json
+```
+
+Después comprueba:
+
+```text
+200 OK
+access token en body
+refresh cookie presente
+```
+
+En PostgreSQL:
+
+```sql
+SELECT
+    "Id",
+    "TokenHash",
+    "ExpiresAt",
+    "RevokedAt",
+    "ReplacedByTokenHash",
+    "CreatedAt"
+FROM identity."RefreshTokens"
+ORDER BY "CreatedAt" DESC;
+```
+
+El token recién creado debería mostrar:
+
+```text
+RevokedAt = NULL
+```
+
+---
+
+# Paso 44: prueba de logout normal
+
+Ejecuta:
+
+```http
+POST /api/auth/logout
+```
+
+con la cookie.
+
+Resultado:
+
+```http
+204 No Content
+```
+
+Después consulta DB.
+
+Deberías observar:
+
+```text
+RevokedAt != NULL
+ReplacedByTokenHash = NULL
+```
+
+La segunda condición demuestra que la sesión terminó en lugar de rotarse.
+
+---
+
+# Paso 45: comprobar que la cookie fue eliminada
+
+En DevTools, Postman o la herramienta usada para probar, comprueba que:
+
+```text
+refresh cookie
+```
+
+ya no esté disponible para futuras requests.
+
+El servidor debería haber enviado una instrucción de expiración/eliminación.
+
+---
+
+# Paso 46: probar idempotencia
+
+Ejecuta varias veces:
+
+```text
+POST /logout
+↓
+204
+
+POST /logout
+↓
+204
+
+POST /logout
+↓
+204
+```
+
+No debería aparecer:
+
+```text
+400
+401
+404
+500
+```
+
+simplemente porque la sesión ya fue cerrada.
+
+---
+
+# Paso 47: probar logout sin access token
+
+Elimina:
+
+```http
+Authorization: Bearer ...
+```
+
+y conserva la cookie.
+
+Ejecuta:
+
+```http
+POST /api/auth/logout
+```
+
+Debe seguir devolviendo:
+
+```http
+204
+```
+
+Esta prueba valida que logout no dependa de un JWT vigente.
+
+---
+
+# Paso 48: probar token desconocido
+
+Envía manualmente una cookie con un valor aleatorio:
+
+```text
+myapp.refreshToken=not-a-real-token
+```
+
+Resultado esperado:
+
+```text
+204
+```
+
+y ninguna fila válida debe ser modificada.
+
+---
+
+# Paso 49: probar token ya revocado
+
+Guarda el refresh token antes del primer logout.
+
+Después:
+
+```text
+logout
+↓
+token revocado
+```
+
+Vuelve a enviar manualmente el mismo token.
+
+Resultado:
+
+```text
+204
+```
+
+y `RevokedAt` no necesita cambiar.
+
+---
+
+# Paso 50: probar token expirado
+
+Puedes:
+
+```text
+reducir temporalmente la vida del token
+```
+
+o preparar una sesión expirada en un entorno de pruebas.
+
+Después:
+
+```text
+POST /logout
+```
+
+debe responder:
+
+```text
+204
+```
+
+sin convertir necesariamente la expiración natural en una revocación explícita.
+
+---
+
+# Paso 51: prueba de seguridad más importante
+
+La prueba esencial es:
+
+```text
+login
+↓
+guardar RT1
+↓
+logout con RT1
+↓
+intentar POST /refresh usando RT1
+```
+
+El resultado debe ser:
+
+```http
+401 Unauthorized
+```
+
+Esta prueba demuestra que logout no fue simplemente:
+
+```text
+borrar cookie
+```
+
+sino:
+
+```text
+revocar sesión en servidor
+```
+
+Aunque alguien conserve el token real antiguo, ya no debería poder renovar la
+sesión.
+
+---
+
+# Paso 52: probar la lógica frontend sin construir UI
+
+Todavía no necesitas un botón.
+
+Puedes ejecutar el servicio o hook desde una prueba, una pantalla temporal o una
+herramienta de desarrollo.
+
+Lo que debes verificar en Network es:
+
+```text
+POST /auth/logout
+↓
+204
+```
+
+y después:
+
+```text
+accessToken = null
+user = null
+isAuthenticated = false
+```
+
+---
+
+# Paso 53: probar fallo de red del frontend
+
+Esta prueba valida la decisión de `finally`.
+
+Simula:
+
+```text
+backend apagado
+```
+
+o una URL no disponible.
+
+Ejecuta logout.
+
+Deberías observar:
+
+```text
+request remoto
+→ falla
+
+
+estado local
+→ limpiado
+
+
+error
+→ continúa propagándose
+```
+
+Esto confirma que:
+
+```text
+finally
+```
+
+cumple su objetivo sin esconder la imposibilidad de confirmar la revocación
+remota.
+
+---
+
+# Paso 54: probar que logout no dispara refresh automático
+
+Fuerza una respuesta problemática desde `/logout` en un entorno controlado o
+inspecciona la configuración del interceptor.
+
+Comprueba que:
+
+```text
+/auth/logout
+```
+
+esté dentro de:
+
+```text
+REFRESH_EXCLUDED_ENDPOINTS
+```
+
+El flujo nunca debería ser:
+
+```text
+logout
+↓
+401
+↓
+refresh
+```
+
+---
+
+# Paso 55: ejecutar compilación y lint
+
+Backend:
+
+```bash
+dotnet build
+```
+
+Frontend:
+
+```bash
+npm run build
+```
+
+Y, si existe:
+
+```bash
+npm run lint
+```
+
+La feature no está terminada solamente porque una prueba manual pasó.
+
+Comprueba también:
+
+```text
+contratos
+imports
+tipos
+nullable reference types
+TypeScript
+```
+
+---
+
+# Paso 56: arquitectura de archivos sugerida
+
+Una estructura posible:
+
+```text
+backend/
+├── Application/
+│   └── Identity/
+│       ├── Interfaces/
+│       │   ├── IAuthService.cs
+│       │   └── IRefreshTokenRepository.cs
+│       └── Services/
+│           └── AuthService.cs
+│
+├── Infrastructure/
+│   └── Repositories/
+│       └── RefreshTokenRepository.cs
+│
+└── Api/
+    └── Endpoints/
+        └── AuthEndpoints.cs
+
+
+frontend/
+└── src/
+    └── modules/
+        └── auth/
+            ├── context/
+            │   └── AuthContext.ts
+            ├── providers/
+            │   └── AuthProvider.tsx
+            ├── hooks/
+            │   ├── useAuth.ts
+            │   └── useLogout.ts
+            └── services/
+                └── authService.ts
+```
+
+---
+
+# Responsabilidad final de cada archivo
+
+## `IAuthService.cs`
+
+Define:
+
+```text
+qué operaciones de autenticación existen
+```
+
+incluyendo:
+
+```text
+LogoutAsync
+```
+
+---
+
+## `AuthService.cs`
+
+Define:
+
+```text
+qué significa revocar una sesión
+```
+
+No sabe:
+
+```text
+cómo se llama la cookie
+qué status code devolver
+```
+
+---
+
+## `IRefreshTokenRepository.cs`
+
+Define primitivas de persistencia:
+
+```text
+FindByHashAsync
+Revoke
+SaveChangesAsync
+```
+
+No sabe:
+
+```text
+qué es logout HTTP
+```
+
+---
+
+## `RefreshTokenRepository.cs`
+
+Implementa:
+
+```text
+EF Core
+tracking
+PostgreSQL
+```
+
+---
+
+## `AuthEndpoints.cs`
+
+Administra:
+
+```text
+HttpRequest
+HttpResponse
+cookies
+204
+```
+
+---
+
+## `authService.ts`
+
+Administra:
+
+```text
+POST /auth/logout
+```
+
+pero no el estado React.
+
+---
+
+## `AuthProvider.tsx`
+
+Administra:
+
+```text
+accessToken
+user
+isAuthenticated
+```
+
+pero no Axios.
+
+---
+
+## `useLogout.ts`
+
+Coordina:
+
+```text
+logout remoto
++
+logout local
+```
+
+---
+
+## `AuthInterceptor.tsx`
+
+Debe saber que:
+
+```text
+/auth/logout
+```
+
+no participa del refresh automático.
+
+---
+
+# Errores comunes
+
+| Error | Consecuencia | Solución |
+|---|---|---|
+| Limpiar solamente React | El refresh token puede seguir activo | Revocar también la sesión en backend |
+| Exigir JWT válido en `/logout` | Usuario no puede cerrar sesión después de expirar el access token | Permitir logout basado en refresh cookie |
+| Devolver 401 si no hay cookie | Logout deja de ser idempotente | Responder 204 |
+| Persistir refresh token real | Robo de DB expone sesiones utilizables | Guardar solamente SHA-256 |
+| Crear un hash diferente para logout | No se encuentra la sesión | Reutilizar el mismo hashing |
+| Crear un token reemplazo durante logout | La sesión continúa | `ReplacedByTokenHash = null` |
+| No eliminar la cookie | Navegador conserva una credencial inútil o potencialmente activa | Borrarla siempre |
+| Borrar con `Path` distinto | La cookie original puede permanecer | Reutilizar nombre/path/domain |
+| Meter Axios en `AuthProvider` | Estado y transporte quedan acoplados | Mantener logout local separado |
+| Guardar refresh token en Context | JavaScript obtiene acceso al secreto | Mantenerlo HttpOnly |
+| Hacer `catch {}` en frontend | Se oculta un fallo de revocación remota | Usar `finally` y propagar el error |
+| Permitir refresh automático sobre `/logout` | Posibles loops o renovación durante cierre | Excluir auth endpoints |
+| Agregar JWT blacklist sin requerimiento | Mayor complejidad y estado por request | Mantener JWT corto y stateless |
+| Generar migración sin cambios de modelo | Ruido y riesgo innecesario | No migrar |
+| Mezclar navegación con `AuthProvider` | Context queda acoplado al router | Navegar desde UI/guards |
+
+---
+
+# Checklist final
+
+## Backend
+
+- [ ] Existe `POST /api/auth/logout`
+- [ ] El endpoint puede ejecutarse sin access token válido
+- [ ] Lee el refresh token desde cookie
+- [ ] No recibe el refresh token en JSON
+- [ ] Calcula el mismo SHA-256 utilizado por login/refresh
+- [ ] Busca la sesión mediante `TokenHash`
+- [ ] Token desconocido produce no-op
+- [ ] Token revocado produce no-op
+- [ ] Token expirado produce no-op
+- [ ] Solo tokens activos se revocan
+- [ ] `RevokedAt` se asigna
+- [ ] `ReplacedByTokenHash` permanece `null`
+- [ ] Se ejecuta `SaveChangesAsync`
+- [ ] La cookie se elimina siempre
+- [ ] El endpoint devuelve 204
+- [ ] Repetir logout sigue devolviendo 204
+- [ ] No existe blacklist de access tokens sin una decisión explícita
+
+## Frontend
+
+- [ ] `apiClient` usa `withCredentials`
+- [ ] Existe `authService.logout(): Promise<void>`
+- [ ] React no lee el refresh token
+- [ ] `AuthContext.logout()` solamente limpia estado
+- [ ] `AuthProvider` no depende de Axios
+- [ ] Existe una capa de orquestación como `useLogout`
+- [ ] El estado local se limpia en `finally`
+- [ ] Los errores remotos no se silencian
+- [ ] `/auth/logout` está excluido del refresh automático
+- [ ] La navegación permanece en UI/router
+
+## Pruebas
+
+- [ ] Login crea sesión activa
+- [ ] Logout asigna `RevokedAt`
+- [ ] Cookie desaparece
+- [ ] Logout repetido responde 204
+- [ ] Logout sin JWT responde 204
+- [ ] Token desconocido responde 204
+- [ ] Token revocado responde 204
+- [ ] Token expirado responde 204
+- [ ] Token revocado ya no puede hacer `/refresh`
+- [ ] Frontend limpia access token
+- [ ] Frontend limpia user
+- [ ] Fallo de red limpia estado local pero propaga error
+- [ ] Logout no dispara refresh automático
+- [ ] Backend compila
+- [ ] Frontend compila
+- [ ] Lint pasa si existe
+
+---
+
+# Modelo mental completo del logout
+
+La versión corta para recordar dentro de seis meses:
+
+```text
+LOGOUT
+======
+
+Browser tiene:
+refresh token HttpOnly
+
+React tiene:
+access token
+user
+
+
+1. React llama /logout
+
+2. Browser adjunta refresh cookie
+
+3. Backend:
+   cookie
+   ↓
+   SHA-256
+   ↓
+   buscar hash
+   ↓
+   si está activo
+   RevokedAt = now
+
+4. Backend:
+   borrar cookie
+   ↓
+   204
+
+5. Frontend:
+   accessToken = null
+   user = null
+```
+
+La idea esencial:
+
+```text
+Revocar servidor
++
+Limpiar cliente
+```
+
+---
+
+# Modelo mental del ciclo completo de autenticación
+
+Después de los cuatro playbooks:
+
+```text
+REGISTRO / LOGIN
+────────────────
+credentials
+↓
+JWT1
++
+RT1 HttpOnly
++
+SHA256(RT1) en DB
+
+
+REQUEST NORMAL
+──────────────
+JWT1
+↓
+Authorization Bearer
+↓
+200
+
+
+ACCESS TOKEN EXPIRA
+───────────────────
+JWT1
+↓
+401
+↓
+Axios interceptor
+↓
+POST /refresh
+↓
+RT1 cookie
+↓
+revocar RT1
+↓
+crear RT2
+↓
+JWT2
+↓
+retry request
+
+
+LOGOUT
+──────
+POST /logout
+↓
+RT2 cookie
+↓
+SHA-256
+↓
+RevokedAt = now
+↓
+borrar cookie
+↓
+204
+↓
+limpiar JWT2 de React
+```
+
+Después:
+
+```text
+RT2
+↓
+POST /refresh
+↓
+401
+```
+
+La sesión terminó realmente.
+
+---
+
+# Qué implementar después
+
+Con logout terminado, el núcleo del ciclo de sesión ya está completo.
+
+Los siguientes temas naturales son:
+
+1. **Session bootstrap**
+
+   Al recargar la página:
+
+   ```text
+   accessToken = null
+   ↓
+   cookie quizá existe
+   ↓
+   POST /refresh
+   ↓
+   restaurar sesión
+   ```
+
+2. **Route Guards**
+
+   Diferenciar:
+
+   ```text
+   initializing
+   authenticated
+   unauthenticated
+   ```
+
+3. **Layout y logout visual**
+
+   El botón solamente debería necesitar:
+
+   ```text
+   useLogout()
+   +
+   navegación
+   ```
+
+4. **Mejoras avanzadas de sesiones**
+
+   ```text
+   sesiones por dispositivo
+   logout global
+   refresh token families
+   reuse detection
+   concurrency control backend
+   auditoría de sesiones
+   limpieza de tokens expirados
+   integration tests
+   ```
+
+---
+
+# Qué revisar la próxima vez
+
+- [ ] Por qué logout no consiste solamente en borrar el access token
+- [ ] Por qué el refresh token representa la sesión renovable
+- [ ] Por qué no necesitas una blacklist JWT en el modelo básico
+- [ ] Por qué `/logout` debe funcionar con un access token expirado
+- [ ] Qué significa que logout sea idempotente
+- [ ] Por qué cookie ausente, token desconocido y token revocado producen 204
+- [ ] Cómo localizar la sesión usando SHA-256
+- [ ] Por qué `ReplacedByTokenHash` queda `null` durante logout
+- [ ] Por qué el endpoint y `AuthService` tienen responsabilidades diferentes
+- [ ] Qué atributos son importantes al eliminar una cookie
+- [ ] Por qué React no debe leer el refresh token
+- [ ] Diferencia entre logout remoto y logout local
+- [ ] Por qué mantener `AuthContext.logout()` síncrono y local
+- [ ] Para qué sirve un hook `useLogout`
+- [ ] Qué implica usar `finally`
+- [ ] Por qué no ocultar errores de red durante logout
+- [ ] Por qué `/auth/logout` debe excluirse del refresh automático
+- [ ] Cómo probar que un refresh token revocado ya no puede renovar la sesión
+- [ ] Cómo se conecta logout con Route Guards y el layout
+
+---
+
+# Referencias útiles
+
+- [ASP.NET Core Security](https://learn.microsoft.com/aspnet/core/security/)
+- [ASP.NET Core Cookies](https://learn.microsoft.com/aspnet/core/security/authentication/cookie)
+- [ASP.NET Core Minimal APIs](https://learn.microsoft.com/aspnet/core/fundamentals/minimal-apis)
+- [System.Security.Cryptography](https://learn.microsoft.com/dotnet/api/system.security.cryptography)
+- [SHA256](https://learn.microsoft.com/dotnet/api/system.security.cryptography.sha256)
+- [EF Core Saving Data](https://learn.microsoft.com/ef/core/saving/)
+- [React useCallback](https://react.dev/reference/react/useCallback)
+- [React Context](https://react.dev/learn/passing-data-deeply-with-context)
+- [Axios Request Config](https://axios-http.com/docs/req_config)
+- [Axios Interceptors](https://axios-http.com/docs/interceptors)
+- [MDN — HTTP 204](https://developer.mozilla.org/docs/Web/HTTP/Status/204)
+- [MDN — HTTP Cookies](https://developer.mozilla.org/docs/Web/HTTP/Cookies)
+- [MDN — Set-Cookie](https://developer.mozilla.org/docs/Web/HTTP/Headers/Set-Cookie)
