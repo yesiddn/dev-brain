@@ -1,0 +1,2778 @@
+---
+title: "Cómo coordinar una sesión JWT entre múltiples pestañas sin persistir el Access Token"
+description: "Guía práctica y conceptual para sincronizar autenticación entre pestañas usando BroadcastChannel y Web Locks, manteniendo el access token únicamente en memoria y evitando refresh redundantes o carreras durante la rotación del refresh token"
+goal: "Construir una sesión multi-tab segura donde las pestañas compartan temporalmente access tokens válidos, coordinen el refresh y sincronicen login/logout sin persistir el JWT en localStorage o sessionStorage"
+tech:
+  [
+    "react",
+    "typescript",
+    "axios",
+    "jwt",
+    "broadcast-channel",
+    "web-locks",
+    "authentication",
+  ]
+tags:
+  [
+    "authentication",
+    "jwt",
+    "access-token",
+    "refresh-token",
+    "multi-tab",
+    "broadcast-channel",
+    "web-locks",
+    "axios",
+    "security",
+    "concurrency",
+  ]
+level: "intermedio"
+status: "active"
+prerequisites:
+  - "Aplicación React + TypeScript funcionando"
+  - "Login que entregue un access token JWT"
+  - "Access token almacenado únicamente en memoria"
+  - "Refresh token persistido mediante cookie HttpOnly"
+  - "Endpoint de refresh que rote el refresh token"
+  - "Cliente HTTP compartido con Axios"
+  - "Interceptor que agregue Authorization: Bearer <accessToken>"
+  - "Conocimientos básicos de JWT, React Context, useRef y Promises"
+estimatedTime: "90–120 min"
+updatedAt: 2026-08-17
+createdAt: 2026-08-17
+summary: "Patrón para coordinar sesiones JWT entre pestañas usando BroadcastChannel para compartir estado temporal y Web Locks para serializar la renovación, manteniendo el access token exclusivamente en memoria"
+related:
+  [
+    "Persistencia segura de Refresh Tokens",
+    "Emisión y rotación de Refresh Tokens",
+    "Refresh automático mediante Axios interceptor",
+    "Logout y revocación de Refresh Tokens",
+  ]
+---
+
+import { Code } from "astro:components";
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando una aplicación utiliza un **access token corto almacenado únicamente en memoria** y un **refresh token protegido mediante cookie HttpOnly**, pero necesita funcionar correctamente cuando el usuario recarga la página o abre varias pestañas del navegador.
+
+Este patrón parte de una arquitectura como esta:
+
+```text
+Access Token
+├── JWT
+├── corta duración
+├── almacenado solo en memoria
+└── enviado mediante Authorization: Bearer
+
+Refresh Token
+├── opaco
+├── larga duración
+├── cookie HttpOnly
+├── persistido en backend
+└── rotado en cada refresh
+```
+
+Esta separación es deseable porque evita persistir el access token en mecanismos accesibles permanentemente desde JavaScript como:
+
+```text
+localStorage
+sessionStorage
+IndexedDB
+```
+
+Sin embargo, almacenar el access token únicamente en memoria introduce dos comportamientos que hay que entender.
+
+### Problema 1: reload
+
+Si React tiene:
+
+```text
+accessToken = T1
+```
+
+y el usuario hace:
+
+```text
+F5
+```
+
+la memoria de JavaScript desaparece.
+
+Aunque `T1` todavía pudiera ser válido durante diez minutos, la nueva instancia de la aplicación comienza con:
+
+```text
+accessToken = null
+```
+
+El navegador conserva únicamente la cookie HttpOnly del refresh token.
+
+---
+
+### Problema 2: múltiples pestañas
+
+Cada pestaña tiene su propio proceso JavaScript y su propio estado React:
+
+```text
+TAB A                 TAB B
+
+AuthProvider           AuthProvider
+T1                     null
+```
+
+Abrir una segunda pestaña no copia automáticamente el `AuthContext` de la primera.
+
+Sin coordinación, TAB B terminaría llamando a:
+
+```http
+POST /auth/refresh
+```
+
+aunque TAB A todavía tenga un access token completamente válido.
+
+---
+
+### Problema 3: refresh concurrente
+
+Este es el problema más peligroso cuando existe **rotación de refresh tokens**.
+
+Supongamos:
+
+```text
+Refresh Token actual = R1
+```
+
+Dos pestañas detectan un access token vencido simultáneamente:
+
+```text
+TAB A                     TAB B
+
+401                       401
+ │                         │
+refresh(R1)                refresh(R1)
+```
+
+El backend recibe primero TAB A:
+
+```text
+R1
+ ↓
+revocar R1
+ ↓
+crear R2
+```
+
+Después llega TAB B todavía utilizando:
+
+```text
+R1
+```
+
+pero `R1` ya está revocado.
+
+Dependiendo de la estrategia del backend, TAB B podría recibir `401` y considerar que la sesión dejó de ser válida.
+
+Por eso **deduplicar refresh solamente dentro de una pestaña no es suficiente**.
+
+---
+
+## Objetivo final
+
+Al terminar este playbook tendrás este comportamiento:
+
+```text
+Nueva pestaña
+     │
+     ▼
+¿otra tab tiene token válido?
+     │
+ ┌───┴────┐
+ sí       no
+ │         │
+usar T1    ▼
+        Web Lock
+           │
+           ▼
+        refresh
+```
+
+Y cuando varias pestañas necesiten refresh:
+
+```text
+TAB A ─────┐
+TAB B ─────┼──► Web Lock
+TAB C ─────┘
+                │
+                ▼
+            solo una tab
+            hace refresh
+                │
+                ▼
+            nuevo token
+                │
+                ▼
+         BroadcastChannel
+          ┌─────┼─────┐
+          ▼     ▼     ▼
+          A     B     C
+```
+
+---
+
+# Decisión arquitectónica
+
+La solución utiliza dos APIs nativas del navegador:
+
+### BroadcastChannel
+
+Se utiliza para comunicación entre pestañas del mismo origen.
+
+Nos permite enviar mensajes como:
+
+```text
+REQUEST_ACCESS_TOKEN
+ACCESS_TOKEN_RESPONSE
+ACCESS_TOKEN_UPDATED
+LOGOUT
+```
+
+No convierte el access token en estado persistente.
+
+El token sigue existiendo únicamente mientras exista alguna pestaña que lo tenga en memoria.
+
+---
+
+### Web Locks
+
+Se utiliza para proteger la sección crítica:
+
+```text
+POST /auth/refresh
+```
+
+Solo una pestaña puede poseer simultáneamente el lock:
+
+```text
+ceres-auth-refresh
+```
+
+Las demás esperan.
+
+Pero **el lock por sí solo no resuelve el problema**.
+
+Después de conseguirlo, cada pestaña debe volver a comprobar si otra pestaña ya renovó el token mientras esperaba.
+
+Esta segunda comprobación es una de las reglas más importantes de todo el patrón.
+
+---
+
+# Arquitectura resultante
+
+```text
+                    AuthProvider
+                         │
+                 estado React local
+                         │
+          ┌──────────────┴──────────────┐
+          │                             │
+AuthSessionCoordinator           AuthInterceptor
+          │                             │
+  BroadcastChannel                 Axios 401
+          │                             │
+          └──────────────┬──────────────┘
+                         │
+               authSessionService
+                         │
+                     Web Lock
+                         │
+                         ▼
+                   /auth/refresh
+                         │
+                         ▼
+              cookie Refresh Token
+```
+
+Cada pieza tiene una responsabilidad diferente:
+
+```text
+AuthProvider
+→ mantiene sesión React local
+
+authChannel
+→ comunica pestañas
+
+AuthSessionCoordinator
+→ reconstruye y sincroniza la sesión
+
+authSessionService
+→ decide cómo conseguir un access token
+
+AuthInterceptor
+→ autentica requests y recupera respuestas 401
+
+authService
+→ realiza requests contra los endpoints de autenticación
+```
+
+---
+
+# Paso 1: Poder determinar si un Access Token todavía es utilizable
+
+Antes de compartir un JWT con otra pestaña necesitamos responder:
+
+> ¿Este access token todavía vale la pena utilizar?
+
+No queremos compartir un token vencido ni uno al que le quedan unos pocos segundos.
+
+Primero necesitamos poder leer el payload.
+
+```ts
+// utils/decodeJwtPayload.ts
+
+export function decodeJwtPayload<T>(token: string): T {
+  const tokenParts = token.split(".");
+
+  if (tokenParts.length !== 3) {
+    throw new Error("Invalid JWT token format");
+  }
+
+  const payload = tokenParts[1];
+
+  const normalizedPayload = payload.replace(/-/g, "+").replace(/_/g, "/");
+
+  const paddedPayload = normalizedPayload.padEnd(
+    Math.ceil(normalizedPayload.length / 4) * 4,
+    "=",
+  );
+
+  const decodedPayload = atob(paddedPayload);
+
+  return JSON.parse(decodedPayload) as T;
+}
+```
+
+El payload debe contener al menos:
+
+```ts
+export interface AuthTokenPayload {
+  UserId: string;
+  email: string;
+  exp: number;
+}
+```
+
+---
+
+## Importante: decodificar no significa validar
+
+Esta función:
+
+```ts
+decodeJwtPayload();
+```
+
+**no verifica la firma criptográfica del JWT**.
+
+El frontend solamente está leyendo:
+
+```text
+exp
+```
+
+para tomar una decisión de experiencia de usuario.
+
+La validación real sigue perteneciendo al backend:
+
+```text
+firma
+issuer
+audience
+expiration
+claims
+```
+
+Nunca debes usar esta decodificación como sustituto de la validación del servidor.
+
+---
+
+## Crear `isAccessTokenUsable`
+
+```ts
+// utils/isAccessTokenUsable.ts
+
+import type { AuthTokenPayload } from "../types/auth";
+import { decodeJwtPayload } from "./decodeJwtPayload";
+
+const TOKEN_EXPIRY_MARGIN_SECONDS = 30;
+
+export function isAccessTokenUsable(
+  accessToken: string | null | undefined,
+): accessToken is string {
+  if (!accessToken) {
+    return false;
+  }
+
+  try {
+    const payload = decodeJwtPayload<AuthTokenPayload>(accessToken);
+
+    const expiresAt = payload.exp * 1000;
+
+    const minimumExpiration = Date.now() + TOKEN_EXPIRY_MARGIN_SECONDS * 1000;
+
+    return expiresAt > minimumExpiration;
+  } catch {
+    return false;
+  }
+}
+```
+
+El margen evita compartir un token como:
+
+```text
+expira en 5 segundos
+```
+
+porque ocurriría:
+
+```text
+TAB A comparte T1
+       │
+       ▼
+TAB B recibe T1
+       │
+     5 segundos
+       │
+       ▼
+      401
+       │
+       ▼
+    refresh
+```
+
+Es mejor renovar directamente.
+
+---
+
+# Paso 2: Crear el canal de comunicación entre pestañas
+
+Crea:
+
+```text
+services/authChannel.ts
+```
+
+Primero define el protocolo.
+
+```ts
+type AuthChannelMessage =
+  | {
+      type: "REQUEST_ACCESS_TOKEN";
+      requestId: string;
+    }
+  | {
+      type: "ACCESS_TOKEN_RESPONSE";
+      requestId: string;
+      accessToken: string;
+    }
+  | {
+      type: "ACCESS_TOKEN_UPDATED";
+      accessToken: string;
+    }
+  | {
+      type: "LOGOUT";
+    };
+```
+
+Después crea el canal:
+
+```ts
+const authChannel = new BroadcastChannel("ceres-auth");
+```
+
+El nombre puede cambiar según el proyecto:
+
+```text
+myapp-auth
+finance-auth
+portal-auth
+```
+
+Lo importante es que todas las pestañas utilicen exactamente el mismo nombre.
+
+---
+
+# Paso 3: Diferenciar respuesta de token y actualización global
+
+Hay dos situaciones diferentes.
+
+### Una pestaña pregunta por un token
+
+```text
+TAB B
+ │
+ └── REQUEST_ACCESS_TOKEN
+            │
+            ▼
+          TAB A
+            │
+            └── ACCESS_TOKEN_RESPONSE
+```
+
+### Una pestaña acaba de generar un token nuevo
+
+```text
+TAB A
+refresh
+  │
+  ▼
+ T2
+  │
+  └── ACCESS_TOKEN_UPDATED
+          │
+       ┌──┴──┐
+       ▼     ▼
+       B     C
+```
+
+Por eso existen dos mensajes distintos.
+
+---
+
+## Broadcast de token nuevo
+
+```ts
+export function broadcastAccessToken(accessToken: string) {
+  authChannel.postMessage({
+    type: "ACCESS_TOKEN_UPDATED",
+    accessToken,
+  } satisfies AuthChannelMessage);
+}
+```
+
+---
+
+## Broadcast de logout
+
+```ts
+export function broadcastLogout() {
+  authChannel.postMessage({
+    type: "LOGOUT",
+  } satisfies AuthChannelMessage);
+}
+```
+
+---
+
+# Paso 4: Pedir un Access Token a otras pestañas
+
+Necesitamos una función:
+
+```ts
+requestAccessTokenFromTabs();
+```
+
+que pregunte:
+
+> ¿Existe alguna pestaña que tenga actualmente un access token?
+
+```ts
+export function requestAccessTokenFromTabs(
+  timeoutMs = 100,
+): Promise<string | null> {
+  const requestId = crypto.randomUUID();
+
+  return new Promise((resolve) => {
+    let timeoutId: number;
+
+    const handler = (event: MessageEvent<AuthChannelMessage>) => {
+      const message = event.data;
+
+      if (
+        message.type !== "ACCESS_TOKEN_RESPONSE" ||
+        message.requestId !== requestId
+      ) {
+        return;
+      }
+
+      window.clearTimeout(timeoutId);
+
+      authChannel.removeEventListener("message", handler);
+
+      resolve(message.accessToken);
+    };
+
+    authChannel.addEventListener("message", handler);
+
+    authChannel.postMessage({
+      type: "REQUEST_ACCESS_TOKEN",
+      requestId,
+    } satisfies AuthChannelMessage);
+
+    timeoutId = window.setTimeout(() => {
+      authChannel.removeEventListener("message", handler);
+
+      resolve(null);
+    }, timeoutMs);
+  });
+}
+```
+
+---
+
+## ¿Por qué necesitamos `requestId`?
+
+Podrían existir dos solicitudes simultáneas:
+
+```text
+TAB B → REQUEST id=123
+TAB C → REQUEST id=456
+```
+
+Cuando llegan respuestas, cada Promise debe reconocer cuál le pertenece:
+
+```text
+response 123 → TAB B
+response 456 → TAB C
+```
+
+Sin `requestId`, cualquier respuesta podría satisfacer cualquier request pendiente.
+
+---
+
+## ¿Por qué existe timeout?
+
+Si no existe ninguna otra pestaña:
+
+```text
+REQUEST_ACCESS_TOKEN
+        │
+        ▼
+      nadie
+```
+
+no podemos esperar indefinidamente.
+
+Después de una pequeña ventana:
+
+```text
+~100 ms
+```
+
+consideramos:
+
+```text
+sharedAccessToken = null
+```
+
+y continuamos con el mecanismo de refresh.
+
+El número exacto no es una regla de seguridad.
+
+Su objetivo es dar suficiente tiempo a otra pestaña para responder sin introducir una espera visible para el usuario.
+
+---
+
+# Paso 5: Permitir que una pestaña responda
+
+```ts
+export function respondWithAccessToken(requestId: string, accessToken: string) {
+  authChannel.postMessage({
+    type: "ACCESS_TOKEN_RESPONSE",
+    requestId,
+    accessToken,
+  } satisfies AuthChannelMessage);
+}
+```
+
+---
+
+# Paso 6: Crear un mecanismo reutilizable de suscripción
+
+```ts
+export function subscribeToAuthChannel(
+  listener: (message: AuthChannelMessage) => void,
+) {
+  const handler = (event: MessageEvent<AuthChannelMessage>) => {
+    listener(event.data);
+  };
+
+  authChannel.addEventListener("message", handler);
+
+  return () => {
+    authChannel.removeEventListener("message", handler);
+  };
+}
+```
+
+Este cleanup es importante cuando trabajas con React.
+
+El componente podrá hacer:
+
+```ts
+useEffect(() => {
+  return subscribeToAuthChannel(...);
+}, []);
+```
+
+y React eliminará el listener cuando corresponda.
+
+---
+
+# Paso 7: Crear el servicio que recupera el Access Token
+
+Ahora necesitamos centralizar una decisión:
+
+> Si necesito un access token, ¿de dónde debo obtenerlo?
+
+Crea:
+
+```text
+services/authSessionService.ts
+```
+
+Importa:
+
+```ts
+import {
+  broadcastAccessToken,
+  requestAccessTokenFromTabs,
+} from "./authChannel";
+
+import { refresh as refreshRequest } from "./authService";
+
+import { isAccessTokenUsable } from "../utils/isAccessTokenUsable";
+```
+
+Define el lock:
+
+```ts
+const AUTH_REFRESH_LOCK = "ceres-auth-refresh";
+```
+
+---
+
+# Paso 8: Recibir una función para consultar el token actual
+
+Define:
+
+```ts
+interface RecoverAccessTokenOptions {
+  getCurrentAccessToken: () => string | null;
+
+  rejectedAccessToken: string | null;
+}
+```
+
+Es importante recibir:
+
+```ts
+getCurrentAccessToken();
+```
+
+y no simplemente:
+
+```ts
+currentAccessToken;
+```
+
+porque esta operación es asíncrona.
+
+Mientras esperamos:
+
+```text
+Web Lock
+request HTTP
+otra pestaña
+```
+
+el token puede cambiar.
+
+Queremos consultar siempre el valor más reciente.
+
+---
+
+# Paso 9: Saber si un token candidato puede utilizarse
+
+```ts
+function isCandidateToken(
+  accessToken: string | null,
+  rejectedAccessToken?: string | null,
+): accessToken is string {
+  return (
+    accessToken !== rejectedAccessToken && isAccessTokenUsable(accessToken)
+  );
+}
+```
+
+El retorno:
+
+```ts
+accessToken is string
+```
+
+es un **type predicate de TypeScript**.
+
+Esto permite que:
+
+```ts
+const token: string | null = ...;
+
+if (isCandidateToken(token, rejectedToken)) {
+  return token;
+}
+```
+
+sea entendido dentro del `if` como:
+
+```ts
+token: string;
+```
+
+sin casts ni `!`.
+
+---
+
+# Paso 10: Comprobar primero el token local
+
+Comienza `recoverAccessToken`:
+
+```ts
+export async function recoverAccessToken({
+  getCurrentAccessToken,
+  rejectedAccessToken,
+}: RecoverAccessTokenOptions): Promise<string> {
+  const currentAccessToken = getCurrentAccessToken();
+
+  if (isCandidateToken(currentAccessToken, rejectedAccessToken)) {
+    return currentAccessToken;
+  }
+
+  // ...
+}
+```
+
+Antes de hacer cualquier otra operación preguntamos:
+
+```text
+¿ya tengo un token válido?
+```
+
+Si sí, terminamos inmediatamente.
+
+---
+
+# Paso 11: Preguntar a otras pestañas
+
+Continúa:
+
+```ts
+const sharedAccessToken = await requestAccessTokenFromTabs();
+
+if (isCandidateToken(sharedAccessToken, rejectedAccessToken)) {
+  return sharedAccessToken;
+}
+```
+
+Ahora tenemos:
+
+```text
+1. memoria local
+2. otras pestañas
+```
+
+Todavía no hemos llamado a:
+
+```http
+POST /auth/refresh
+```
+
+---
+
+# Paso 12: Adquirir un Web Lock antes del refresh
+
+Si nadie tiene token usable:
+
+```ts
+return navigator.locks.request(AUTH_REFRESH_LOCK, async () => {
+  // sección crítica
+});
+```
+
+Ahora solo una pestaña podrá entrar simultáneamente.
+
+Supón:
+
+```text
+TAB A
+TAB B
+TAB C
+```
+
+las tres quieren renovar.
+
+```text
+       ceres-auth-refresh
+               │
+      ┌────────┼────────┐
+      │        │        │
+      A        B        C
+      │        │        │
+    entra    espera    espera
+```
+
+---
+
+# Paso 13: LA REGLA MÁS IMPORTANTE — volver a comprobar después del lock
+
+No hagas esto:
+
+```ts
+return navigator.locks.request(AUTH_REFRESH_LOCK, async () => {
+  return refreshRequest();
+});
+```
+
+Eso solamente serializaría las requests:
+
+```text
+TAB A → refresh
+TAB B → refresh
+TAB C → refresh
+```
+
+Obtendrías:
+
+```text
+R1 → R2 → R3 → R4
+```
+
+aunque solo necesitabas una renovación.
+
+El lock evita simultaneidad, pero **no evita renovaciones secuenciales innecesarias**.
+
+Por eso debes volver a comprobar.
+
+---
+
+## Primero, estado local
+
+```ts
+const currentAfterLock = getCurrentAccessToken();
+
+if (isCandidateToken(currentAfterLock, rejectedAccessToken)) {
+  return currentAfterLock;
+}
+```
+
+---
+
+## Después, otras pestañas
+
+```ts
+const sharedAfterLock = await requestAccessTokenFromTabs(50);
+
+if (isCandidateToken(sharedAfterLock, rejectedAccessToken)) {
+  return sharedAfterLock;
+}
+```
+
+Solo después de estas comprobaciones hacemos:
+
+```ts
+const response = await refreshRequest();
+```
+
+---
+
+# Paso 14: Hacer refresh y compartir el resultado
+
+```ts
+const response = await refreshRequest();
+
+broadcastAccessToken(response.accessToken);
+
+return response.accessToken;
+```
+
+La función completa queda:
+
+```ts
+export async function recoverAccessToken({
+  getCurrentAccessToken,
+  rejectedAccessToken,
+}: RecoverAccessTokenOptions): Promise<string> {
+  const currentAccessToken = getCurrentAccessToken();
+
+  if (isCandidateToken(currentAccessToken, rejectedAccessToken)) {
+    return currentAccessToken;
+  }
+
+  const sharedAccessToken = await requestAccessTokenFromTabs();
+
+  if (isCandidateToken(sharedAccessToken, rejectedAccessToken)) {
+    return sharedAccessToken;
+  }
+
+  return navigator.locks.request(AUTH_REFRESH_LOCK, async () => {
+    const currentAfterLock = getCurrentAccessToken();
+
+    if (isCandidateToken(currentAfterLock, rejectedAccessToken)) {
+      return currentAfterLock;
+    }
+
+    const sharedAfterLock = await requestAccessTokenFromTabs(50);
+
+    if (isCandidateToken(sharedAfterLock, rejectedAccessToken)) {
+      return sharedAfterLock;
+    }
+
+    const response = await refreshRequest();
+
+    broadcastAccessToken(response.accessToken);
+
+    return response.accessToken;
+  });
+}
+```
+
+---
+
+# Paso 15: Entender por qué funciona el double-check
+
+Supón dos pestañas:
+
+```text
+TAB A                         TAB B
+
+401                           401
+ │                             │
+recover                       recover
+ │                             │
+pide lock                     pide lock
+ │                             │
+gana                          espera
+ │                             │
+refresh R1                    │
+ │                             │
+T2 + R2                       │
+ │                             │
+broadcast T2 ───────────────► T2
+ │                             │
+libera lock                   │
+                               ▼
+                          obtiene lock
+                               │
+                    getCurrentAccessToken()
+                               │
+                               ▼
+                              T2
+                               │
+                         NO refresh
+```
+
+Este patrón se conoce generalmente como:
+
+```text
+check
+ ↓
+lock
+ ↓
+check again
+ ↓
+perform work
+```
+
+La segunda comprobación es esencial porque el mundo pudo cambiar mientras estabas esperando el lock.
+
+---
+
+# Paso 16: Crear `AuthSessionCoordinator`
+
+Ahora necesitamos integrar todo esto con React.
+
+Crea:
+
+```text
+components/AuthSessionCoordinator.tsx
+```
+
+Este componente será responsable de dos cosas:
+
+1. reconstruir la sesión cuando arranca una pestaña;
+2. escuchar cambios provenientes de otras pestañas.
+
+No debe reemplazar a `AuthProvider`.
+
+---
+
+# Paso 17: Mantener una referencia actual del Access Token
+
+```tsx
+const { accessToken, login, logout } = useAuth();
+
+const accessTokenRef = useRef<string | null>(accessToken);
+```
+
+Después:
+
+```tsx
+useLayoutEffect(() => {
+  accessTokenRef.current = accessToken;
+}, [accessToken]);
+```
+
+¿Por qué existe el ref si ya tenemos state?
+
+Porque una función asíncrona puede capturar un valor viejo.
+
+Con:
+
+```ts
+accessTokenRef.current;
+```
+
+siempre podemos consultar el último token conocido.
+
+---
+
+# Paso 18: Evitar inicializaciones duplicadas
+
+Crea:
+
+```tsx
+const initializationPromiseRef = useRef<Promise<string> | null>(null);
+```
+
+Este ref guarda **la operación de inicialización**, no solamente un boolean.
+
+Esto es especialmente útil durante desarrollo con React `StrictMode`, donde los efectos son ejecutados de forma adicional para detectar errores de ciclo de vida.
+
+En lugar de:
+
+```text
+initialización 1 → refresh
+initialización 2 → refresh
+```
+
+queremos:
+
+```text
+initialización 1 ──┐
+                   ▼
+             Promise<T1>
+                   ▲
+initialización 2 ──┘
+```
+
+Las dos ejecuciones observan la misma operación.
+
+---
+
+# Paso 19: Diferenciar "no autenticado" de "todavía no lo sé"
+
+Añade:
+
+```tsx
+const [isReady, setIsReady] = useState(false);
+```
+
+Este estado **no significa autenticación**.
+
+Significa:
+
+> ¿Ya terminamos de averiguar si existe sesión?
+
+Existen tres estados:
+
+```text
+isReady = false
+→ todavía no sabemos
+
+isReady = true
+accessToken = null
+→ sabemos que no existe sesión
+
+isReady = true
+accessToken = T1
+→ sabemos que existe sesión
+```
+
+Esta distinción evita que la aplicación interprete:
+
+```text
+accessToken = null
+```
+
+como logout durante los primeros milisegundos del bootstrap.
+
+---
+
+# Paso 20: Inicializar la sesión
+
+```tsx
+useEffect(() => {
+  let active = true;
+
+  if (!initializationPromiseRef.current) {
+    initializationPromiseRef.current = recoverAccessToken({
+      getCurrentAccessToken: () => accessTokenRef.current,
+
+      rejectedAccessToken: null,
+    });
+  }
+
+  const initialization = initializationPromiseRef.current;
+
+  initialization
+    .then((recoveredAccessToken) => {
+      if (!active) {
+        return;
+      }
+
+      accessTokenRef.current = recoveredAccessToken;
+
+      login(recoveredAccessToken);
+    })
+    .catch(() => {
+      if (!active) {
+        return;
+      }
+
+      if (isAccessTokenUsable(accessTokenRef.current)) {
+        return;
+      }
+
+      accessTokenRef.current = null;
+
+      logout();
+    })
+    .finally(() => {
+      if (active) {
+        setIsReady(true);
+      }
+    });
+
+  return () => {
+    active = false;
+  };
+}, [login, logout]);
+```
+
+---
+
+## ¿Por qué comprobamos el token dentro de `catch`?
+
+Puede ocurrir esta carrera:
+
+```text
+TAB B comienza bootstrap
+ │
+ └── intenta refresh
+
+
+TAB A hace login
+ │
+ └── broadcast T1
+          │
+          ▼
+        TAB B
+          │
+          └── ya tiene T1
+
+
+pero la recuperación antigua de TAB B falla
+          │
+          ▼
+        catch()
+```
+
+Sin protección, el `catch()` podría hacer:
+
+```ts
+logout();
+```
+
+y borrar un token válido recibido mientras esperaba.
+
+Por eso comprobamos:
+
+```ts
+if (isAccessTokenUsable(accessTokenRef.current)) {
+  return;
+}
+```
+
+Si mientras tanto apareció una sesión válida, la conservamos.
+
+---
+
+# Paso 21: Escuchar mensajes de otras pestañas
+
+Añade otro `useEffect`.
+
+```tsx
+useEffect(() => {
+  return subscribeToAuthChannel((message) => {
+    // manejar mensajes
+  });
+}, [login, logout]);
+```
+
+---
+
+## REQUEST_ACCESS_TOKEN
+
+```tsx
+if (message.type === "REQUEST_ACCESS_TOKEN") {
+  const currentAccessToken = accessTokenRef.current;
+
+  if (isAccessTokenUsable(currentAccessToken)) {
+    respondWithAccessToken(message.requestId, currentAccessToken);
+  }
+
+  return;
+}
+```
+
+Una pestaña solamente comparte el token si todavía es usable.
+
+---
+
+## ACCESS_TOKEN_UPDATED
+
+```tsx
+if (message.type === "ACCESS_TOKEN_UPDATED") {
+  if (!isAccessTokenUsable(message.accessToken)) {
+    return;
+  }
+
+  accessTokenRef.current = message.accessToken;
+
+  login(message.accessToken);
+
+  return;
+}
+```
+
+Cuando otra pestaña renueva:
+
+```text
+TAB A
+T2
+ │
+ └──────────► TAB B → login(T2)
+              TAB C → login(T2)
+```
+
+---
+
+## LOGOUT
+
+```tsx
+if (message.type === "LOGOUT") {
+  accessTokenRef.current = null;
+
+  logout();
+}
+```
+
+Este `logout()` debe ser **local**.
+
+No debes volver a llamar al backend desde todas las pestañas.
+
+---
+
+# Paso 22: No renderizar la aplicación hasta terminar el bootstrap
+
+Al final del coordinador:
+
+```tsx
+if (!isReady) {
+  return null;
+}
+
+return children;
+```
+
+Entonces:
+
+```text
+App inicia
+   │
+   ▼
+AuthSessionCoordinator
+   │
+   ▼
+recuperando sesión...
+   │
+   ▼
+estado conocido
+   │
+   ▼
+render children
+```
+
+Más adelante puedes reemplazar:
+
+```tsx
+return null;
+```
+
+por una pantalla de loading.
+
+La lógica no depende de ello.
+
+---
+
+# Paso 23: Componente completo
+
+```tsx
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+
+import { useAuth } from "../hooks/useAuth";
+
+import {
+  respondWithAccessToken,
+  subscribeToAuthChannel,
+} from "../services/authChannel";
+
+import { recoverAccessToken } from "../services/authSessionService";
+
+import { isAccessTokenUsable } from "../utils/isAccessTokenUsable";
+
+interface AuthSessionCoordinatorProps {
+  children: ReactNode;
+}
+
+export function AuthSessionCoordinator({
+  children,
+}: AuthSessionCoordinatorProps) {
+  const { accessToken, login, logout } = useAuth();
+
+  const accessTokenRef = useRef<string | null>(accessToken);
+
+  const initializationPromiseRef = useRef<Promise<string> | null>(null);
+
+  const [isReady, setIsReady] = useState(false);
+
+  useLayoutEffect(() => {
+    accessTokenRef.current = accessToken;
+  }, [accessToken]);
+
+  useEffect(() => {
+    let active = true;
+
+    if (!initializationPromiseRef.current) {
+      initializationPromiseRef.current = recoverAccessToken({
+        getCurrentAccessToken: () => accessTokenRef.current,
+
+        rejectedAccessToken: null,
+      });
+    }
+
+    const initialization = initializationPromiseRef.current;
+
+    initialization
+      .then((recoveredAccessToken) => {
+        if (!active) {
+          return;
+        }
+
+        accessTokenRef.current = recoveredAccessToken;
+
+        login(recoveredAccessToken);
+      })
+      .catch(() => {
+        if (!active) {
+          return;
+        }
+
+        if (isAccessTokenUsable(accessTokenRef.current)) {
+          return;
+        }
+
+        accessTokenRef.current = null;
+
+        logout();
+      })
+      .finally(() => {
+        if (active) {
+          setIsReady(true);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [login, logout]);
+
+  useEffect(() => {
+    return subscribeToAuthChannel((message) => {
+      if (message.type === "REQUEST_ACCESS_TOKEN") {
+        const currentAccessToken = accessTokenRef.current;
+
+        if (isAccessTokenUsable(currentAccessToken)) {
+          respondWithAccessToken(message.requestId, currentAccessToken);
+        }
+
+        return;
+      }
+
+      if (message.type === "ACCESS_TOKEN_UPDATED") {
+        if (!isAccessTokenUsable(message.accessToken)) {
+          return;
+        }
+
+        accessTokenRef.current = message.accessToken;
+
+        login(message.accessToken);
+
+        return;
+      }
+
+      if (message.type === "LOGOUT") {
+        accessTokenRef.current = null;
+
+        logout();
+      }
+    });
+  }, [login, logout]);
+
+  if (!isReady) {
+    return null;
+  }
+
+  return children;
+}
+```
+
+---
+
+# Paso 24: Montar el coordinador en los providers
+
+Antes:
+
+```tsx
+<AuthProvider>
+  <AuthInterceptor />
+  {children}
+</AuthProvider>
+```
+
+Después:
+
+```tsx
+<AuthProvider>
+  <AuthSessionCoordinator>
+    <AuthInterceptor />
+
+    {children}
+  </AuthSessionCoordinator>
+</AuthProvider>
+```
+
+El orden tiene significado:
+
+```text
+AuthProvider
+     │
+     ▼
+AuthSessionCoordinator
+     │
+     ▼
+AuthInterceptor
+     │
+     ▼
+Aplicación
+```
+
+Primero existe el estado global.
+
+Después reconstruimos la sesión.
+
+Solo entonces montamos el interceptor y la aplicación.
+
+---
+
+# Paso 25: Sincronizar login entre pestañas
+
+Después de hacer login normalmente:
+
+```ts
+const response = await loginRequest(credentials);
+
+auth.login(response.accessToken);
+```
+
+añade:
+
+```ts
+broadcastAccessToken(response.accessToken);
+```
+
+Queda:
+
+```ts
+const response = await loginRequest(credentials);
+
+auth.login(response.accessToken);
+
+broadcastAccessToken(response.accessToken);
+
+navigate("/", {
+  replace: true,
+});
+```
+
+Entonces:
+
+```text
+TAB A login
+ │
+ ├── estado local = T1
+ │
+ └── broadcast T1
+          │
+     ┌────┴────┐
+     ▼         ▼
+   TAB B     TAB C
+```
+
+---
+
+## No pongas el broadcast dentro de `AuthProvider.login()`
+
+Evita esto:
+
+```ts
+function login(token) {
+  setAccessToken(token);
+
+  broadcastAccessToken(token);
+}
+```
+
+Porque cuando otra pestaña recibe el broadcast hace:
+
+```text
+receive
+ ↓
+login()
+ ↓
+broadcast
+ ↓
+otra tab
+ ↓
+login()
+ ↓
+broadcast
+```
+
+Puedes generar loops de sincronización.
+
+La regla es:
+
+```text
+login()
+→ operación local
+
+broadcastAccessToken()
+→ operación explícita cuando este contexto originó un cambio
+```
+
+---
+
+# Paso 26: Sincronizar logout
+
+La pestaña que inicia el logout debe:
+
+```text
+1. llamar al backend
+2. limpiar su estado
+3. avisar a las demás tabs
+```
+
+Por ejemplo:
+
+```ts
+export function useLogout() {
+  const { logout: clearLocalSession } = useAuth();
+
+  return useCallback(async () => {
+    try {
+      await logoutRequest();
+    } finally {
+      clearLocalSession();
+
+      broadcastLogout();
+    }
+  }, [clearLocalSession]);
+}
+```
+
+La secuencia es:
+
+```text
+TAB A
+ │
+ ├── POST /auth/logout
+ │
+ ├── clearLocalSession()
+ │
+ └── broadcast LOGOUT
+          │
+     ┌────┴────┐
+     ▼         ▼
+   TAB B     TAB C
+   logout     logout
+   local      local
+```
+
+Las otras pestañas **no vuelven a llamar**:
+
+```http
+POST /auth/logout
+```
+
+El refresh token pertenece a la sesión del navegador y ya fue revocado por la pestaña iniciadora.
+
+---
+
+# Paso 27: No confundir logout local con logout real
+
+Es útil conservar dos operaciones distintas.
+
+### `AuthProvider.logout()`
+
+```text
+limpia estado React
+```
+
+### `useLogout()`
+
+```text
+backend
++
+estado React
++
+BroadcastChannel
+```
+
+La UI debe utilizar:
+
+```ts
+useLogout();
+```
+
+no directamente:
+
+```ts
+useAuth().logout;
+```
+
+Por ejemplo:
+
+```tsx
+const { isAuthenticated } = useAuth();
+
+const logout = useLogout();
+```
+
+Y:
+
+```tsx
+<button type="button" onClick={() => void logout()}>
+  Cerrar sesión
+</button>
+```
+
+---
+
+# Paso 28: Integrar `recoverAccessToken` con el interceptor Axios
+
+El bootstrap resuelve:
+
+```text
+reload
+nueva tab
+```
+
+pero todavía necesitamos solucionar:
+
+```text
+JWT expira mientras usamos la aplicación
+```
+
+Aquí entra `AuthInterceptor`.
+
+---
+
+# Paso 29: Mantener `refreshPromise`
+
+Aunque ahora tenemos Web Locks, **no elimines `refreshPromise`**.
+
+Resuelven problemas diferentes.
+
+```text
+refreshPromise
+→ concurrencia dentro de la MISMA pestaña
+
+Web Lock
+→ concurrencia ENTRE pestañas
+```
+
+Supón una página que hace cuatro requests simultáneas:
+
+```text
+TAB A
+
+GET /accounts → 401
+GET /budget   → 401
+GET /profile  → 401
+GET /gym      → 401
+```
+
+No quieres que las cuatro creen operaciones completas de recuperación.
+
+Por eso mantenemos:
+
+```ts
+let refreshPromise: Promise<string> | null = null;
+```
+
+---
+
+# Paso 30: Saber qué token produjo realmente el 401
+
+Este detalle es fundamental.
+
+No asumas que:
+
+```ts
+accessTokenRef.current;
+```
+
+es el token que produjo la respuesta `401`.
+
+Puede ocurrir:
+
+```text
+request enviada con T1
+        │
+        ▼
+backend procesando...
+
+
+otra tab renueva
+        │
+        ▼
+BroadcastChannel → T2
+        │
+        ▼
+accessTokenRef = T2
+
+
+respuesta original
+        │
+        ▼
+401 de T1
+```
+
+Cuando llega el `401`:
+
+```text
+token rechazado = T1
+token actual    = T2
+```
+
+Por eso obtenemos el token desde el request original.
+
+```ts
+const authorizationHeader = originalRequest.headers.get("Authorization");
+
+const rejectedAccessToken =
+  typeof authorizationHeader === "string" &&
+  authorizationHeader.startsWith("Bearer ")
+    ? authorizationHeader.slice("Bearer ".length)
+    : null;
+```
+
+Ahora podemos distinguir:
+
+```text
+T1 fue rechazado
+pero T2 ya existe
+```
+
+y reutilizar T2.
+
+---
+
+# Paso 31: Reemplazar refresh directo por recuperación coordinada
+
+Antes:
+
+```ts
+refreshPromise = refreshRequest().then(({ accessToken }) => {
+  login(accessToken);
+
+  return accessToken;
+});
+```
+
+Después:
+
+```ts
+const getFreshAccessToken = (rejectedAccessToken: string | null) => {
+  if (!refreshPromise) {
+    refreshPromise = recoverAccessToken({
+      getCurrentAccessToken: () => accessTokenRef.current,
+
+      rejectedAccessToken,
+    })
+      .then((accessToken) => {
+        accessTokenRef.current = accessToken;
+
+        login(accessToken);
+
+        return accessToken;
+      })
+      .catch((error: unknown) => {
+        // manejo de error
+        throw error;
+      })
+      .finally(() => {
+        refreshPromise = null;
+      });
+  }
+
+  return refreshPromise;
+};
+```
+
+---
+
+# Paso 32: Reintentar el request original
+
+Cuando conseguimos un nuevo token:
+
+```ts
+const newAccessToken = await getFreshAccessToken(rejectedAccessToken);
+```
+
+actualizamos:
+
+```ts
+originalRequest.headers.set("Authorization", `Bearer ${newAccessToken}`);
+```
+
+y repetimos:
+
+```ts
+return apiClient(originalRequest);
+```
+
+Mantén también una protección como:
+
+```ts
+_retry;
+```
+
+para que un request original sea reintentado como máximo una vez.
+
+---
+
+# Paso 33: Diferenciar 401 de errores temporales
+
+No todos los errores de refresh significan:
+
+```text
+sesión inválida
+```
+
+Por ejemplo:
+
+```text
+network error
+timeout
+500
+```
+
+no deberían necesariamente cerrar todas las pestañas.
+
+En cambio:
+
+```text
+401 de /auth/refresh
+```
+
+sí indica que el backend no acepta la sesión renovable.
+
+Puedes hacer:
+
+```ts
+.catch((error: unknown) => {
+  if (
+    axios.isAxiosError(error) &&
+    error.response?.status === 401
+  ) {
+    accessTokenRef.current = null;
+
+    logout();
+
+    broadcastLogout();
+
+    window.location.replace(
+      "/login",
+    );
+  }
+
+  throw error;
+})
+```
+
+De esta forma no propagas un logout global por una caída temporal del servidor.
+
+---
+
+# Paso 34: Entender el comportamiento de cada escenario
+
+## Nueva pestaña con otra abierta
+
+```text
+TAB A
+T1 válido
+
+        abrir TAB B
+
+TAB B
+null
+ │
+ ▼
+REQUEST_ACCESS_TOKEN
+ │
+ ▼
+TAB A responde T1
+ │
+ ▼
+TAB B usa T1
+```
+
+Resultado:
+
+```text
+0 refresh
+```
+
+---
+
+## Reload mientras otra pestaña sigue abierta
+
+```text
+TAB A = T1
+TAB B = T1
+
+F5 TAB B
+   │
+   ▼
+TAB B pierde memoria
+   │
+   ▼
+pide token
+   │
+   ▼
+TAB A responde T1
+```
+
+Resultado:
+
+```text
+0 refresh
+```
+
+---
+
+## Reload de la única pestaña
+
+```text
+TAB A = T1
+
+F5
+ │
+ ▼
+T1 desaparece completamente
+ │
+ ▼
+nadie tiene copia
+ │
+ ▼
+refresh cookie sigue existiendo
+ │
+ ▼
+POST /auth/refresh
+ │
+ ▼
+T2
+```
+
+Resultado:
+
+```text
+1 refresh
+```
+
+**Este comportamiento es intencional.**
+
+No existe ningún lugar desde el que recuperar T1.
+
+No necesitamos persistir el access token solamente para ahorrar esta request.
+
+---
+
+## Dos pestañas reciben 401
+
+```text
+TAB A                      TAB B
+
+401 T1                     401 T1
+ │                          │
+recover                     recover
+ │                          │
+Web Lock                    Web Lock
+ │                          │
+gana                        espera
+ │                          │
+refresh                     │
+ │                          │
+T2                          │
+ │                          │
+broadcast ─────────────────►T2
+ │                          │
+release lock                │
+                            ▼
+                       obtiene lock
+                            │
+                     encuentra T2
+                            │
+                       no refresh
+```
+
+Resultado:
+
+```text
+1 refresh total
+```
+
+---
+
+## Logout
+
+```text
+TAB A
+logout
+ │
+ ├── backend
+ ├── clear local
+ └── broadcast
+        │
+   ┌────┴────┐
+   ▼         ▼
+ TAB B     TAB C
+ clear     clear
+```
+
+Resultado:
+
+```text
+1 request de logout
+todas las tabs desautenticadas
+```
+
+---
+
+# ¿Por qué no usar localStorage?
+
+Funcionalmente, guardar el access token en:
+
+```ts
+localStorage.setItem("accessToken", token);
+```
+
+resolvería:
+
+```text
+reload
++
+nueva pestaña
+```
+
+porque `localStorage` persiste y se comparte entre pestañas del mismo origen.
+
+Sin embargo, también convierte el JWT en información persistente accesible desde JavaScript.
+
+El objetivo de este diseño era mantener:
+
+```text
+access token
+→ corto
+→ temporal
+→ solamente en memoria
+```
+
+Por eso no se eligió.
+
+---
+
+# ¿Por qué no usar sessionStorage?
+
+`sessionStorage` sobrevive a reload, pero pertenece a la sesión de una pestaña.
+
+Por tanto:
+
+```text
+reload
+→ sí
+
+nueva pestaña
+→ no necesariamente
+```
+
+Además sigue siendo accesible desde JavaScript.
+
+No resuelve completamente el problema multi-tab.
+
+---
+
+# ¿Por qué no poner el Access Token en una cookie HttpOnly?
+
+Es una arquitectura válida, pero cambia el modelo.
+
+Actualmente tenemos:
+
+```http
+Authorization: Bearer <JWT>
+```
+
+Si el JWT pasa a:
+
+```text
+HttpOnly cookie
+```
+
+JavaScript no puede leerlo.
+
+Por diseño, no podrías hacer:
+
+```ts
+headers.Authorization = `Bearer ${token}`;
+```
+
+porque el frontend ya no tendría acceso al token.
+
+El navegador enviaría automáticamente la cookie.
+
+Eso obliga a revisar:
+
+```text
+backend JWT extraction
+modelo CSRF
+frontend auth state
+interceptor
+login/refresh responses
+```
+
+Era un cambio arquitectónico mucho mayor para resolver un problema que podía solucionarse manteniendo el modelo existente.
+
+---
+
+# Principio importante: compartir no significa persistir
+
+Cuando TAB A envía:
+
+```text
+T1
+```
+
+a TAB B mediante `BroadcastChannel`, ambas pestañas tienen temporalmente:
+
+```text
+T1 en memoria
+```
+
+Pero si se cierran todas las pestañas:
+
+```text
+TAB A → cerrada
+TAB B → cerrada
+```
+
+desaparece:
+
+```text
+T1
+```
+
+No queda almacenado en:
+
+```text
+localStorage
+sessionStorage
+IndexedDB
+```
+
+Al volver a abrir la aplicación:
+
+```text
+cookie refresh
+    │
+    ▼
+/auth/refresh
+    │
+    ▼
+nuevo access token
+```
+
+Ese es exactamente el comportamiento buscado.
+
+---
+
+# Estructura recomendada
+
+Una estructura final puede verse así:
+
+```text
+auth/
+│
+├── components/
+│   ├── AuthInterceptor.tsx
+│   └── AuthSessionCoordinator.tsx
+│
+├── context/
+│   └── AuthContext.ts
+│
+├── hooks/
+│   ├── useAuth.ts
+│   └── useLogout.ts
+│
+├── providers/
+│   └── AuthProvider.tsx
+│
+├── services/
+│   ├── authService.ts
+│   ├── authChannel.ts
+│   └── authSessionService.ts
+│
+├── types/
+│   └── auth.ts
+│
+└── utils/
+    ├── decodeJwtPayload.ts
+    ├── getUserFromAccessToken.ts
+    └── isAccessTokenUsable.ts
+```
+
+Las responsabilidades son:
+
+```text
+AuthProvider
+→ estado
+
+AuthSessionCoordinator
+→ ciclo de vida y sincronización
+
+AuthInterceptor
+→ HTTP
+
+authChannel
+→ mensajes cross-tab
+
+authSessionService
+→ recuperación coordinada
+
+authService
+→ endpoints
+
+utils
+→ operaciones puras sobre JWT
+```
+
+---
+
+# Orden recomendado de implementación
+
+No implementes todo simultáneamente.
+
+## Etapa 1
+
+Implementa:
+
+```text
+decodeJwtPayload
+isAccessTokenUsable
+```
+
+Comprueba:
+
+```text
+token válido     → true
+token expirado   → false
+null             → false
+token inválido   → false
+```
+
+---
+
+## Etapa 2
+
+Implementa:
+
+```text
+authChannel
+```
+
+Prueba manualmente:
+
+```text
+login TAB A
+abrir TAB B
+TAB B recibe T1
+```
+
+Todavía sin Web Locks.
+
+---
+
+## Etapa 3
+
+Implementa:
+
+```text
+authSessionService
+```
+
+con:
+
+```text
+local
+↓
+tabs
+↓
+lock
+↓
+double-check
+↓
+refresh
+```
+
+---
+
+## Etapa 4
+
+Implementa:
+
+```text
+AuthSessionCoordinator
+```
+
+Prueba:
+
+```text
+reload
+nueva tab
+sin sesión
+con sesión
+```
+
+---
+
+## Etapa 5
+
+Integra el interceptor.
+
+Mantén:
+
+```text
+refreshPromise
+_retry
+```
+
+y añade:
+
+```text
+rejectedAccessToken
+recoverAccessToken
+```
+
+---
+
+## Etapa 6
+
+Sincroniza:
+
+```text
+login
+logout
+```
+
+---
+
+# Pruebas obligatorias
+
+Antes de considerar la implementación terminada, verifica estos casos:
+
+| Escenario                          | Resultado esperado                            |
+| ---------------------------------- | --------------------------------------------- |
+| Entrar sin sesión                  | La recuperación falla y queda desautenticado  |
+| Login                              | Access token queda en memoria                 |
+| Login con otras tabs abiertas      | Todas reciben el nuevo token                  |
+| Abrir segunda tab                  | Reutiliza token existente                     |
+| Nueva tab con token válido en otra | No hace refresh                               |
+| F5 teniendo otra tab abierta       | No hace refresh                               |
+| F5 en única tab                    | Hace exactamente un refresh                   |
+| Token compartido expirado          | No se reutiliza                               |
+| Token a punto de expirar           | No se reutiliza                               |
+| Dos 401 en misma tab               | Un solo refresh                               |
+| 401 simultáneo en dos tabs         | Un solo refresh total                         |
+| Tres tabs esperan Web Lock         | Solo la primera hace refresh                  |
+| Tab esperando recibe nuevo token   | Omite su refresh                              |
+| Refresh exitoso                    | Nuevo token llega a las otras tabs            |
+| Logout desde una tab               | Todas limpian sesión                          |
+| Logout                             | Backend recibe una sola llamada               |
+| Refresh devuelve 401               | Sesión se limpia globalmente                  |
+| Refresh devuelve 500               | No convertir automáticamente en logout global |
+| React StrictMode                   | No generar inicializaciones duplicadas        |
+
+---
+
+# Errores comunes
+
+| Error                                               | Causa                                          | Solución                                           |
+| --------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------- |
+| Cada pestaña sigue haciendo refresh                 | El lock no vuelve a comprobar el token         | Hacer double-check dentro del Web Lock             |
+| Dos requests de la misma tab disparan refresh       | Se eliminó `refreshPromise`                    | Mantener deduplicación intra-tab                   |
+| Se reutiliza el token que produjo el 401            | Se consulta solamente `accessTokenRef.current` | Extraer el token del request original              |
+| Una pestaña nueva siempre hace refresh              | No existe `REQUEST_ACCESS_TOKEN`               | Consultar otras tabs antes del backend             |
+| Logout solo afecta una pestaña                      | La UI usa el logout local                      | Usar el hook de logout completo                    |
+| Logout llama al backend desde todas las tabs        | El listener ejecuta el logout remoto           | El mensaje `LOGOUT` solo debe limpiar estado local |
+| Broadcast infinito                                  | `login()` hace broadcast internamente          | Mantener login local y broadcast explícito         |
+| Token vencido se comparte                           | No se valida `exp`                             | Usar `isAccessTokenUsable()`                       |
+| La app parpadea como desautenticada al iniciar      | No existe estado de bootstrap                  | Introducir `isReady`                               |
+| StrictMode parece duplicar inicialización           | Cada efecto crea una nueva Promise             | Guardar la Promise en `useRef`                     |
+| Un bootstrap fallido borra un token recién recibido | `catch()` limpia estado sin comprobarlo        | Revisar `accessTokenRef.current` antes del logout  |
+| Web Lock serializa pero sigue haciendo N refresh    | Se asumió que lock = deduplicación             | Revalidar estado después de adquirir el lock       |
+
+---
+
+# Reglas que conviene recordar
+
+### Regla 1
+
+> **El Web Lock evita concurrencia, pero no evita trabajo redundante.**
+
+Siempre:
+
+```text
+check
+↓
+lock
+↓
+check again
+↓
+refresh
+```
+
+---
+
+### Regla 2
+
+> **`refreshPromise` y Web Locks no son reemplazos entre sí.**
+
+```text
+refreshPromise
+→ misma tab
+
+Web Locks
+→ tabs diferentes
+```
+
+---
+
+### Regla 3
+
+> **El token que produjo el 401 puede no ser el token actual.**
+
+Siempre que puedas, identifica:
+
+```text
+rejectedAccessToken
+```
+
+desde el request original.
+
+---
+
+### Regla 4
+
+> **`accessToken = null` al arrancar no significa necesariamente logout.**
+
+Puede significar:
+
+```text
+todavía no reconstruí la sesión
+```
+
+Por eso existe:
+
+```text
+isReady
+```
+
+---
+
+### Regla 5
+
+> **Un reload de la última pestaña haciendo refresh es correcto.**
+
+Si todas las copias en memoria desaparecieron, el refresh token es precisamente el mecanismo diseñado para reconstruir la sesión.
+
+No persistas el access token únicamente para evitar esa request.
+
+---
+
+### Regla 6
+
+> **Las pestañas del mismo origen representan una misma sesión de navegador.**
+
+Si comparten la misma refresh cookie, conviene que también compartan:
+
+```text
+login
+access token actualizado
+logout
+```
+
+para no mantener estados contradictorios.
+
+---
+
+# Qué revisar la próxima vez
+
+Antes de implementar este patrón en otro proyecto, confirma:
+
+- [ ] ¿El access token realmente vive solo en memoria?
+- [ ] ¿El refresh token está protegido mediante HttpOnly?
+- [ ] ¿El backend rota refresh tokens?
+- [ ] ¿El refresh endpoint puede recibir llamadas concurrentes?
+- [ ] ¿Existe un interceptor Axios compartido?
+- [ ] ¿Existe un único AuthProvider?
+- [ ] ¿Login y logout están separados entre operación local y remota?
+- [ ] ¿El JWT contiene `exp`?
+- [ ] ¿El proyecto necesita soportar varias pestañas?
+- [ ] ¿Los navegadores objetivo soportan las APIs utilizadas?
+- [ ] ¿Los errores 401, 500 y network errors tienen semánticas diferentes?
+- [ ] ¿Existe una estrategia clara de bootstrap de autenticación?
+
+---
+
+# Modelo mental final
+
+Cuando necesites reconstruir esta arquitectura de memoria, recuerda esta secuencia:
+
+```text
+                 ACCESS TOKEN NEEDED
+                         │
+                         ▼
+                ¿Tengo uno usable?
+                         │
+                   ┌─────┴─────┐
+                  sí           no
+                   │            │
+                   ▼            ▼
+                return     preguntar tabs
+                                │
+                          ┌─────┴─────┐
+                         token       nadie
+                          │            │
+                          ▼            ▼
+                       return        LOCK
+                                       │
+                                       ▼
+                              comprobar otra vez
+                                       │
+                                  ┌────┴────┐
+                                token      nada
+                                  │          │
+                                  ▼          ▼
+                               return     refresh
+                                            │
+                                            ▼
+                                      nuevo token
+                                            │
+                                            ▼
+                                        broadcast
+```
+
+Ese diagrama contiene prácticamente toda la implementación.
+
+---
+
+## Links útiles
+
+- [Broadcast Channel API — MDN](https://developer.mozilla.org/en-US/docs/Web/API/Broadcast_Channel_API)
+- [Web Locks API — MDN](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API)
+- [React StrictMode](https://react.dev/reference/react/StrictMode)
+- [Axios Interceptors](https://axios-http.com/docs/interceptors)
+
+---
+
+## Resumen de la decisión
+
+El problema original no era simplemente:
+
+> "¿Cómo hago que el access token sobreviva a un reload?"
+
+La pregunta correcta era:
+
+> "¿Cómo mantengo una sesión coherente entre pestañas sin convertir el access token en estado persistente y sin romper la rotación del refresh token?"
+
+La solución fue mantener:
+
+```text
+Access Token
+→ JWT corto
+→ memoria
+→ Authorization Bearer
+```
+
+y:
+
+```text
+Refresh Token
+→ cookie HttpOnly
+→ persistido en backend
+→ rotación
+```
+
+añadiendo una capa de coordinación:
+
+```text
+BroadcastChannel
+→ compartir estado temporal
+
+Web Locks
+→ coordinar refresh entre tabs
+
+refreshPromise
+→ coordinar refresh dentro de una tab
+
+AuthSessionCoordinator
+→ reconstruir la sesión al arrancar
+```
+
+De esta forma obtenemos una sesión que funciona correctamente con múltiples pestañas y recargas sin introducir persistencia adicional del access token ni cambiar el modelo de autenticación del backend.
