@@ -1,0 +1,1659 @@
+---
+title: "Cómo configurar CI para frontend y backend con GitHub Actions"
+description: "Guía paso a paso para configurar Continuous Integration en un monorepo con frontend Node/pnpm y backend .NET, validando automáticamente lint, dependencias y compilación en Pull Requests"
+goal: "Tener workflows independientes de GitHub Actions para frontend y backend que detecten errores antes de integrar cambios a la rama principal"
+tech: ["github-actions", "ci", "dotnet", "nodejs", "pnpm", "typescript", "vite"]
+tags:
+  [
+    "ci",
+    "github-actions",
+    "automation",
+    "frontend",
+    "backend",
+    "dotnet",
+    "pnpm",
+  ]
+level: "medio"
+status: "active"
+prerequisites:
+  - "Repositorio alojado en GitHub"
+  - "Backend .NET con una solución o proyecto que pueda restaurarse y compilarse desde CLI"
+  - "Frontend Node.js con package.json y lockfile de pnpm"
+  - "Scripts de lint y build definidos en package.json"
+  - "Flujo de trabajo basado en Pull Requests hacia una rama principal"
+estimatedTime: "45 min"
+updatedAt: 2026-08-30
+createdAt: 2026-08-30
+summary: "Configurar CI independiente para frontend y backend con GitHub Actions, entender qué hace cada etapa, validar fallos reales y decidir correctamente cómo usar los checks en los Pull Requests"
+related: []
+---
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando un repositorio tiene frontend y backend y querés que GitHub compruebe automáticamente que el código sigue siendo instalable, válido y compilable cada vez que se abre o actualiza un Pull Request.
+
+El objetivo de Continuous Integration no es desplegar la aplicación.
+
+Su primera responsabilidad es mucho más sencilla:
+
+```text
+Cambio de código
+      ↓
+Pull Request
+      ↓
+GitHub Actions
+      ↓
+Validaciones automáticas
+      ↓
+¿El código sigue siendo válido?
+```
+
+Para una primera implementación de CI normalmente alcanza con validar:
+
+### Backend
+
+```text
+restore
+↓
+build
+```
+
+### Frontend
+
+```text
+install
+↓
+lint
+↓
+build
+```
+
+No hace falta introducir desde el principio:
+
+- Docker builds.
+- Deployment.
+- SonarCloud.
+- Codecov.
+- Bases de datos temporales.
+- Tests que todavía no existen.
+- Pipelines complejos.
+
+La idea es empezar con una capa pequeña de automatización que responda una pregunta:
+
+> **¿Este cambio rompió la capacidad del proyecto de instalarse, pasar validaciones estáticas o compilarse?**
+
+Qué vas a poder hacer al terminar:
+
+- ✅ Crear workflows de GitHub Actions.
+- ✅ Ejecutar CI automáticamente desde Pull Requests.
+- ✅ Validar un backend .NET.
+- ✅ Validar un frontend Node.js + pnpm.
+- ✅ Instalar dependencias de manera reproducible.
+- ✅ Ejecutar lint automáticamente.
+- ✅ Compilar frontend y backend.
+- ✅ Entender qué es un workflow, job, step y check.
+- ✅ Probar deliberadamente que CI detecta errores.
+- ✅ Entender cuándo usar path filters.
+- ✅ Entender la relación entre CI y required checks.
+
+---
+
+## Prerequisitos
+
+Antes de crear CI, verificá que los mismos comandos que ejecutará GitHub funcionen localmente.
+
+### Backend
+
+```bash
+dotnet --version
+```
+
+Después comprobá la solución:
+
+```bash
+cd backend
+
+dotnet restore ceres.sln
+dotnet build ceres.sln --configuration Release --no-restore
+```
+
+Los nombres pueden variar según el proyecto:
+
+```text
+backend/
+└── MiProyecto.sln
+```
+
+Lo importante es identificar cuál es el comando real de compilación.
+
+---
+
+### Frontend
+
+Verificá Node y pnpm:
+
+```bash
+node --version
+pnpm --version
+```
+
+El frontend debería tener como mínimo:
+
+```text
+frontend/
+├── package.json
+└── pnpm-lock.yaml
+```
+
+Y scripts similares a:
+
+```json
+{
+  "scripts": {
+    "build": "tsc -b && vite build",
+    "lint": "oxlint"
+  }
+}
+```
+
+Probá:
+
+```bash
+cd frontend
+
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm build
+```
+
+> ⚠️ **Regla importante:** CI no debería ser el primer lugar donde descubras que los comandos básicos del proyecto no funcionan. Primero reproducilos localmente y después automatizalos.
+
+---
+
+## Paso 1: Entender qué estamos automatizando
+
+GitHub Actions trabaja principalmente con cuatro conceptos:
+
+```text
+Workflow
+  └── Job
+       └── Step
+            └── comando/action
+```
+
+### Workflow
+
+Es el proceso completo.
+
+Por ejemplo:
+
+```text
+Backend CI
+```
+
+o:
+
+```text
+Frontend CI
+```
+
+Cada workflow vive en:
+
+```text
+.github/workflows/
+```
+
+---
+
+### Job
+
+Es una unidad de trabajo que GitHub ejecuta en un runner.
+
+Ejemplo:
+
+```yaml
+jobs:
+  build:
+```
+
+Podría representar:
+
+```text
+Backend build
+```
+
+---
+
+### Step
+
+Son las operaciones individuales del job.
+
+Por ejemplo:
+
+```text
+Checkout
+Setup .NET
+Restore
+Build
+```
+
+---
+
+### Check
+
+Cuando un job se ejecuta sobre un Pull Request, GitHub muestra su resultado como un check:
+
+```text
+✓ Backend build
+✓ Frontend build
+```
+
+Si algo falla:
+
+```text
+✓ Backend build
+✗ Frontend build
+```
+
+El objetivo de CI es que esos errores sean visibles automáticamente sin depender de que el desarrollador recuerde ejecutar cada comando manualmente.
+
+---
+
+## Paso 2: Crear la carpeta de workflows
+
+Desde la raíz del repositorio:
+
+```bash
+mkdir -p .github/workflows
+```
+
+La estructura será:
+
+```text
+.github/
+└── workflows/
+    ├── backend-ci.yml
+    └── frontend-ci.yml
+```
+
+Separamos backend y frontend porque utilizan toolchains diferentes:
+
+```text
+Backend
+└── .NET
+
+Frontend
+├── Node.js
+└── pnpm
+```
+
+Además, tenerlos separados hace más sencillo:
+
+- Leerlos.
+- Depurarlos.
+- Cambiar versiones.
+- Aplicar path filters.
+- Identificar qué parte del proyecto falló.
+
+---
+
+## Paso 3: Crear el Backend CI
+
+Crear:
+
+```text
+.github/workflows/backend-ci.yml
+```
+
+Ejemplo:
+
+```yaml
+name: Backend CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+
+jobs:
+  build:
+    name: Backend build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Restore dependencies
+        run: dotnet restore ceres.sln
+
+      - name: Build
+        run: dotnet build ceres.sln --configuration Release --no-restore
+```
+
+Las versiones concretas de las actions deben revisarse cuando se reutilice este playbook en el futuro.
+
+---
+
+## Paso 4: Entender el trigger del backend
+
+El bloque:
+
+```yaml
+on:
+```
+
+define **cuándo debe ejecutarse el workflow**.
+
+### Pull Requests
+
+```yaml
+pull_request:
+  branches:
+    - main
+```
+
+Significa:
+
+> Ejecutá este workflow cuando se cree o actualice un Pull Request cuyo destino sea `main`.
+
+Por ejemplo:
+
+```text
+feature/create-routine
+        ↓
+       PR
+        ↓
+      main
+```
+
+El workflow se ejecutará sobre el código del Pull Request.
+
+---
+
+### Push a main
+
+También configuramos:
+
+```yaml
+push:
+  branches:
+    - main
+```
+
+Esto ejecuta CI después de integrar cambios.
+
+Hay dos momentos distintos:
+
+```text
+Pull Request
+↓
+validación antes del merge
+
+main
+↓
+validación del resultado integrado
+```
+
+Aunque un PR haya pasado CI, sigue siendo útil validar el commit que finalmente quedó en `main`.
+
+---
+
+## Paso 5: Usar path filters
+
+En un monorepo puede ser innecesario ejecutar backend cuando solamente cambió frontend.
+
+Podemos utilizar:
+
+```yaml
+paths:
+  - "backend/**"
+  - ".github/workflows/backend-ci.yml"
+```
+
+Entonces un cambio como:
+
+```text
+frontend/src/pages/LoginPage.tsx
+```
+
+no dispara Backend CI.
+
+Pero:
+
+```text
+backend/ceres.api/Program.cs
+```
+
+sí lo hace.
+
+También incluimos:
+
+```text
+.github/workflows/backend-ci.yml
+```
+
+porque modificar el propio workflow debe provocar una ejecución que compruebe que continúa funcionando.
+
+El equivalente para frontend será:
+
+```yaml
+paths:
+  - "frontend/**"
+  - ".github/workflows/frontend-ci.yml"
+```
+
+### Cuándo usar path filters
+
+Son útiles cuando:
+
+- Frontend y backend son independientes.
+- El repositorio es un monorepo.
+- No querés ejecutar pipelines innecesarios.
+- Los checks son informativos y no obligatorios.
+
+### Precaución
+
+Si posteriormente convertís `Backend build` y `Frontend build` en required checks globales, los path filters pueden ser problemáticos.
+
+Un PR exclusivamente frontend podría producir:
+
+```text
+Frontend build → ejecutado
+Backend build  → workflow omitido
+```
+
+Si GitHub exige ambos checks, puede quedar esperando un check que nunca se ejecutará.
+
+Por eso hay dos estrategias válidas.
+
+#### Checks informativos
+
+```text
+path filters
++
+checks no obligatorios
+```
+
+Es una combinación sencilla.
+
+#### Checks obligatorios
+
+Una opción sencilla es ejecutar ambos workflows para todos los PRs:
+
+```yaml
+on:
+  pull_request:
+    branches:
+      - main
+```
+
+sin `paths`.
+
+Así siempre existen:
+
+```text
+Backend build
+Frontend build
+```
+
+y ambos pueden convertirse en required checks.
+
+---
+
+## Paso 6: Configurar el runner
+
+Dentro del job:
+
+```yaml
+runs-on: ubuntu-latest
+```
+
+GitHub crea una máquina virtual temporal.
+
+Conceptualmente:
+
+```text
+GitHub recibe evento
+      ↓
+crea runner Linux
+      ↓
+ejecuta steps
+      ↓
+recoge resultado
+      ↓
+destruye runner
+```
+
+No hay que mantener un servidor propio.
+
+Cada ejecución empieza desde un entorno limpio.
+
+Esto es importante porque evita depender accidentalmente de configuraciones existentes en la computadora del desarrollador.
+
+---
+
+## Paso 7: Definir el working directory
+
+La solución se encuentra dentro de:
+
+```text
+backend/
+```
+
+Podríamos escribir:
+
+```yaml
+run: dotnet restore backend/ceres.sln
+```
+
+en cada step.
+
+Pero resulta más limpio definir:
+
+```yaml
+defaults:
+  run:
+    working-directory: backend
+```
+
+A partir de ahí:
+
+```yaml
+run: dotnet restore ceres.sln
+```
+
+se ejecuta como si GitHub hubiese hecho:
+
+```bash
+cd backend
+dotnet restore ceres.sln
+```
+
+Esto reduce repetición y deja claro que todo el job pertenece al backend.
+
+---
+
+## Paso 8: Checkout del repositorio
+
+El primer step normalmente será:
+
+```yaml
+- name: Checkout repository
+  uses: actions/checkout@v7
+```
+
+El runner empieza vacío.
+
+Antes de checkout:
+
+```text
+runner
+└── no existe tu repositorio
+```
+
+Después:
+
+```text
+runner
+└── repository/
+    ├── backend/
+    └── frontend/
+```
+
+`actions/checkout` descarga el commit que GitHub necesita validar.
+
+Sin este paso, comandos como:
+
+```bash
+dotnet build
+```
+
+no tendrían ningún código que compilar.
+
+---
+
+## Paso 9: Configurar .NET
+
+Agregar:
+
+```yaml
+- name: Setup .NET
+  uses: actions/setup-dotnet@v6
+  with:
+    dotnet-version: "10.0.x"
+```
+
+El objetivo es declarar explícitamente qué SDK necesita el proyecto.
+
+Si el `.csproj` contiene:
+
+```xml
+<TargetFramework>net10.0</TargetFramework>
+```
+
+el CI debe disponer de .NET 10.
+
+Usar:
+
+```yaml
+dotnet-version: "10.0.x"
+```
+
+significa:
+
+> utilizar una versión compatible de la línea 10.0.
+
+No dependemos de que `ubuntu-latest` casualmente tenga la versión correcta preinstalada.
+
+---
+
+## Paso 10: Restaurar dependencias del backend
+
+Agregar:
+
+```yaml
+- name: Restore dependencies
+  run: dotnet restore ceres.sln
+```
+
+`dotnet restore`:
+
+1. Lee los proyectos de la solución.
+2. Lee sus `PackageReference`.
+3. Resuelve paquetes NuGet.
+4. Prepara lo necesario para compilar.
+
+Separar restore de build tiene una ventaja importante: si CI falla, sabés inmediatamente en qué etapa ocurrió.
+
+```text
+Restore dependencies ✗
+```
+
+indica un problema distinto de:
+
+```text
+Restore dependencies ✓
+Build ✗
+```
+
+---
+
+## Paso 11: Compilar el backend
+
+Agregar:
+
+```yaml
+- name: Build
+  run: dotnet build ceres.sln --configuration Release --no-restore
+```
+
+### `--configuration Release`
+
+Usamos:
+
+```text
+Release
+```
+
+porque queremos validar una compilación cercana a la utilizada para producir el artefacto real.
+
+---
+
+### `--no-restore`
+
+Ya ejecutamos:
+
+```bash
+dotnet restore
+```
+
+por eso no necesitamos restaurar nuevamente.
+
+El pipeline queda explícitamente dividido:
+
+```text
+Restore
+   ↓
+Build
+```
+
+en lugar de dejar que `dotnet build` realice operaciones implícitas.
+
+---
+
+## Paso 12: No agregar tests que todavía no existen
+
+Puede parecer natural agregar:
+
+```yaml
+- name: Test
+  run: dotnet test
+```
+
+pero CI debería automatizar capacidades reales del proyecto.
+
+Si todavía no existe una suite de tests útil, no hace falta introducir un step vacío únicamente porque "los pipelines suelen tener tests".
+
+Primero:
+
+```text
+tests reales
+```
+
+Después:
+
+```text
+CI ejecuta tests
+```
+
+No al revés.
+
+Cuando existan proyectos como:
+
+```text
+Application.Tests
+IntegrationTests
+```
+
+entonces sí se puede extender el workflow:
+
+```text
+Restore
+↓
+Build
+↓
+Test
+```
+
+---
+
+## Paso 13: Probar el backend localmente
+
+Antes de hacer push:
+
+```bash
+cd backend
+
+dotnet restore ceres.sln
+dotnet build ceres.sln --configuration Release --no-restore
+```
+
+El resultado esperado:
+
+```text
+Build succeeded.
+```
+
+La idea es reproducir exactamente los comandos que ejecutará GitHub.
+
+---
+
+## Paso 14: Hacer reproducible el package manager del frontend
+
+Un frontend puede tener:
+
+```text
+package.json
+pnpm-lock.yaml
+```
+
+pero eso no necesariamente indica qué versión exacta de pnpm debería utilizarse.
+
+Para declarar el toolchain explícitamente, agregar en `package.json`:
+
+```json
+{
+  "packageManager": "pnpm@10.33.0"
+}
+```
+
+Ejemplo:
+
+```json
+{
+  "name": "my-app",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "build": "tsc -b && vite build",
+    "lint": "oxlint"
+  }
+}
+```
+
+La versión debe adaptarse a la utilizada realmente por el proyecto.
+
+### ¿Por qué pinnear pnpm?
+
+Esto:
+
+```bash
+npm install -g pnpm
+```
+
+sin versión puede instalar versiones diferentes con el tiempo.
+
+Entonces el mismo commit podría ejecutarse con:
+
+```text
+Hoy
+pnpm X
+
+Meses después
+pnpm Y
+```
+
+CI debería ser reproducible.
+
+Idealmente:
+
+```text
+mismo código
++
+mismo lockfile
++
+mismo package manager
+=
+mismo entorno de instalación
+```
+
+---
+
+## Paso 15: Crear Frontend CI
+
+Crear:
+
+```text
+.github/workflows/frontend-ci.yml
+```
+
+Ejemplo:
+
+```yaml
+name: Frontend CI
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-ci.yml"
+
+  push:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-ci.yml"
+
+jobs:
+  build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "pnpm"
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+```
+
+El flujo conceptual es:
+
+```text
+Checkout
+↓
+Setup pnpm
+↓
+Setup Node.js
+↓
+Install
+↓
+Lint
+↓
+Build
+```
+
+---
+
+## Paso 16: Elegir una versión compatible de Node.js
+
+No conviene seleccionar una versión de Node arbitrariamente.
+
+Antes de definir:
+
+```yaml
+node-version: "24"
+```
+
+revisá los requisitos de las dependencias importantes.
+
+Por ejemplo, algunas herramientas pueden declarar:
+
+```text
+^20.19.0 || >=22.12.0
+```
+
+Eso significa que una versión antigua de Node 20 podría no ser válida.
+
+La regla es:
+
+> CI debe utilizar una versión de Node compatible con las dependencias reales del proyecto.
+
+También conviene alinear CI, desarrollo local y eventualmente Docker cuando sea razonable.
+
+---
+
+## Paso 17: Configurar pnpm
+
+El step:
+
+```yaml
+- name: Setup pnpm
+  uses: pnpm/action-setup@v6
+  with:
+    version: 10.33.0
+    run_install: false
+```
+
+instala una versión concreta de pnpm.
+
+### `version`
+
+```yaml
+version: 10.33.0
+```
+
+evita depender de una versión global impredecible.
+
+---
+
+### `run_install: false`
+
+Indicamos explícitamente:
+
+> configurá pnpm, pero no instales todavía las dependencias.
+
+Esto permite mantener dos responsabilidades separadas:
+
+```text
+Setup pnpm
+↓
+Install dependencies
+```
+
+Es más sencillo de entender y depurar que esconder la instalación dentro del action.
+
+---
+
+## Paso 18: Configurar Node.js
+
+Agregar:
+
+```yaml
+- name: Setup Node.js
+  uses: actions/setup-node@v6
+  with:
+    node-version: "24"
+    cache: "pnpm"
+    cache-dependency-path: frontend/pnpm-lock.yaml
+```
+
+Esto prepara Node para el job.
+
+---
+
+## Paso 19: Entender el cache de pnpm
+
+Configuramos:
+
+```yaml
+cache: "pnpm"
+cache-dependency-path: frontend/pnpm-lock.yaml
+```
+
+El cache ayuda a reutilizar paquetes descargados previamente.
+
+Sin cache:
+
+```text
+runner nuevo
+↓
+descargar dependencias
+↓
+instalar
+```
+
+Con cache:
+
+```text
+runner nuevo
+↓
+recuperar store de pnpm
+↓
+instalar
+```
+
+Pero el cache **no reemplaza**:
+
+```bash
+pnpm install
+```
+
+Solo acelera parte del proceso.
+
+El lockfile participa en la identificación del cache porque un cambio en:
+
+```text
+pnpm-lock.yaml
+```
+
+puede significar que el conjunto de dependencias cambió.
+
+---
+
+## Paso 20: Instalar con `--frozen-lockfile`
+
+Agregar:
+
+```yaml
+- name: Install dependencies
+  run: pnpm install --frozen-lockfile
+```
+
+Esta opción es especialmente importante en CI.
+
+`--frozen-lockfile` significa:
+
+> instalá utilizando el lockfile existente y fallá si `package.json` y el lockfile no están sincronizados.
+
+Supongamos que alguien cambia:
+
+```json
+{
+  "dependencies": {
+    "example": "^2.0.0"
+  }
+}
+```
+
+pero olvida actualizar:
+
+```text
+pnpm-lock.yaml
+```
+
+CI debería fallar.
+
+Eso evita que el pipeline modifique silenciosamente el lockfile o instale un estado diferente al registrado en Git.
+
+La intención es:
+
+```text
+package.json
++
+pnpm-lock.yaml
+=
+estado coherente
+```
+
+---
+
+## Paso 21: Ejecutar lint
+
+Si `package.json` define:
+
+```json
+{
+  "scripts": {
+    "lint": "oxlint"
+  }
+}
+```
+
+CI debería llamar:
+
+```yaml
+- name: Lint
+  run: pnpm lint
+```
+
+En general es mejor ejecutar el script del proyecto:
+
+```bash
+pnpm lint
+```
+
+que invocar directamente la herramienta:
+
+```bash
+pnpm oxlint
+```
+
+¿Por qué?
+
+Porque `package.json` funciona como contrato.
+
+Hoy puede ser:
+
+```json
+"lint": "oxlint"
+```
+
+y mañana:
+
+```json
+"lint": "otra-herramienta"
+```
+
+CI sigue llamando:
+
+```bash
+pnpm lint
+```
+
+sin conocer detalles internos.
+
+---
+
+## Paso 22: Ejecutar el build del frontend
+
+Si:
+
+```json
+{
+  "scripts": {
+    "build": "tsc -b && vite build"
+  }
+}
+```
+
+entonces:
+
+```yaml
+- name: Build
+  run: pnpm build
+```
+
+valida dos cosas.
+
+### TypeScript
+
+```text
+tsc -b
+```
+
+comprueba que el proyecto pueda compilar sus tipos.
+
+Errores como:
+
+```ts
+const value: string = 123;
+```
+
+deberían hacer fallar CI.
+
+---
+
+### Vite
+
+Después:
+
+```text
+vite build
+```
+
+intenta producir el bundle de producción.
+
+El flujo completo es:
+
+```text
+TypeScript válido
+        ↓
+bundle producible
+```
+
+Por eso `pnpm build` es una validación más útil que ejecutar únicamente Vite.
+
+---
+
+## Paso 23: Probar frontend localmente
+
+Antes de push:
+
+```bash
+cd frontend
+
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm build
+```
+
+Todo debe finalizar correctamente.
+
+Esto reproduce el mismo flujo que GitHub.
+
+---
+
+## Paso 24: Crear un Pull Request para probar CI
+
+Después de crear ambos workflows:
+
+```bash
+git add .
+git commit -m "configure frontend and backend CI"
+git push
+```
+
+Abrí un Pull Request hacia:
+
+```text
+main
+```
+
+Si el PR modifica ambos workflows, ambos deberían ejecutarse.
+
+GitHub mostrará algo similar a:
+
+```text
+Backend build
+Frontend build
+```
+
+Cada uno pasará por sus respectivos steps.
+
+### Backend
+
+```text
+Checkout repository
+✓
+
+Setup .NET
+✓
+
+Restore dependencies
+✓
+
+Build
+✓
+```
+
+### Frontend
+
+```text
+Checkout repository
+✓
+
+Setup pnpm
+✓
+
+Setup Node.js
+✓
+
+Install dependencies
+✓
+
+Lint
+✓
+
+Build
+✓
+```
+
+---
+
+## Paso 25: Probar que CI realmente detecta errores
+
+Ver checks verdes no demuestra completamente que CI funciona.
+
+También conviene verificar que un error produzca un fallo.
+
+Por ejemplo, introducí temporalmente un error TypeScript:
+
+```ts
+const value: string = 123;
+```
+
+Hacé commit y push.
+
+El resultado esperado:
+
+```text
+Frontend build ✗
+```
+
+Entrando al workflow debería verse que el fallo ocurre durante:
+
+```text
+pnpm build
+```
+
+Después corregí el error:
+
+```ts
+const value: string = "123";
+```
+
+y volvé a hacer push.
+
+El check debería cambiar a:
+
+```text
+Frontend build ✓
+```
+
+Este pequeño experimento confirma todo el circuito:
+
+```text
+código inválido
+↓
+GitHub detecta cambio
+↓
+workflow inicia
+↓
+build falla
+↓
+check rojo
+```
+
+No solamente que el YAML tiene sintaxis válida.
+
+---
+
+## Paso 26: Decidir si los checks deben bloquear merges
+
+Hay dos decisiones distintas:
+
+### Tener CI
+
+```text
+PR
+↓
+GitHub ejecuta checks
+↓
+resultado visible
+```
+
+### Exigir CI
+
+```text
+PR
+↓
+checks
+↓
+si fallan → GitHub bloquea merge
+```
+
+No son lo mismo.
+
+Un proyecto personal puede perfectamente utilizar CI como feedback:
+
+```text
+✓ checks visibles
+✓ errores detectados
+✓ desarrollador decide cuándo mergear
+```
+
+sin configurar required checks.
+
+Esto puede ser razonable cuando:
+
+- Trabaja una sola persona.
+- El desarrollador revisa activamente los checks.
+- Se quiere evitar fricción innecesaria.
+- El riesgo de que otra persona ignore un CI rojo es bajo.
+
+En este caso los path filters pueden mantenerse sin problemas:
+
+```text
+frontend change
+↓
+Frontend CI
+
+backend change
+↓
+Backend CI
+```
+
+---
+
+### Cuando sí conviene usar required checks
+
+Son más valiosos cuando:
+
+- Hay varios desarrolladores.
+- Hay contribuciones externas.
+- Se quiere aplicar una política automática.
+- El repositorio necesita garantizar que nadie pueda mergear con CI rojo.
+
+En ese escenario conviene revisar cuidadosamente la interacción entre:
+
+```text
+required checks
++
+path filters
+```
+
+Una estrategia sencilla es eliminar los path filters y ejecutar todos los checks en cada PR.
+
+---
+
+## Paso 27: Mantener CI pequeño
+
+Una primera versión sana debería parecerse a:
+
+```text
+Backend CI
+├── Restore
+└── Build
+
+Frontend CI
+├── Install
+├── Lint
+└── Build
+```
+
+No hace falta convertir inmediatamente el pipeline en:
+
+```text
+Install
+Lint
+Unit tests
+Integration tests
+E2E
+Database
+Docker
+Security scan
+Coverage
+Sonar
+Deploy preview
+Deploy staging
+Deploy production
+```
+
+Cada nueva etapa debería responder a una necesidad real.
+
+Por ejemplo:
+
+```text
+Aparecen unit tests
+↓
+agregar test a CI
+```
+
+o:
+
+```text
+Se empieza a distribuir una imagen Docker
+↓
+agregar Docker build
+```
+
+CI debería evolucionar junto al proyecto.
+
+---
+
+## Errores comunes
+
+| Error                                      | Causa                                                   | Solución                                                             |
+| ------------------------------------------ | ------------------------------------------------------- | -------------------------------------------------------------------- |
+| Workflow no aparece                        | Archivo fuera de `.github/workflows` o YAML inválido    | Verificar ubicación y sintaxis                                       |
+| `dotnet: command not found`                | No se configuró .NET o se usa una versión incorrecta    | Agregar/revisar `actions/setup-dotnet`                               |
+| Backend build falla después de restore     | Error real de compilación                               | Ejecutar localmente el mismo `dotnet build`                          |
+| `pnpm: command not found`                  | pnpm no fue configurado antes de utilizarlo             | Agregar el step de setup de pnpm                                     |
+| `ERR_PNPM_OUTDATED_LOCKFILE`               | `package.json` y `pnpm-lock.yaml` están desincronizados | Ejecutar `pnpm install` localmente y commitear el lockfile           |
+| Node no soportado                          | Una dependencia requiere una versión más reciente       | Revisar `engines` y actualizar `node-version`                        |
+| Cache de pnpm no funciona                  | Ruta del lockfile incorrecta                            | Revisar `cache-dependency-path`                                      |
+| `pnpm lint` falla                          | El linter encontró problemas reales                     | Ejecutar `pnpm lint` localmente y corregirlos                        |
+| `pnpm build` falla                         | Error TypeScript o del bundler                          | Ejecutar `pnpm build` localmente                                     |
+| CI backend corre con cambios solo frontend | No hay path filters                                     | Agregarlos si los checks no son obligatorios                         |
+| Required check queda pendiente             | El workflow fue omitido por un path filter              | Eliminar filtros o rediseñar la estrategia de checks                 |
+| Workflow funciona localmente pero no en CI | El entorno local tiene configuración implícita          | Comparar versiones, variables, working directories y dependencias    |
+| `working-directory` no encuentra archivos  | La ruta está definida desde la raíz incorrecta          | Revisar estructura del repositorio                                   |
+| El mismo pipeline hace demasiadas cosas    | CI creció sin separar responsabilidades                 | Dividir workflows/jobs o eliminar pasos que todavía no aportan valor |
+
+---
+
+## Qué revisar la próxima vez
+
+Lista de puntos que conviene recordar cuando vuelvas a configurar CI:
+
+- [ ] Confirmar la versión actual de las GitHub Actions utilizadas.
+- [ ] Confirmar la versión de .NET del proyecto.
+- [ ] Confirmar la versión mínima de Node requerida por las dependencias.
+- [ ] Confirmar qué versión de pnpm generó o soporta el lockfile.
+- [ ] Declarar `packageManager` cuando se utilice pnpm.
+- [ ] Usar `pnpm install --frozen-lockfile` en CI.
+- [ ] Ejecutar scripts de `package.json` en vez de acoplar CI a herramientas concretas.
+- [ ] Separar restore y build en .NET.
+- [ ] Usar `--no-restore` después de restaurar explícitamente.
+- [ ] Probar los comandos localmente antes de crear el workflow.
+- [ ] Hacer una prueba deliberada de fallo después de configurar CI.
+- [ ] Decidir explícitamente si los checks serán informativos u obligatorios.
+- [ ] Revisar path filters antes de habilitar required checks.
+- [ ] Agregar tests solamente cuando exista una suite real.
+- [ ] Mantener el pipeline pequeño hasta que aparezca una necesidad concreta.
+
+---
+
+## Modelo mental final
+
+Pensá CI como otro desarrollador que recibe cada cambio en una computadora completamente limpia.
+
+Backend:
+
+```text
+GitHub
+  ↓
+crear runner
+  ↓
+checkout
+  ↓
+instalar .NET
+  ↓
+restore
+  ↓
+build
+  ↓
+reportar resultado
+```
+
+Frontend:
+
+```text
+GitHub
+  ↓
+crear runner
+  ↓
+checkout
+  ↓
+instalar pnpm
+  ↓
+instalar Node
+  ↓
+install --frozen-lockfile
+  ↓
+lint
+  ↓
+build
+  ↓
+reportar resultado
+```
+
+La pregunta fundamental que CI responde es:
+
+> **Si otra máquina recibe exactamente este commit desde cero, ¿puede reconstruir y validar correctamente el proyecto?**
+
+Si la respuesta es sí:
+
+```text
+✓ CI
+```
+
+Si no:
+
+```text
+✗ CI
+```
+
+Y ese feedback aparece antes de que el problema avance más lejos en el flujo de desarrollo.
+
+---
+
+## Links útiles
+
+- [GitHub Actions documentation](https://docs.github.com/en/actions)
+- [Building and testing .NET with GitHub Actions](https://docs.github.com/en/actions/tutorials/build-and-test-code/net)
+- [actions/checkout](https://github.com/actions/checkout)
+- [actions/setup-dotnet](https://github.com/actions/setup-dotnet)
+- [actions/setup-node](https://github.com/actions/setup-node)
+- [pnpm/action-setup](https://github.com/pnpm/action-setup)
+- [pnpm Continuous Integration documentation](https://pnpm.io/continuous-integration)
+- [GitHub Rulesets documentation](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets)
