@@ -1,0 +1,1721 @@
+---
+title: "Check Constraints en PostgreSQL con EF Core"
+description: "Qué es un CHECK constraint, cómo protege invariantes de datos en PostgreSQL y cómo configurarlo correctamente con Fluent API en EF Core 10"
+tech: ["dotnet", "csharp", "ef-core", "postgresql"]
+tags:
+  [
+    "database",
+    "constraints",
+    "check-constraint",
+    "ef-core",
+    "postgresql",
+    "fluent-api",
+    "data-integrity",
+  ]
+level: "medio"
+status: "active"
+updatedAt: 2026-08-30
+summary: "Un CHECK constraint es una regla de integridad aplicada por la base de datos que impide insertar o actualizar filas cuyos valores no cumplan una expresión booleana"
+related: []
+---
+
+## En una línea
+
+> Un **CHECK constraint** es una regla almacenada en la propia base de datos que obliga a que cada fila cumpla una expresión lógica antes de permitir un `INSERT` o un `UPDATE`.
+
+Ejemplo conceptual:
+
+```text
+TargetSets >= 1
+```
+
+La aplicación puede intentar guardar:
+
+```text
+TargetSets = -5
+```
+
+pero PostgreSQL rechaza la operación porque el dato viola una regla estructural del modelo.
+
+---
+
+## El problema que resuelve
+
+Supongamos esta entidad:
+
+```csharp
+public class RoutineExercise
+{
+    public Guid Id { get; set; }
+
+    public int Order { get; set; }
+
+    public int TargetSets { get; set; }
+
+    public int TargetReps { get; set; }
+
+    public int RestTimeSeconds { get; set; }
+}
+```
+
+Desde el punto de vista de C#, todas estas asignaciones son válidas:
+
+```csharp
+routineExercise.Order = -10;
+routineExercise.TargetSets = 0;
+routineExercise.TargetReps = -50;
+routineExercise.RestTimeSeconds = -30;
+```
+
+¿Por qué?
+
+Porque el tipo:
+
+```csharp
+int
+```
+
+solo dice:
+
+```text
+"este valor debe ser un número entero"
+```
+
+No dice:
+
+```text
+Order debe ser >= 1
+TargetSets debe ser >= 1
+TargetReps debe ser >= 1
+RestTimeSeconds debe ser >= 0
+```
+
+Esas son **restricciones adicionales del modelo**.
+
+Sin protección en base de datos podríamos terminar con filas como:
+
+```text
+RoutineExercises
+──────────────────────────────────────
+Order             = -3
+TargetSets        = 0
+TargetReps        = -15
+RestTimeSeconds   = -60
+```
+
+La tabla seguiría siendo técnicamente válida para PostgreSQL porque todos esos valores caben dentro de un `integer`.
+
+El problema es que serían datos inválidos para nuestro dominio.
+
+---
+
+## Qué significa realmente un constraint
+
+Una base de datos relacional no solamente almacena datos.
+
+También puede almacenar **reglas sobre qué datos son válidos**.
+
+Algunas reglas ya son muy conocidas:
+
+```text
+PRIMARY KEY
+FOREIGN KEY
+NOT NULL
+UNIQUE
+CHECK
+```
+
+Todas cumplen la misma idea general:
+
+```text
+Aplicación
+    │
+    │ intenta escribir
+    ▼
+Base de datos
+    │
+    ├── ¿cumple las restricciones?
+    │
+    ├── sí  → guardar
+    │
+    └── no  → rechazar
+```
+
+Por eso un constraint forma parte de la **integridad del esquema**, no de la interfaz de usuario.
+
+---
+
+## Qué hace específicamente un `CHECK`
+
+Un `CHECK` contiene una expresión SQL que debe evaluarse como válida para la fila.
+
+Por ejemplo:
+
+```sql
+CHECK ("TargetSets" >= 1)
+```
+
+Conceptualmente PostgreSQL hace algo parecido a:
+
+```text
+INSERT / UPDATE
+      │
+      ▼
+evaluar:
+TargetSets >= 1
+      │
+      ├── true  → aceptar
+      └── false → rechazar
+```
+
+Ejemplo válido:
+
+```text
+TargetSets = 4
+
+4 >= 1
+→ true
+→ fila aceptada
+```
+
+Ejemplo inválido:
+
+```text
+TargetSets = 0
+
+0 >= 1
+→ false
+→ operación rechazada
+```
+
+---
+
+# Ejemplo real: `RoutineExercise`
+
+En una configuración de EF Core podemos definir:
+
+```csharp
+builder.ToTable(
+    "RoutineExercises",
+    "gym",
+    tableBuilder =>
+    {
+        tableBuilder.HasCheckConstraint(
+            "CK_RoutineExercises_Order",
+            "\"Order\" >= 1");
+
+        tableBuilder.HasCheckConstraint(
+            "CK_RoutineExercises_TargetSets",
+            "\"TargetSets\" >= 1");
+
+        tableBuilder.HasCheckConstraint(
+            "CK_RoutineExercises_TargetReps",
+            "\"TargetReps\" >= 1");
+
+        tableBuilder.HasCheckConstraint(
+            "CK_RoutineExercises_RestTimeSeconds",
+            "\"RestTimeSeconds\" >= 0");
+    });
+```
+
+Esta configuración describe cuatro invariantes independientes:
+
+```text
+Order             >= 1
+TargetSets        >= 1
+TargetReps        >= 1
+RestTimeSeconds   >= 0
+```
+
+---
+
+# Cómo leer `HasCheckConstraint`
+
+Tomemos uno:
+
+```csharp
+tableBuilder.HasCheckConstraint(
+    "CK_RoutineExercises_TargetSets",
+    "\"TargetSets\" >= 1");
+```
+
+Tiene dos partes importantes.
+
+## 1. Nombre del constraint
+
+```csharp
+"CK_RoutineExercises_TargetSets"
+```
+
+Es el nombre con el que la restricción existirá en la base de datos.
+
+Una convención útil es:
+
+```text
+CK_<Table>_<Rule>
+```
+
+Por ejemplo:
+
+```text
+CK_RoutineExercises_Order
+CK_RoutineExercises_TargetSets
+CK_RoutineExercises_TargetReps
+CK_RoutineExercises_RestTimeSeconds
+```
+
+Nombrar explícitamente los constraints ayuda porque:
+
+- hace más legible la migración;
+- permite encontrarlos fácilmente en PostgreSQL;
+- hace más claros los errores;
+- facilita modificarlos o eliminarlos en el futuro;
+- documenta qué regla está protegiendo la tabla.
+
+Un nombre como:
+
+```text
+CK_RoutineExercises_TargetSets
+```
+
+dice inmediatamente:
+
+```text
+CHECK constraint
+↓
+tabla RoutineExercises
+↓
+relacionado con TargetSets
+```
+
+---
+
+## 2. Expresión SQL
+
+La segunda parte:
+
+```csharp
+"\"TargetSets\" >= 1"
+```
+
+es **SQL**, no una expresión C#.
+
+El contenido real que EF Core entrega al proveedor relacional es:
+
+```sql
+"TargetSets" >= 1
+```
+
+Es importante entender esta diferencia:
+
+```text
+C#
+────────────────────────
+routineExercise.TargetSets >= 1
+
+SQL
+────────────────────────
+"TargetSets" >= 1
+```
+
+`HasCheckConstraint` recibe la versión SQL.
+
+EF Core no recibe aquí una lambda como:
+
+```csharp
+x => x.TargetSets >= 1
+```
+
+porque la expresión del constraint pertenece al esquema relacional.
+
+---
+
+# ¿Por qué aparecen `\"`?
+
+En C#:
+
+```csharp
+"\"TargetSets\" >= 1"
+```
+
+es un string.
+
+Los caracteres:
+
+```text
+\"
+```
+
+significan:
+
+```text
+incluye una comilla doble dentro del string
+```
+
+Por tanto:
+
+```csharp
+"\"TargetSets\" >= 1"
+```
+
+representa realmente:
+
+```text
+"TargetSets" >= 1
+```
+
+y PostgreSQL recibe:
+
+```sql
+"TargetSets" >= 1
+```
+
+---
+
+## ¿Por qué PostgreSQL usa `"TargetSets"`?
+
+PostgreSQL trata los identificadores sin comillas de forma distinta a los identificadores delimitados.
+
+EF Core + Npgsql conserva nombres PascalCase como:
+
+```text
+TargetSets
+TargetReps
+RestTimeSeconds
+```
+
+mediante identificadores SQL delimitados:
+
+```sql
+"TargetSets"
+"TargetReps"
+"RestTimeSeconds"
+```
+
+Por eso la expresión debe hacer referencia al nombre real de la columna:
+
+```sql
+"TargetSets" >= 1
+```
+
+En particular, para:
+
+```text
+Order
+```
+
+es buena idea mantener el identificador explícitamente delimitado:
+
+```sql
+"Order" >= 1
+```
+
+---
+
+# SQL equivalente
+
+Aunque escribimos la configuración mediante EF Core:
+
+```csharp
+tableBuilder.HasCheckConstraint(
+    "CK_RoutineExercises_TargetSets",
+    "\"TargetSets\" >= 1");
+```
+
+la idea que terminará representada en PostgreSQL es equivalente a:
+
+```sql
+CONSTRAINT "CK_RoutineExercises_TargetSets"
+CHECK ("TargetSets" >= 1)
+```
+
+La tabla podría verse conceptualmente así:
+
+```sql
+CREATE TABLE gym."RoutineExercises"
+(
+    "Id" uuid NOT NULL,
+    "Order" integer NOT NULL,
+    "TargetSets" integer NOT NULL,
+    "TargetReps" integer NOT NULL,
+    "RestTimeSeconds" integer NOT NULL,
+
+    CONSTRAINT "CK_RoutineExercises_Order"
+        CHECK ("Order" >= 1),
+
+    CONSTRAINT "CK_RoutineExercises_TargetSets"
+        CHECK ("TargetSets" >= 1),
+
+    CONSTRAINT "CK_RoutineExercises_TargetReps"
+        CHECK ("TargetReps" >= 1),
+
+    CONSTRAINT "CK_RoutineExercises_RestTimeSeconds"
+        CHECK ("RestTimeSeconds" >= 0)
+);
+```
+
+EF Core se encarga de convertir el modelo configurado en operaciones de migración y el proveedor Npgsql genera después el SQL correspondiente para PostgreSQL.
+
+---
+
+# Qué ocurre al guardar un valor válido
+
+Supongamos:
+
+```sql
+INSERT INTO gym."RoutineExercises"
+(
+    "Id",
+    "Order",
+    "TargetSets",
+    "TargetReps",
+    "RestTimeSeconds"
+)
+VALUES
+(
+    gen_random_uuid(),
+    1,
+    4,
+    10,
+    90
+);
+```
+
+PostgreSQL evalúa:
+
+```text
+Order >= 1
+1 >= 1
+→ true
+
+TargetSets >= 1
+4 >= 1
+→ true
+
+TargetReps >= 1
+10 >= 1
+→ true
+
+RestTimeSeconds >= 0
+90 >= 0
+→ true
+```
+
+Todos los checks pasan.
+
+La fila puede almacenarse.
+
+---
+
+# Qué ocurre al guardar un valor inválido
+
+Ahora:
+
+```text
+TargetSets = 0
+```
+
+La evaluación sería:
+
+```text
+0 >= 1
+→ false
+```
+
+PostgreSQL rechaza la operación.
+
+Aunque el valor venga de:
+
+```text
+React
+API
+Service
+Repository
+EF Core
+script SQL manual
+otro backend
+importación de datos
+```
+
+la regla sigue existiendo porque está en la base de datos.
+
+Ese es uno de los mayores beneficios de un constraint.
+
+---
+
+# También se ejecuta durante `UPDATE`
+
+Un `CHECK` no protege solamente inserciones.
+
+Supongamos que ya existe:
+
+```text
+TargetSets = 4
+```
+
+y alguien ejecuta:
+
+```sql
+UPDATE gym."RoutineExercises"
+SET "TargetSets" = 0
+WHERE "Id" = ...;
+```
+
+PostgreSQL vuelve a evaluar el constraint.
+
+```text
+TargetSets = 0
+↓
+0 >= 1
+↓
+false
+↓
+UPDATE rechazado
+```
+
+Por eso el constraint protege el **estado de la tabla**, no únicamente el proceso de creación.
+
+---
+
+# Aplicación validation vs database constraint
+
+Una duda común es:
+
+> Si valido `TargetSets >= 1` en el backend, ¿para qué necesito también el CHECK?
+
+Porque ambas capas tienen responsabilidades diferentes.
+
+Podemos imaginar:
+
+```text
+Frontend validation
+        ↓
+experiencia de usuario
+
+Application validation
+        ↓
+reglas del caso de uso
+
+Database constraints
+        ↓
+integridad final de los datos
+```
+
+---
+
+## Validación de aplicación
+
+Un Service podría comprobar:
+
+```csharp
+if (targetSets < 1)
+{
+    return Result.Invalid(...);
+}
+```
+
+Eso permite responder al usuario con un error útil:
+
+```text
+Target sets must be at least 1.
+```
+
+Esta es una buena experiencia.
+
+---
+
+## Check constraint
+
+La base de datos añade:
+
+```text
+aunque la aplicación falle
+↓
+aunque exista un bug
+↓
+aunque otro proceso escriba directamente
+↓
+el dato inválido no entra
+```
+
+Por tanto, normalmente no queremos elegir:
+
+```text
+validation OR constraint
+```
+
+sino:
+
+```text
+validation AND constraint
+```
+
+cuando la regla representa una propiedad estructural que jamás debería violarse.
+
+---
+
+# La base de datos no debería ser el mecanismo normal de validación del usuario
+
+Que exista:
+
+```text
+CHECK ("TargetSets" >= 1)
+```
+
+no significa que debamos hacer esto:
+
+```text
+usuario envía TargetSets = 0
+↓
+guardar directamente
+↓
+esperar DbUpdateException
+↓
+usar la excepción SQL como validación normal
+```
+
+Eso mezcla responsabilidades.
+
+Es mejor:
+
+```text
+Request
+  ↓
+Service valida regla
+  ↓
+si es inválida:
+retorna error de aplicación
+  ↓
+si es válida:
+Repository / EF Core
+  ↓
+PostgreSQL
+  ↓
+CHECK actúa como última línea de defensa
+```
+
+El constraint protege la integridad.
+
+El Service comunica correctamente la regla al usuario.
+
+---
+
+# Invariante vs regla de caso de uso
+
+Los `CHECK` son especialmente útiles cuando la condición representa un **invariante de la fila**.
+
+Un invariante es algo que debería ser cierto siempre.
+
+En `RoutineExercise`:
+
+```text
+TargetSets >= 1
+```
+
+tiene sentido como invariante porque:
+
+```text
+no existe un RoutineExercise válido con menos de una serie objetivo
+```
+
+Igualmente:
+
+```text
+RestTimeSeconds >= 0
+```
+
+porque:
+
+```text
+un tiempo negativo no tiene significado válido
+```
+
+---
+
+## Ejemplo de regla que NO necesariamente sería un CHECK
+
+Supongamos:
+
+```text
+un usuario gratuito puede tener máximo 3 rutinas
+```
+
+Eso depende de:
+
+```text
+usuario
+plan
+cantidad de otras filas
+```
+
+No es una propiedad aislada de una fila de `Routine`.
+
+No deberíamos intentar resolverla con:
+
+```sql
+CHECK (...)
+```
+
+Ese tipo de regla pertenece normalmente a la lógica de aplicación y, dependiendo del problema, puede necesitar otra estrategia de integridad/concurrencia.
+
+---
+
+# Los CHECK pueden usar varias columnas de la misma fila
+
+No están limitados a expresiones como:
+
+```sql
+"TargetSets" >= 1
+```
+
+También pueden comparar columnas.
+
+Imagina:
+
+```text
+MinReps
+MaxReps
+```
+
+Una regla válida podría ser:
+
+```text
+MaxReps >= MinReps
+```
+
+y el constraint:
+
+```sql
+CHECK ("MaxReps" >= "MinReps")
+```
+
+EF Core:
+
+```csharp
+tableBuilder.HasCheckConstraint(
+    "CK_Exercise_MinMaxReps",
+    "\"MaxReps\" >= \"MinReps\"");
+```
+
+Esto es útil porque ambas columnas pertenecen a la misma fila.
+
+---
+
+# Un detalle crítico: `CHECK` y `NULL`
+
+En PostgreSQL un check constraint se considera satisfecho cuando su expresión produce:
+
+```text
+TRUE
+```
+
+o:
+
+```text
+NULL / UNKNOWN
+```
+
+No solamente cuando produce `TRUE`.
+
+Esto sorprende mucho al principio.
+
+Supongamos:
+
+```sql
+CHECK ("Weight" > 0)
+```
+
+pero `Weight` acepta `NULL`.
+
+Entonces:
+
+```text
+Weight = NULL
+```
+
+produce conceptualmente:
+
+```text
+NULL > 0
+→ UNKNOWN
+```
+
+y el `CHECK` no rechaza esa fila.
+
+Por eso:
+
+```text
+CHECK ("Weight" > 0)
+```
+
+NO significa automáticamente:
+
+```text
+Weight es obligatorio y debe ser positivo
+```
+
+Si quieres ambas reglas necesitas:
+
+```text
+NOT NULL
++
+CHECK ("Weight" > 0)
+```
+
+Son restricciones diferentes.
+
+---
+
+## Aplicado al ejemplo de `RoutineExercise`
+
+Tus propiedades son:
+
+```csharp
+public int Order { get; set; }
+public int TargetSets { get; set; }
+public int TargetReps { get; set; }
+public int RestTimeSeconds { get; set; }
+```
+
+Son `int` no-nullables.
+
+EF Core las mapea como columnas requeridas.
+
+Por tanto tenemos dos protecciones distintas:
+
+```text
+NOT NULL
+↓
+el valor debe existir
+
+CHECK
+↓
+el valor existente debe pertenecer al rango permitido
+```
+
+Ejemplo para `TargetSets`:
+
+```text
+NULL
+→ falla NOT NULL
+
+0
+→ pasa NOT NULL
+→ falla CHECK
+
+1
+→ pasa NOT NULL
+→ pasa CHECK
+```
+
+---
+
+# Diferencia entre los constraints principales
+
+No debemos usar `CHECK` para resolver problemas que ya tienen un constraint específico.
+
+| Necesidad | Constraint correcto |
+|---|---|
+| La columna debe tener valor | `NOT NULL` |
+| El valor debe cumplir una expresión | `CHECK` |
+| No puede haber duplicados | `UNIQUE` |
+| Identificar una fila | `PRIMARY KEY` |
+| La referencia debe apuntar a una fila existente | `FOREIGN KEY` |
+
+Ejemplo de `RoutineExercise`:
+
+```text
+Id
+→ PRIMARY KEY
+
+RoutineId
+→ FOREIGN KEY
+
+RoutineId + Order no se puede repetir
+→ UNIQUE index/constraint
+
+TargetSets >= 1
+→ CHECK
+```
+
+Cada mecanismo protege una clase diferente de invariante.
+
+---
+
+# ¿Por qué `(RoutineId, Order)` no se implementó como CHECK?
+
+La regla es:
+
+```text
+dentro de una misma rutina no pueden existir dos ejercicios con el mismo Order
+```
+
+Para comprobar eso habría que comparar una fila con **otras filas**.
+
+Un `CHECK` está diseñado para validar la fila evaluada.
+
+Por eso la solución correcta es un índice único compuesto:
+
+```csharp
+builder.HasIndex(routineExercise => new
+    {
+        routineExercise.RoutineId,
+        routineExercise.Order
+    })
+    .IsUnique();
+```
+
+Conceptualmente:
+
+```text
+(Routine A, 1) ✅
+(Routine A, 2) ✅
+(Routine B, 1) ✅
+(Routine A, 1) ❌ duplicado
+```
+
+No:
+
+```sql
+CHECK (...)
+```
+
+---
+
+# No usar CHECK para consultar otras tablas
+
+PostgreSQL no soporta de forma segura los `CHECK` que dependen de datos de otras filas o tablas.
+
+Evita pensar en reglas como:
+
+```text
+CHECK:
+ExerciseId debe pertenecer al mismo usuario de Routine
+```
+
+si para resolverla necesitas consultar:
+
+```text
+Exercises
+Routines
+Users
+```
+
+Ese ya no es el propósito de un check constraint.
+
+Para relaciones entre tablas existen herramientas como:
+
+```text
+FOREIGN KEY
+UNIQUE
+EXCLUDE
+```
+
+y para reglas de negocio más complejas suele intervenir la capa de aplicación.
+
+---
+
+# Por qué usamos un constraint separado por regla
+
+Podríamos técnicamente escribir algo como:
+
+```sql
+CHECK (
+    "Order" >= 1
+    AND "TargetSets" >= 1
+    AND "TargetReps" >= 1
+    AND "RestTimeSeconds" >= 0
+)
+```
+
+pero en este caso es preferible separar:
+
+```text
+CK_RoutineExercises_Order
+CK_RoutineExercises_TargetSets
+CK_RoutineExercises_TargetReps
+CK_RoutineExercises_RestTimeSeconds
+```
+
+¿Por qué?
+
+Porque cada constraint representa un invariante distinto.
+
+Si falla:
+
+```text
+CK_RoutineExercises_TargetReps
+```
+
+sabemos inmediatamente cuál fue la regla violada.
+
+Con un único:
+
+```text
+CK_RoutineExercises_ValidValues
+```
+
+tendríamos que inspeccionar todos los valores para saber qué ocurrió.
+
+Separarlos mejora:
+
+- diagnóstico;
+- mantenibilidad;
+- lectura del schema;
+- migraciones futuras;
+- trazabilidad de errores.
+
+---
+
+# API recomendada en EF Core 10
+
+En versiones actuales de EF Core, la forma recomendada es configurar el check sobre la tabla:
+
+```csharp
+builder.ToTable(
+    "RoutineExercises",
+    "gym",
+    tableBuilder =>
+    {
+        tableBuilder.HasCheckConstraint(
+            "CK_RoutineExercises_TargetSets",
+            "\"TargetSets\" >= 1");
+    });
+```
+
+La API antigua sobre `EntityTypeBuilder`:
+
+```csharp
+builder.HasCheckConstraint(
+    "CK_RoutineExercises_TargetSets",
+    "\"TargetSets\" >= 1");
+```
+
+está marcada como obsoleta en EF Core actual.
+
+La recomendación de EF Core es configurar el constraint mediante:
+
+```text
+ToTable(...)
+    ↓
+TableBuilder
+    ↓
+HasCheckConstraint(...)
+```
+
+Esto también tiene sentido conceptualmente:
+
+```text
+el CHECK no es comportamiento del objeto C#
+↓
+es una restricción de la tabla relacional
+```
+
+---
+
+# Por qué el `CHECK` vive en Infrastructure
+
+Si usamos una arquitectura por capas:
+
+```text
+Domain
+Application
+Infrastructure
+API
+```
+
+la expresión:
+
+```sql
+"TargetSets" >= 1
+```
+
+es un detalle relacional.
+
+El dominio no debería conocer:
+
+```text
+PostgreSQL
+SQL
+EF Core
+nombres físicos de columnas
+constraints de tabla
+```
+
+Por eso una configuración como:
+
+```csharp
+RoutineExerciseConfiguration
+```
+
+vive naturalmente en Infrastructure.
+
+Conceptualmente:
+
+```text
+Domain
+────────────────────────────
+TargetSets representa una propiedad
+
+Infrastructure
+────────────────────────────
+TargetSets se almacena como integer
+y la tabla exige TargetSets >= 1
+```
+
+La regla puede existir también conceptualmente en el dominio o Application, pero la forma:
+
+```sql
+"TargetSets" >= 1
+```
+
+es infraestructura.
+
+---
+
+# El papel de las migraciones
+
+Agregar:
+
+```csharp
+tableBuilder.HasCheckConstraint(...)
+```
+
+modifica el **modelo EF Core**.
+
+Pero todavía no modifica físicamente PostgreSQL.
+
+El flujo es:
+
+```text
+IEntityTypeConfiguration
+        ↓
+modelo EF Core
+        ↓
+generar migration
+        ↓
+migration contiene AddCheckConstraint / CreateTable
+        ↓
+database update
+        ↓
+PostgreSQL recibe el constraint
+```
+
+Por tanto:
+
+```text
+configurar constraint
+```
+
+y:
+
+```text
+tener constraint en PostgreSQL
+```
+
+no son exactamente el mismo paso.
+
+La configuración describe el modelo deseado.
+
+La migración lleva ese cambio al esquema físico.
+
+---
+
+# Cómo verificar que realmente existe en PostgreSQL
+
+Una vez aplicada la migración puedes consultar los constraints.
+
+Por ejemplo:
+
+```sql
+SELECT
+    constraint_name,
+    check_clause
+FROM information_schema.check_constraints
+WHERE constraint_schema = 'gym'
+ORDER BY constraint_name;
+```
+
+Deberías encontrar entradas similares a:
+
+```text
+CK_RoutineExercises_Order
+CK_RoutineExercises_TargetSets
+CK_RoutineExercises_TargetReps
+CK_RoutineExercises_RestTimeSeconds
+```
+
+Esto permite confirmar que la protección no existe solamente en el código de EF Core.
+
+---
+
+# Qué pasa cuando EF Core viola el constraint
+
+Supongamos:
+
+```csharp
+var routineExercise = new RoutineExercise
+{
+    Id = Guid.NewGuid(),
+    Order = 1,
+    TargetSets = 0,
+    TargetReps = 10,
+    RestTimeSeconds = 90
+};
+
+dbContext.RoutineExercises.Add(routineExercise);
+
+await dbContext.SaveChangesAsync();
+```
+
+EF Core puede construir perfectamente el `INSERT`.
+
+El objeto C# también es perfectamente válido desde el punto de vista del runtime.
+
+El problema aparece cuando PostgreSQL evalúa:
+
+```text
+TargetSets >= 1
+```
+
+y obtiene:
+
+```text
+false
+```
+
+La escritura falla y EF Core recibe un error del proveedor de base de datos que termina propagándose normalmente a través de `SaveChangesAsync`.
+
+Por eso el constraint es:
+
+```text
+última barrera de integridad
+```
+
+y no:
+
+```text
+sustituto de la validación del caso de uso
+```
+
+---
+
+# Patrón recomendado
+
+Para una regla estructural importante:
+
+```text
+TargetSets >= 1
+```
+
+una arquitectura robusta puede protegerla en varias capas:
+
+```text
+Frontend
+────────────────
+input min=1
+feedback inmediato
+
+Application
+────────────────
+validar TargetSets >= 1
+retornar error entendible
+
+Database
+────────────────
+CHECK ("TargetSets" >= 1)
+rechazar cualquier estado imposible
+```
+
+No es necesariamente duplicación inútil.
+
+Cada capa protege contra un problema diferente.
+
+---
+
+# Cuándo sí usar un CHECK
+
+Buenos candidatos:
+
+```text
+Price >= 0
+Percentage BETWEEN 0 AND 100
+StartHour < EndHour
+MinValue <= MaxValue
+Quantity > 0
+RestTimeSeconds >= 0
+TargetSets >= 1
+```
+
+Características comunes:
+
+- la condición depende de la fila actual;
+- la condición siempre debe cumplirse;
+- el dato no tiene sentido si la viola;
+- puede expresarse claramente mediante SQL;
+- quieres preservar la integridad aunque la escritura no venga de la aplicación principal.
+
+---
+
+# Cuándo NO usar un CHECK
+
+Evítalo cuando la regla depende de:
+
+### Otras filas
+
+```text
+un usuario no puede tener más de 10 rutinas
+```
+
+### Otra tabla
+
+```text
+el Exercise debe ser propiedad del mismo User de la Routine
+```
+
+### Estado externo
+
+```text
+solo permitir operaciones si Stripe dice que la suscripción está activa
+```
+
+### Reglas temporales o de workflow
+
+```text
+un WorkoutSession solo puede cerrarse después de iniciar
+```
+
+Dependiendo del diseño, esa última regla podría modelarse parcialmente con constraints, pero normalmente requiere comprender el flujo del agregado y no solo una comparación aislada de columnas.
+
+---
+
+# Error frecuente: poner absolutamente todas las reglas en la base de datos
+
+Que PostgreSQL pueda expresar algo no significa que deba convertirse automáticamente en un `CHECK`.
+
+Pregúntate:
+
+```text
+¿esta condición define qué estados de una fila son estructuralmente imposibles?
+```
+
+Si la respuesta es sí:
+
+```text
+CHECK puede ser apropiado
+```
+
+Si la respuesta es:
+
+```text
+depende del usuario, permisos, plan, workflow,
+hora actual, otra entidad o una operación concreta
+```
+
+probablemente pertenece a Application/Domain.
+
+---
+
+# Error frecuente: confiar solo en validación del frontend
+
+Esto:
+
+```html
+<input type="number" min="1" />
+```
+
+no protege la base de datos.
+
+Un cliente puede:
+
+```text
+modificar la request
+usar Postman
+usar curl
+llamar la API desde otro frontend
+ejecutar SQL
+usar otro servicio
+```
+
+El frontend controla experiencia de usuario.
+
+No controla integridad de datos.
+
+---
+
+# Error frecuente: confiar solo en el tipo
+
+Esto:
+
+```csharp
+public int TargetSets { get; set; }
+```
+
+no significa:
+
+```text
+positive integer
+```
+
+Significa únicamente:
+
+```text
+integer
+```
+
+Si el dominio requiere un subconjunto:
+
+```text
+1, 2, 3, ...
+```
+
+necesitas expresar esa regla en algún lugar.
+
+El `CHECK` permite expresarla también en la base de datos.
+
+---
+
+# Error frecuente: olvidar el comportamiento con NULL
+
+No asumas:
+
+```sql
+CHECK ("Weight" > 0)
+```
+
+equivale a:
+
+```text
+Weight requerido y positivo
+```
+
+Si `Weight` puede ser `NULL`, normalmente debes pensar por separado:
+
+```text
+¿puede faltar?
+↓
+NOT NULL / nullable
+
+si existe:
+¿qué valores son válidos?
+↓
+CHECK
+```
+
+---
+
+# Modelo mental para recordar
+
+Cuando vuelvas a este tema, piensa:
+
+```text
+TYPE
+────────────────
+¿Qué clase de dato es?
+
+int
+
+
+NULLABILITY
+────────────────
+¿Puede faltar?
+
+NOT NULL
+
+
+RELATION
+────────────────
+¿Debe apuntar a otra fila?
+
+FOREIGN KEY
+
+
+UNIQUENESS
+────────────────
+¿Puede repetirse?
+
+UNIQUE
+
+
+VALUE DOMAIN
+────────────────
+¿Qué valores concretos son permitidos?
+
+CHECK
+```
+
+Para:
+
+```text
+TargetSets
+```
+
+el razonamiento es:
+
+```text
+tipo:
+integer
+
+nullable:
+no
+
+rango válido:
+>= 1
+
+resultado:
+integer NOT NULL
++
+CHECK ("TargetSets" >= 1)
+```
+
+---
+
+# Ejemplo final completo
+
+```csharp
+using ceres.domain.Gym.Entities;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata.Builders;
+
+namespace ceres.infrastructure.persistence.Configurations.Gym;
+
+public class RoutineExerciseConfiguration
+    : IEntityTypeConfiguration<RoutineExercise>
+{
+    public void Configure(EntityTypeBuilder<RoutineExercise> builder)
+    {
+        builder.ToTable(
+            "RoutineExercises",
+            "gym",
+            tableBuilder =>
+            {
+                tableBuilder.HasCheckConstraint(
+                    "CK_RoutineExercises_Order",
+                    "\"Order\" >= 1");
+
+                tableBuilder.HasCheckConstraint(
+                    "CK_RoutineExercises_TargetSets",
+                    "\"TargetSets\" >= 1");
+
+                tableBuilder.HasCheckConstraint(
+                    "CK_RoutineExercises_TargetReps",
+                    "\"TargetReps\" >= 1");
+
+                tableBuilder.HasCheckConstraint(
+                    "CK_RoutineExercises_RestTimeSeconds",
+                    "\"RestTimeSeconds\" >= 0");
+            });
+
+        builder.HasKey(routineExercise => routineExercise.Id);
+
+        builder.HasOne(routineExercise => routineExercise.Routine)
+            .WithMany(routine => routine.Exercises)
+            .HasForeignKey(routineExercise => routineExercise.RoutineId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        builder.HasOne(routineExercise => routineExercise.Exercise)
+            .WithMany()
+            .HasForeignKey(routineExercise => routineExercise.ExerciseId)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        builder.HasIndex(routineExercise => new
+            {
+                routineExercise.RoutineId,
+                routineExercise.Order
+            })
+            .IsUnique()
+            .HasDatabaseName(
+                "IX_RoutineExercises_RoutineId_Order");
+
+        builder.HasIndex(
+                routineExercise => routineExercise.ExerciseId)
+            .HasDatabaseName(
+                "IX_RoutineExercises_ExerciseId");
+    }
+}
+```
+
+Dentro de esta configuración cada mecanismo tiene una responsabilidad distinta:
+
+```text
+HasKey
+────────────────
+identidad
+
+HasOne / HasForeignKey
+────────────────
+integridad referencial
+
+IsUnique
+────────────────
+unicidad entre filas
+
+HasCheckConstraint
+────────────────
+validez de valores de la fila
+```
+
+No son alternativas entre sí.
+
+Se complementan para describir qué estados de la tabla son válidos.
+
+---
+
+## Cuándo NO usarlo
+
+- Para reemplazar la validación amigable de Application.
+- Para reglas que dependen de permisos o del usuario autenticado.
+- Para reglas que consultan otras tablas.
+- Para limitar cantidades de filas.
+- Para lógica que depende de servicios externos.
+- Para workflows complejos que no pueden describirse como un invariante estable de la fila.
+- Cuando existe un constraint relacional más específico como `FOREIGN KEY`, `UNIQUE` o `NOT NULL`.
+
+---
+
+## Regla práctica
+
+Antes de crear un `CHECK`, pregunta:
+
+> **¿Sería siempre incorrecto que esta fila existiera con ese valor, sin importar quién la creó ni desde qué flujo llegó?**
+
+Si la respuesta es sí, probablemente estás frente a un buen candidato para un `CHECK`.
+
+En el ejemplo:
+
+```text
+RoutineExercise con TargetSets = -5
+```
+
+es inválido independientemente de:
+
+```text
+qué endpoint lo creó
+qué usuario hizo la petición
+qué frontend se utilizó
+qué repository guardó la entidad
+```
+
+Por eso:
+
+```sql
+CHECK ("TargetSets" >= 1)
+```
+
+es una protección adecuada.
+
+---
+
+## Referencias
+
+- Microsoft Learn — EF Core: Indexes and check constraints  
+  https://learn.microsoft.com/en-us/ef/core/modeling/indexes
+
+- Microsoft Learn — `TableBuilder.HasCheckConstraint` (EF Core 10)  
+  https://learn.microsoft.com/en-us/dotnet/api/microsoft.entityframeworkcore.metadata.builders.tablebuilder.hascheckconstraint?view=efcore-10.0
+
+- Microsoft Learn — API antigua `EntityTypeBuilder.HasCheckConstraint` y recomendación de usar `ToTable(...)`  
+  https://learn.microsoft.com/en-us/dotnet/api/microsoft.entityframeworkcore.relationalentitytypebuilderextensions.hascheckconstraint?view=efcore-10.0
+
+- PostgreSQL — Constraints / Check Constraints  
+  https://www.postgresql.org/docs/current/ddl-constraints.html
