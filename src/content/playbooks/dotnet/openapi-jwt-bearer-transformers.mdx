@@ -1,0 +1,1275 @@
+---
+title: "Cómo documentar autenticación JWT Bearer con OpenAPI Transformers en .NET 10"
+description: "Guía práctica para declarar JWT Bearer en OpenAPI y marcar únicamente los endpoints protegidos para que herramientas como Scalar representen correctamente la autenticación"
+goal: "Configurar OpenAPI para que conozca el esquema JWT Bearer y detecte automáticamente qué Minimal API endpoints requieren autenticación"
+tech: ["dotnet-10", "aspnet-core", "minimal-api", "openapi", "scalar", "jwt"]
+tags:
+  [
+    "openapi",
+    "jwt",
+    "bearer",
+    "authentication",
+    "minimal-api",
+    "scalar",
+    "transformers",
+  ]
+level: "medio"
+status: "active"
+prerequisites:
+  - ".NET 10 SDK instalado"
+  - "Proyecto ASP.NET Core Minimal API"
+  - "Microsoft.AspNetCore.OpenApi configurado"
+  - "Autenticación JWT Bearer funcionando en runtime"
+  - "Conocer la diferencia básica entre autenticación y autorización"
+estimatedTime: "20 min"
+updatedAt: 2026-09-05
+createdAt: 2026-09-05
+summary: "Configurar un Document Transformer para declarar JWT Bearer y un Operation Transformer para aplicar ese esquema únicamente a los endpoints protegidos"
+related: ["Ceres PR #51 — Add Exercise CRUD Minimal API endpoints"]
+---
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando una API ASP.NET Core ya utiliza JWT Bearer para proteger endpoints, pero la documentación OpenAPI no representa correctamente la autenticación en herramientas como Scalar.
+
+Configurar autenticación en ASP.NET Core y documentarla en OpenAPI son dos responsabilidades diferentes.
+
+Una aplicación puede estar correctamente protegida en runtime:
+
+```csharp
+builder.Services
+    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer();
+
+builder.Services.AddAuthorization();
+```
+
+y tener endpoints como:
+
+```csharp
+app.MapGet("/profile", ...)
+    .RequireAuthorization();
+```
+
+pero eso no significa necesariamente que el documento OpenAPI incluya todo lo necesario para representar:
+
+```text
+Este endpoint requiere:
+
+Authorization: Bearer <token>
+```
+
+Herramientas como Scalar consumen principalmente el **documento OpenAPI**.
+
+Por eso conviene pensar el problema en tres capas:
+
+```text
+ASP.NET Core runtime
+        │
+        │ Authentication / Authorization
+        ▼
+Endpoints protegidos
+        │
+        │ Metadata
+        ▼
+OpenAPI
+        │
+        │ Security Scheme + Security Requirements
+        ▼
+Scalar
+```
+
+Qué vas a poder hacer al terminar:
+
+- ✅ Declarar JWT Bearer dentro de `components.securitySchemes`.
+- ✅ Marcar únicamente endpoints protegidos con `security`.
+- ✅ Respetar endpoints con `AllowAnonymous`.
+- ✅ Hacer que Scalar represente correctamente la autenticación.
+- ✅ Entender cuándo usar un Document Transformer y cuándo un Operation Transformer.
+- ✅ Evitar aplicar autenticación accidentalmente a toda la API.
+
+---
+
+## Prerequisitos
+
+Verificá que el proyecto utilice .NET 10:
+
+```bash
+dotnet --version
+```
+
+Y que tenga configurado OpenAPI:
+
+```csharp
+builder.Services.AddOpenApi();
+```
+
+junto con JWT Bearer:
+
+```csharp
+builder.Services
+    .AddAuthentication(
+        JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer();
+
+builder.Services.AddAuthorization();
+```
+
+El pipeline debe ejecutar:
+
+```csharp
+app.UseAuthentication();
+app.UseAuthorization();
+```
+
+Y los endpoints privados deben declarar autorización:
+
+```csharp
+app.MapGet("/private", ...)
+    .RequireAuthorization();
+```
+
+> ⚠️ **Importante:** los Transformers que veremos aquí no protegen la API.  
+> Solo modifican su **documentación OpenAPI**.
+>
+> La seguridad real sigue dependiendo de `AddAuthentication`, `AddAuthorization`, `UseAuthentication`, `UseAuthorization` y `RequireAuthorization`.
+
+---
+
+## Concepto clave: Security Scheme vs Security Requirement
+
+Este es el concepto más importante de todo el playbook.
+
+OpenAPI separa dos preguntas distintas.
+
+### 1. ¿Qué mecanismo de autenticación existe?
+
+Esto se representa mediante un **Security Scheme**.
+
+Por ejemplo:
+
+```yaml
+components:
+  securitySchemes:
+    Bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+```
+
+Esto significa:
+
+> La API conoce un mecanismo llamado `Bearer` que utiliza HTTP Bearer tokens.
+
+Pero todavía no indica qué endpoint lo necesita.
+
+---
+
+### 2. ¿Qué operación requiere ese mecanismo?
+
+Eso se representa mediante un **Security Requirement**:
+
+```yaml
+paths:
+  /api/exercises:
+    get:
+      security:
+        - Bearer: []
+```
+
+Esto significa:
+
+> `GET /api/exercises` requiere el esquema Bearer declarado anteriormente.
+
+Por eso necesitamos dos piezas:
+
+```text
+BearerSecuritySchemeTransformer
+            │
+            ▼
+Define QUÉ es Bearer
+components.securitySchemes
+
+
+BearerSecurityRequirementTransformer
+            │
+            ▼
+Define DÓNDE se requiere Bearer
+operation.security
+```
+
+Intentar resolver ambos conceptos como si fueran uno solo suele producir documentación incorrecta.
+
+---
+
+## Paso 1: Crear el Document Transformer
+
+Crea:
+
+```text
+OpenApi/
+└── BearerSecuritySchemeTransformer.cs
+```
+
+El propósito de este transformer es modificar el **documento completo de OpenAPI**.
+
+Implementa:
+
+```csharp
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.OpenApi;
+using Microsoft.OpenApi;
+
+namespace MyProject.Api.OpenApi;
+
+public sealed class BearerSecuritySchemeTransformer(
+    IAuthenticationSchemeProvider authenticationSchemeProvider)
+    : IOpenApiDocumentTransformer
+{
+    public async Task TransformAsync(
+        OpenApiDocument document,
+        OpenApiDocumentTransformerContext context,
+        CancellationToken cancellationToken)
+    {
+        var authenticationSchemes =
+            await authenticationSchemeProvider
+                .GetAllSchemesAsync();
+
+        if (authenticationSchemes.All(
+                scheme => scheme.Name != "Bearer"))
+        {
+            return;
+        }
+
+        document.Components ??=
+            new OpenApiComponents();
+
+        document.Components.SecuritySchemes ??=
+            new Dictionary<
+                string,
+                IOpenApiSecurityScheme>();
+
+        document.Components.SecuritySchemes["Bearer"] =
+            new OpenApiSecurityScheme
+            {
+                Type = SecuritySchemeType.Http,
+                Scheme = "bearer",
+                BearerFormat = "JWT",
+                In = ParameterLocation.Header,
+                Description =
+                    "Enter the JWT access token."
+            };
+    }
+}
+```
+
+---
+
+## ¿Por qué usar `IAuthenticationSchemeProvider`?
+
+Podríamos simplemente registrar Bearer siempre:
+
+```csharp
+document.Components.SecuritySchemes["Bearer"] = ...
+```
+
+pero eso haría que OpenAPI afirmara que existe JWT Bearer incluso si la aplicación no lo tiene configurado.
+
+En cambio:
+
+```csharp
+IAuthenticationSchemeProvider
+```
+
+permite consultar los esquemas realmente registrados en ASP.NET Core.
+
+Primero obtenemos:
+
+```csharp
+var authenticationSchemes =
+    await authenticationSchemeProvider
+        .GetAllSchemesAsync();
+```
+
+Y verificamos:
+
+```csharp
+if (authenticationSchemes.All(
+        scheme => scheme.Name != "Bearer"))
+{
+    return;
+}
+```
+
+Esto mantiene alineados:
+
+```text
+Configuración real de ASP.NET Core
+               │
+               ▼
+Documento OpenAPI
+```
+
+---
+
+## ¿Qué modifica este transformer?
+
+Esta parte:
+
+```csharp
+document.Components ??=
+    new OpenApiComponents();
+```
+
+garantiza que exista la sección:
+
+```yaml
+components:
+```
+
+Después:
+
+```csharp
+document.Components.SecuritySchemes ??=
+    new Dictionary<
+        string,
+        IOpenApiSecurityScheme>();
+```
+
+garantiza:
+
+```yaml
+components:
+  securitySchemes:
+```
+
+Finalmente:
+
+```csharp
+document.Components.SecuritySchemes["Bearer"] =
+    new OpenApiSecurityScheme
+    {
+        Type = SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = ParameterLocation.Header
+    };
+```
+
+produce conceptualmente:
+
+```yaml
+components:
+  securitySchemes:
+    Bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      in: header
+```
+
+Scalar ahora sabe que existe un mecanismo Bearer.
+
+Pero todavía no sabe qué operaciones lo requieren.
+
+---
+
+## Paso 2: Crear el Operation Transformer
+
+Crea:
+
+```text
+OpenApi/
+└── BearerSecurityRequirementTransformer.cs
+```
+
+Implementa:
+
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.OpenApi;
+using Microsoft.OpenApi;
+
+namespace MyProject.Api.OpenApi;
+
+public sealed class BearerSecurityRequirementTransformer
+    : IOpenApiOperationTransformer
+{
+    public Task TransformAsync(
+        OpenApiOperation operation,
+        OpenApiOperationTransformerContext context,
+        CancellationToken cancellationToken)
+    {
+        var metadata =
+            context.Description
+                .ActionDescriptor
+                .EndpointMetadata;
+
+        var requiresAuthorization =
+            metadata
+                .OfType<IAuthorizeData>()
+                .Any();
+
+        var allowsAnonymous =
+            metadata
+                .OfType<IAllowAnonymous>()
+                .Any();
+
+        if (!requiresAuthorization ||
+            allowsAnonymous)
+        {
+            return Task.CompletedTask;
+        }
+
+        operation.Security ??= [];
+
+        operation.Security.Add(
+            new OpenApiSecurityRequirement
+            {
+                [new OpenApiSecuritySchemeReference(
+                    "Bearer",
+                    context.Document)] = []
+            });
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+Este transformer trabaja a nivel de **operación individual**.
+
+En OpenAPI, una operación es esencialmente la combinación de:
+
+```text
+HTTP Method + Path
+```
+
+Por ejemplo:
+
+```text
+GET /api/exercises
+POST /api/exercises
+DELETE /api/exercises/{id}
+```
+
+Cada una es una operación distinta.
+
+---
+
+## Paso 3: Leer la metadata del endpoint
+
+ASP.NET Core guarda información sobre cada endpoint en su metadata.
+
+La obtenemos mediante:
+
+```csharp
+var metadata =
+    context.Description
+        .ActionDescriptor
+        .EndpointMetadata;
+```
+
+Ahí pueden aparecer elementos relacionados con:
+
+```text
+RequireAuthorization()
+AllowAnonymous()
+policies
+roles
+filters
+otros atributos/configuraciones
+```
+
+Esto permite generar OpenAPI basándonos en la configuración **real del endpoint**, en lugar de mantener manualmente una segunda lista de rutas privadas.
+
+---
+
+## Paso 4: Detectar `RequireAuthorization`
+
+Se comprueba:
+
+```csharp
+var requiresAuthorization =
+    metadata
+        .OfType<IAuthorizeData>()
+        .Any();
+```
+
+`RequireAuthorization()` termina incorporando metadata de autorización al endpoint.
+
+Por ejemplo:
+
+```csharp
+var exercises = api
+    .MapGroup("/exercises")
+    .RequireAuthorization();
+```
+
+Los endpoints dentro de ese grupo heredan esa metadata.
+
+Por eso no necesitamos escribir manualmente:
+
+```csharp
+if (path.StartsWith("/api/exercises"))
+```
+
+Eso sería frágil.
+
+La fuente de verdad sigue siendo:
+
+```csharp
+.RequireAuthorization()
+```
+
+---
+
+## Paso 5: Respetar `AllowAnonymous`
+
+También comprobamos:
+
+```csharp
+var allowsAnonymous =
+    metadata
+        .OfType<IAllowAnonymous>()
+        .Any();
+```
+
+Esto es necesario porque una aplicación puede tener un grupo protegido y excepciones públicas.
+
+Por ejemplo:
+
+```csharp
+var auth = api
+    .MapGroup("/auth")
+    .RequireAuthorization();
+
+auth.MapPost("/logout", LogoutAsync);
+
+auth.MapPost("/login", LoginAsync)
+    .AllowAnonymous();
+```
+
+Aunque exista metadata de autorización heredada, `AllowAnonymous()` indica explícitamente que esa operación no requiere autenticación.
+
+Por eso la condición debe considerar ambos casos:
+
+```csharp
+if (!requiresAuthorization ||
+    allowsAnonymous)
+{
+    return Task.CompletedTask;
+}
+```
+
+La regla queda:
+
+```text
+¿Tiene autorización?
+        │
+        ├── No ───────────────► no agregar Bearer
+        │
+        ▼
+       Sí
+        │
+        ▼
+¿Tiene AllowAnonymous?
+        │
+        ├── Sí ───────────────► no agregar Bearer
+        │
+        ▼
+       No
+        │
+        ▼
+Agregar Security Requirement
+```
+
+---
+
+## Paso 6: Agregar el Security Requirement
+
+Para las operaciones protegidas:
+
+```csharp
+operation.Security ??= [];
+```
+
+Y después:
+
+```csharp
+operation.Security.Add(
+    new OpenApiSecurityRequirement
+    {
+        [new OpenApiSecuritySchemeReference(
+            "Bearer",
+            context.Document)] = []
+    });
+```
+
+Lo importante aquí es:
+
+```csharp
+new OpenApiSecuritySchemeReference(
+    "Bearer",
+    context.Document)
+```
+
+No estamos creando otro esquema Bearer.
+
+Estamos creando una **referencia** al esquema ya declarado en:
+
+```text
+components.securitySchemes.Bearer
+```
+
+Conceptualmente:
+
+```yaml
+security:
+  - Bearer: []
+```
+
+El flujo completo es:
+
+```text
+operation.security
+      │
+      ▼
+Bearer
+      │
+      ▼
+#/components/securitySchemes/Bearer
+```
+
+---
+
+## Paso 7: Registrar ambos Transformers
+
+Ahora registra los transformers al configurar OpenAPI:
+
+```csharp
+public static IServiceCollection AddOpenApiDocumentation(
+    this IServiceCollection services)
+{
+    services.AddOpenApi(options =>
+    {
+        options.AddDocumentTransformer<
+            BearerSecuritySchemeTransformer>();
+
+        options.AddOperationTransformer<
+            BearerSecurityRequirementTransformer>();
+    });
+
+    return services;
+}
+```
+
+La diferencia es intencional:
+
+```csharp
+AddDocumentTransformer<
+    BearerSecuritySchemeTransformer>();
+```
+
+modifica el documento completo.
+
+Mientras:
+
+```csharp
+AddOperationTransformer<
+    BearerSecurityRequirementTransformer>();
+```
+
+se ejecuta para operaciones individuales.
+
+---
+
+## Document Transformer vs Operation Transformer
+
+Usa esta regla mental:
+
+| Transformer                    | Usarlo cuando...                          | Ejemplo                                                |
+| ------------------------------ | ----------------------------------------- | ------------------------------------------------------ |
+| `IOpenApiDocumentTransformer`  | El cambio pertenece al documento completo | Registrar `components.securitySchemes.Bearer`          |
+| `IOpenApiOperationTransformer` | El cambio depende de un endpoint concreto | Agregar `security: Bearer` solo a endpoints protegidos |
+
+En este caso necesitamos ambos porque estamos resolviendo dos responsabilidades diferentes.
+
+---
+
+## Paso 8: Proteger los endpoints normalmente
+
+Los transformers no sustituyen la configuración runtime.
+
+Tus endpoints siguen usando:
+
+```csharp
+var exercises = api
+    .MapGroup("/exercises")
+    .WithTags("Exercises")
+    .RequireAuthorization();
+```
+
+Por ejemplo:
+
+```csharp
+exercises.MapGet("/", ListExercisesAsync);
+
+exercises.MapPost("/", CreateExerciseAsync);
+
+exercises.MapDelete(
+    "/{id:guid}",
+    DeleteExerciseAsync);
+```
+
+El `Operation Transformer` observa esa metadata y genera el OpenAPI correspondiente.
+
+Esto evita duplicar información:
+
+```text
+MAL
+────────────────────────
+
+RequireAuthorization()
+
++
+
+configuración manual:
+"GET /api/exercises usa Bearer"
+"POST /api/exercises usa Bearer"
+"DELETE /api/exercises usa Bearer"
+
+
+BIEN
+────────────────────────
+
+RequireAuthorization()
+        │
+        ▼
+Endpoint metadata
+        │
+        ▼
+Operation Transformer
+        │
+        ▼
+OpenAPI
+```
+
+Así `RequireAuthorization()` sigue siendo la fuente de verdad.
+
+---
+
+## Paso 9: Entender la responsabilidad de Scalar
+
+Scalar no reemplaza OpenAPI.
+
+Scalar consume el documento generado por ASP.NET Core y construye una interfaz alrededor de ese contrato.
+
+Por eso el flujo real es:
+
+```text
+ASP.NET Core endpoints
+        │
+        ▼
+Microsoft.AspNetCore.OpenApi
+        │
+        ├── Document Transformer
+        │
+        └── Operation Transformer
+        ▼
+openapi.json
+        │
+        ▼
+Scalar
+```
+
+Si OpenAPI solo contiene:
+
+```yaml
+components:
+  securitySchemes:
+    Bearer:
+```
+
+Scalar conoce el esquema.
+
+Pero una operación como:
+
+```yaml
+/api/exercises:
+  get:
+```
+
+todavía no declara que lo necesita.
+
+Al agregar:
+
+```yaml
+security:
+  - Bearer: []
+```
+
+la relación queda completa.
+
+---
+
+## Paso 10: Verificar el documento generado
+
+Levanta la aplicación:
+
+```bash
+dotnet run
+```
+
+Abre el documento OpenAPI generado.
+
+Busca:
+
+```json
+"securitySchemes"
+```
+
+Deberías encontrar algo conceptualmente similar a:
+
+```json
+{
+  "components": {
+    "securitySchemes": {
+      "Bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "in": "header"
+      }
+    }
+  }
+}
+```
+
+Después busca una operación protegida:
+
+```json
+"/api/exercises": {
+  "get": {
+    "security": [
+      {
+        "Bearer": []
+      }
+    ]
+  }
+}
+```
+
+---
+
+## Paso 11: Verificar endpoints públicos
+
+También revisa endpoints públicos.
+
+Por ejemplo:
+
+```text
+POST /api/auth/login
+```
+
+No debería tener:
+
+```json
+"security": [
+  {
+    "Bearer": []
+  }
+]
+```
+
+Mientras:
+
+```text
+GET /api/exercises
+```
+
+sí debería tenerlo.
+
+La verificación mínima es:
+
+```text
+/api/auth/login
+    └── sin Bearer
+
+/api/auth/register
+    └── sin Bearer
+
+/api/health
+    └── sin Bearer
+
+/api/exercises
+    └── Bearer
+
+/api/exercises/{id}
+    └── Bearer
+```
+
+---
+
+## Paso 12: Verificar Scalar
+
+Abre Scalar.
+
+Los endpoints protegidos deberían aparecer asociados al esquema Bearer.
+
+Ingresa un access token válido y prueba:
+
+```text
+GET /api/exercises
+```
+
+La request enviada debe contener:
+
+```http
+Authorization: Bearer eyJ...
+```
+
+Después prueba un endpoint público para confirmar que sigue funcionando sin token.
+
+---
+
+## Ejemplo completo de arquitectura
+
+Una estructura simple puede quedar así:
+
+```text
+Api/
+├── Endpoints/
+│   ├── Identity/
+│   │   └── AuthEndpoints.cs
+│   └── Gym/
+│       └── ExerciseEndpoints.cs
+│
+├── Extensions/
+│   └── OpenApiExtensions.cs
+│
+└── OpenApi/
+    ├── BearerSecuritySchemeTransformer.cs
+    └── BearerSecurityRequirementTransformer.cs
+```
+
+Responsabilidades:
+
+```text
+BearerSecuritySchemeTransformer
+│
+└── Documento completo
+    └── components.securitySchemes.Bearer
+
+
+BearerSecurityRequirementTransformer
+│
+└── Cada operación
+    └── operation.security
+
+
+ExerciseEndpoints
+│
+└── RequireAuthorization()
+    └── Fuente real de metadata
+
+
+Scalar
+│
+└── Solo visualiza el contrato OpenAPI resultante
+```
+
+---
+
+## Por qué no aplicar Bearer globalmente
+
+Una alternativa sería recorrer todas las operaciones:
+
+```csharp
+foreach (var operation in document.Paths...)
+{
+    operation.Security.Add(...);
+}
+```
+
+Esto puede servir si **absolutamente toda la API** requiere autenticación.
+
+Pero en una API típica existen endpoints públicos:
+
+```text
+POST /auth/login
+POST /auth/register
+POST /auth/refresh
+GET  /health
+```
+
+Si aplicamos Bearer globalmente, OpenAPI termina diciendo:
+
+```text
+/login requiere token
+```
+
+aunque precisamente el login existe para obtener ese token.
+
+Por eso, cuando la autorización depende del endpoint, es preferible usar:
+
+```text
+IOpenApiOperationTransformer
+```
+
+e inspeccionar su metadata.
+
+---
+
+## `RequireAuthorization()` no es documentación OpenAPI
+
+Recordá esta separación:
+
+```csharp
+.RequireAuthorization()
+```
+
+pertenece principalmente al comportamiento runtime de ASP.NET Core.
+
+Mientras:
+
+```csharp
+operation.Security.Add(...)
+```
+
+pertenece al contrato OpenAPI.
+
+El transformer conecta ambas capas:
+
+```text
+RequireAuthorization()
+        │
+        ▼
+IAuthorizeData
+        │
+        ▼
+Operation Transformer
+        │
+        ▼
+OpenAPI security requirement
+```
+
+De esta manera no tenemos dos configuraciones independientes.
+
+---
+
+## No usar `WithOpenApi()` en .NET 10
+
+En versiones anteriores era frecuente encontrar:
+
+```csharp
+app.MapGet(...)
+    .WithOpenApi();
+```
+
+o:
+
+```csharp
+.WithOpenApi(operation =>
+{
+    // modificar operación
+});
+```
+
+En .NET 10 `WithOpenApi()` está deprecado.
+
+Para personalizaciones del documento integrado de OpenAPI, utiliza Transformers:
+
+```text
+IOpenApiDocumentTransformer
+IOpenApiOperationTransformer
+```
+
+o transformers registrados directamente sobre un endpoint cuando el cambio sea específico de esa operación.
+
+> ⚠️ **Truco que siempre olvido:**  
+> `WithSummary`, `WithDescription`, `WithName`, `Produces`, etc. siguen siendo metadata válida para los endpoints. Lo que está deprecado es específicamente `WithOpenApi()`.
+
+---
+
+## No guardar JWT reales en el repositorio
+
+Al crear archivos `.http`, evita:
+
+```http
+@accessToken = eyJhbGciOiJIUzI1Ni...
+```
+
+Incluso si:
+
+- es desarrollo;
+- el token expira pronto;
+- la base de datos es local.
+
+En su lugar:
+
+```http
+@accessToken = PASTE_ACCESS_TOKEN_HERE
+```
+
+Y:
+
+```http
+GET {{host}}/api/exercises
+Authorization: Bearer {{accessToken}}
+```
+
+Un token es una credencial y no debe formar parte del historial Git.
+
+---
+
+## Errores comunes
+
+| Error                                                                    | Causa                                                          | Solución                                                                  |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Scalar conoce Bearer pero los endpoints no aparecen protegidos           | Solo se registró el `SecurityScheme`                           | Agregar `SecurityRequirement` mediante un Operation Transformer           |
+| Login aparece como protegido                                             | Se aplicó Bearer globalmente a todas las operaciones           | Inspeccionar metadata y aplicarlo únicamente a endpoints con autorización |
+| Un endpoint con `AllowAnonymous()` sigue apareciendo protegido           | Solo se comprobó `IAuthorizeData`                              | Comprobar también `IAllowAnonymous`                                       |
+| Scalar no muestra Bearer                                                 | No existe `components.securitySchemes.Bearer`                  | Registrar un Document Transformer                                         |
+| OpenAPI dice que existe Bearer aunque Authentication no está configurado | El esquema se agregó incondicionalmente                        | Consultar `IAuthenticationSchemeProvider`                                 |
+| Se duplica la definición de Bearer                                       | Se crea un esquema nuevo en cada operación                     | Usar `OpenApiSecuritySchemeReference`                                     |
+| Runtime devuelve `401` pero OpenAPI dice que el endpoint es público      | La API está protegida pero falta el Operation Transformer      | Traducir metadata de autorización a `operation.Security`                  |
+| El endpoint aparece protegido en OpenAPI pero realmente es público       | OpenAPI y runtime fueron configurados manualmente por separado | Usar metadata real de ASP.NET Core como fuente de verdad                  |
+| Warning `ASPDEPR002`                                                     | Se está usando `.WithOpenApi()` en .NET 10                     | Eliminarlo y utilizar OpenAPI Transformers                                |
+| Un JWT aparece en Git                                                    | Se hardcodeó en `.http`                                        | Usar placeholders o configuración local                                   |
+
+---
+
+## Regla mental para recordar
+
+Si en seis meses solo recordás una cosa, que sea esta:
+
+```text
+DOCUMENT TRANSFORMER
+"¿Qué mecanismos conoce mi API?"
+
+Bearer
+OAuth
+API Key
+...
+
+
+OPERATION TRANSFORMER
+"¿Cuál de esos mecanismos necesita ESTE endpoint?"
+```
+
+Para JWT:
+
+```text
+Document
+└── components
+    └── securitySchemes
+        └── Bearer
+
+
+Operation
+└── security
+    └── Bearer
+```
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Policies específicas de autorización y cómo representarlas en OpenAPI.
+- [ ] Roles y scopes.
+- [ ] OAuth2/OpenID Connect en lugar de introducir JWT manualmente en Scalar.
+- [ ] Múltiples authentication schemes.
+- [ ] Generación de OpenAPI durante build.
+- [ ] Separar documentos OpenAPI públicos e internos si la API crece.
+- [ ] Tests automáticos sobre metadata OpenAPI.
+- [ ] Cómo se comporta `AllowAnonymous()` combinado con route groups protegidos.
+
+---
+
+## Checklist rápido de reentrada
+
+Cuando necesites volver a configurar Bearer en OpenAPI:
+
+```text
+[ ] AddAuthentication().AddJwtBearer()
+[ ] AddAuthorization()
+[ ] UseAuthentication()
+[ ] UseAuthorization()
+[ ] RequireAuthorization() en endpoints privados
+
+[ ] BearerSecuritySchemeTransformer
+    └── components.securitySchemes.Bearer
+
+[ ] BearerSecurityRequirementTransformer
+    └── detectar IAuthorizeData
+    └── respetar IAllowAnonymous
+    └── operation.Security
+
+[ ] Registrar ambos transformers en AddOpenApi()
+
+[ ] Revisar openapi.json
+[ ] Revisar Scalar
+[ ] Probar endpoint público
+[ ] Probar endpoint protegido
+[ ] No versionar JWT reales
+```
+
+---
+
+## Caso real: Ceres
+
+En Ceres este patrón se introdujo al implementar el CRUD autenticado de `Exercise` en **MID-82 / PR #51**.
+
+Los endpoints se protegen en el route group:
+
+```csharp
+var exercises = api
+    .MapGroup("/exercises")
+    .WithTags("Exercises")
+    .RequireAuthorization();
+```
+
+OpenAPI registra el mecanismo mediante:
+
+```text
+BearerSecuritySchemeTransformer
+```
+
+y detecta las operaciones protegidas mediante:
+
+```text
+BearerSecurityRequirementTransformer
+```
+
+El resultado es que la configuración runtime y la documentación parten de la misma fuente:
+
+```text
+ExerciseEndpoints
+     │
+     └── RequireAuthorization()
+              │
+              ▼
+        Endpoint Metadata
+              │
+              ▼
+BearerSecurityRequirementTransformer
+              │
+              ▼
+          OpenAPI
+              │
+              ▼
+            Scalar
+```
+
+Esto evita mantener manualmente una lista paralela de endpoints privados y mantiene alineados el comportamiento real de la API y su contrato público.
+
+---
+
+## Links útiles
+
+- Microsoft Learn — Customize OpenAPI documents in ASP.NET Core
+- Microsoft Learn — Generate OpenAPI documents with ASP.NET Core
+- Microsoft Learn — Authentication and authorization in Minimal APIs
+- Microsoft Learn — Deprecation of `WithOpenApi` in .NET 10
+- Ceres — PR #51: Add Exercise CRUD Minimal API endpoints
