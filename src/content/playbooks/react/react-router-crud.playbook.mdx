@@ -1,0 +1,1383 @@
+---
+title: "CRUD con React Router: loaders, actions y flujo de datos"
+description: "Playbook para leer, crear, editar y eliminar datos con React Router sin duplicar estado ni depender de useEffect para lecturas de página"
+goal: "Entender y reutilizar un flujo CRUD donde las rutas coordinan lecturas, mutaciones, navegación, revalidación, loading y errores"
+tech: ["react", "typescript", "react-router"]
+tags: ["react-router", "loader", "action", "crud", "data-router", "use-fetcher"]
+level: "medio"
+status: "active"
+prerequisites:
+  - "Conocer componentes, props y estado local en React"
+  - "Usar createBrowserRouter / Data Mode de React Router"
+  - "Tener una capa de servicios que encapsule las llamadas HTTP"
+  - "Entender Promises y async/await en JavaScript"
+estimatedTime: "30 min"
+updatedAt: 2026-10-16
+createdAt: 2026-10-16
+summary: "Modelo reusable para decidir cuándo usar loader, action, Form/useFetcher, navegación y revalidación en un CRUD"
+related:
+  - "Ceres — Exercise CRUD (MID-89 / MID-90)"
+---
+
+## Contexto
+
+> **¿Cuándo usar este playbook?**  
+> Cuando una ruta de React necesita mostrar datos del backend y además permite crear, editar o eliminar esos datos.
+
+El problema no es únicamente “hacer un GET, POST, PUT y DELETE”.
+
+El problema real es decidir **quién es responsable de cada parte del flujo**:
+
+- quién carga los datos;
+- cuándo comienza la carga;
+- qué ocurre si el usuario abandona la navegación;
+- quién ejecuta una mutación;
+- cómo se actualiza la pantalla después de guardar o eliminar;
+- dónde viven los estados de loading/error;
+- cómo evitar tener una segunda copia de los datos del servidor dentro de React.
+
+La idea base de este playbook es:
+
+```text
+Ruta
+ ↓
+loader / action
+ ↓
+feature service
+ ↓
+apiClient
+ ↓
+API
+```
+
+Y en sentido contrario:
+
+```text
+API
+ ↓
+loader data / action result
+ ↓
+React Router
+ ↓
+componente
+```
+
+### Qué vas a poder hacer al terminar
+
+- ✅ Leer una colección mediante `loader`
+- ✅ Leer un recurso por ID mediante `loader`
+- ✅ Mostrar skeletons mientras una lectura se resuelve
+- ✅ Crear un recurso y volver al listado
+- ✅ Editar un recurso cargando primero sus datos
+- ✅ Eliminar sin abandonar la página mediante `action` + `useFetcher`
+- ✅ Entender cuándo React Router revalida los loaders
+- ✅ Separar estado del servidor de estado puramente visual
+- ✅ Evitar lecturas de página con `useEffect`
+
+---
+
+## El modelo mental
+
+Antes del código, recordá esta tabla:
+
+| Necesidad                                            | Herramienta principal                          | Por qué                                                |
+| ---------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------ |
+| La ruta necesita datos para renderizar               | `loader`                                       | La lectura pertenece al ciclo de navegación            |
+| El componente necesita consumir los datos de su ruta | `useLoaderData`                                | Lee el resultado administrado por React Router         |
+| Hay una Promise visible para el usuario              | `Suspense` + `Await`                           | Permite mostrar un fallback representativo             |
+| El usuario modifica datos del servidor               | `action`                                       | La mutación queda asociada a una ruta                  |
+| La mutación debe ocurrir sin navegar                 | `useFetcher`                                   | Ejecuta loaders/actions conservando la pantalla actual |
+| La mutación debe llevar a otra página                | `<Form>` / `useSubmit` o mutación + `navigate` | La navegación forma parte del resultado                |
+| Se necesita repetir manualmente una lectura          | `useRevalidator`                               | Pide al router volver a ejecutar loaders activos       |
+| Solo cambia un detalle visual temporal               | `useState`                                     | No es estado del servidor                              |
+
+La separación más importante es esta:
+
+```text
+DATOS DEL SERVIDOR
+→ loader / action / service / API
+
+ESTADO VISUAL TEMPORAL
+→ useState / isSubmitting / fetcher.state / navigation.state
+```
+
+No copies datos del loader a `useState` solo para “tenerlos disponibles”.
+
+---
+
+## Regla principal: loader para lecturas de página
+
+Si una página necesita datos del backend para existir, esa lectura pertenece a la ruta.
+
+Por ejemplo:
+
+```text
+/gym/exercises
+```
+
+necesita el catálogo de ejercicios.
+
+En lugar de:
+
+```tsx
+function ExercisesPage() {
+  useEffect(() => {
+    fetchExercises();
+  }, []);
+}
+```
+
+usamos:
+
+```text
+router
+ ↓
+exercisesLoader
+ ↓
+listExercises
+ ↓
+apiClient
+ ↓
+GET /exercises
+```
+
+### Loader de listado
+
+```ts
+import type { LoaderFunctionArgs } from "react-router";
+import { listExercises } from "../services/exerciseService";
+
+export function exercisesLoader({ request }: LoaderFunctionArgs) {
+  return {
+    exercises: listExercises(request.signal),
+  };
+}
+```
+
+### Por qué
+
+El loader sabe que la lectura existe **porque la ruta fue solicitada**.
+
+Eso permite que React Router coordine:
+
+- navegación;
+- cancelación;
+- revalidación;
+- errores de ruta;
+- pending UI;
+- dependencia entre URL y datos.
+
+El componente deja de decidir _cuándo hacer el GET_.
+
+Su responsabilidad pasa a ser solamente **renderizar el resultado**.
+
+---
+
+## Propagar `request.signal`
+
+El `request` entregado al loader contiene un `AbortSignal`.
+
+```ts
+listExercises(request.signal);
+```
+
+Ese signal debe viajar hasta la petición HTTP:
+
+```ts
+export async function listExercises(
+  signal?: AbortSignal,
+): Promise<ExerciseResponse[]> {
+  const response = await apiClient.get<ExerciseResponse[]>("/exercises", {
+    signal,
+  });
+
+  return response.data;
+}
+```
+
+### ¿Por qué?
+
+Imaginá:
+
+```text
+Usuario entra a /exercises
+ ↓
+empieza GET /exercises
+ ↓
+antes de terminar navega a /routines
+```
+
+La respuesta de `/exercises` ya no es necesaria.
+
+Con el signal:
+
+```text
+navegación abandonada
+ ↓
+React Router aborta request.signal
+ ↓
+Axios cancela la petición
+```
+
+La cancelación forma parte del ciclo de vida de la ruta.
+
+---
+
+## Mostrar datos: `useLoaderData`
+
+El componente consume lo que produjo su loader:
+
+```tsx
+const { exercises } = useLoaderData<typeof exercisesLoader>();
+```
+
+No vuelve a llamar el servicio.
+
+No necesita:
+
+```tsx
+useEffect(...)
+```
+
+ni:
+
+```tsx
+const [exercises, setExercises] = useState(...)
+```
+
+para guardar una segunda copia.
+
+---
+
+## Loading visible: `Suspense` + `Await`
+
+Si el loader devuelve una Promise:
+
+```ts
+return {
+  exercises: listExercises(request.signal),
+};
+```
+
+la página puede mostrar un skeleton mientras se resuelve:
+
+```tsx
+export function ExercisesPage() {
+  const { exercises } = useLoaderData<typeof exercisesLoader>();
+
+  return (
+    <Suspense fallback={<ExercisesSkeleton />}>
+      <Await resolve={exercises}>
+        {(resolvedExercises) => <ExerciseList exercises={resolvedExercises} />}
+      </Await>
+    </Suspense>
+  );
+}
+```
+
+### Flujo
+
+```text
+Usuario navega
+ ↓
+loader crea Promise
+ ↓
+ruta comienza a renderizar
+ ↓
+Suspense muestra skeleton
+ ↓
+Promise termina
+ ↓
+Await entrega datos
+ ↓
+se renderiza el contenido
+```
+
+### Regla
+
+El skeleton debe representar la forma aproximada del contenido real.
+
+No uses un spinner global para todo si la página puede mostrar un skeleton específico.
+
+---
+
+# CRUD completo
+
+Ahora aplicamos el mismo modelo a cada operación.
+
+---
+
+## READ 1: ver un listado
+
+### Ruta
+
+```tsx
+{
+  path: "gym/exercises",
+  loader: exercisesLoader,
+  Component: ExercisesPage,
+}
+```
+
+### Flujo
+
+```text
+GET /gym/exercises
+ ↓
+loader
+ ↓
+listExercises(signal)
+ ↓
+GET /api/exercises
+ ↓
+Suspense / Await
+ ↓
+lista
+```
+
+### Responsabilidades
+
+**Loader**
+
+- iniciar la lectura;
+- propagar `request.signal`.
+
+**Service**
+
+- conocer el endpoint;
+- usar `apiClient`;
+- traducir errores HTTP a errores de la aplicación si corresponde.
+
+**Page**
+
+- renderizar loading;
+- renderizar error;
+- renderizar empty;
+- renderizar success.
+
+---
+
+## READ 2: ver un recurso por ID
+
+Editar normalmente necesita primero conocer el recurso actual.
+
+Ruta:
+
+```text
+/gym/exercises/:exerciseId/edit
+```
+
+Loader:
+
+```ts
+import type { LoaderFunctionArgs } from "react-router";
+import { getExercise } from "../services/exerciseService";
+
+export function exerciseLoader({ params, request }: LoaderFunctionArgs) {
+  const exerciseId = params.exerciseId;
+
+  if (!exerciseId) {
+    throw new Response("Exercise id is required.", { status: 400 });
+  }
+
+  return {
+    exercise: getExercise(exerciseId, request.signal),
+  };
+}
+```
+
+### Acá aparecen dos fuentes de datos propias de la ruta
+
+```text
+params
+→ qué recurso se pidió
+
+request.signal
+→ ciclo de vida de esta navegación
+```
+
+El componente no debería volver a leer el ID desde la URL para repetir el fetch.
+
+---
+
+# CREATE: crear datos
+
+Crear tiene una diferencia importante con editar:
+
+```text
+/gym/exercises/new
+```
+
+no necesita leer un Exercise existente.
+
+Por eso la ruta puede no necesitar loader:
+
+```tsx
+{
+  path: "gym/exercises/new",
+  Component: CreateExercisePage,
+}
+```
+
+El formulario comienza vacío.
+
+```tsx
+export function CreateExercisePage() {
+  const navigate = useNavigate();
+
+  async function handleCreate(values: ExerciseFormValues) {
+    await createExercise(values);
+
+    navigate("/gym/exercises");
+  }
+
+  return <ExerciseForm submitLabel="Crear ejercicio" onSubmit={handleCreate} />;
+}
+```
+
+### Flujo
+
+```text
+Formulario vacío
+ ↓
+usuario escribe
+ ↓
+validación cliente
+ ↓
+createExercise(values)
+ ↓
+POST /api/exercises
+ ↓
+éxito
+ ↓
+navigate("/gym/exercises")
+ ↓
+entra a ruta de listado
+ ↓
+exercisesLoader
+ ↓
+GET actualizado
+```
+
+### ¿Por qué no agregamos manualmente el nuevo objeto al array?
+
+Porque el servidor es la fuente de verdad.
+
+En lugar de:
+
+```text
+POST
+ ↓
+setExercises([...exercises, created])
+```
+
+hacemos:
+
+```text
+POST
+ ↓
+navegación
+ ↓
+loader vuelve a consultar al servidor
+```
+
+Esto evita mantener dos fuentes de verdad.
+
+---
+
+## ¿Create también podría usar una `action`?
+
+Sí.
+
+Una ruta puede tener una `action` y recibir el formulario mediante `<Form>` o `useSubmit`.
+
+Usá una `action` cuando quieras que React Router sea el dueño explícito de la mutación y de su ciclo de navegación/revalidación.
+
+El patrón usado en Ceres para create/edit mantiene actualmente la llamada al feature service dentro de la página y navega después del éxito. Es una solución simple y válida porque:
+
+1. la mutación sigue encapsulada en el service;
+2. no existe estado global duplicado;
+3. al navegar al listado, el loader vuelve a leer la fuente de verdad.
+
+No conviertas automáticamente toda función `POST` en una action solo por existir.
+
+Preguntate primero:
+
+> **¿Esta mutación forma parte del flujo de la ruta y me beneficia que React Router coordine su submission/revalidación?**
+
+---
+
+# EDIT: leer primero, mutar después
+
+Editar combina lectura y mutación.
+
+```text
+GET recurso actual
++
+PUT con cambios
+```
+
+### Configuración de la ruta
+
+```tsx
+{
+  path: "gym/exercises/:exerciseId/edit",
+  loader: exerciseLoader,
+  Component: EditExercisePage,
+  ErrorBoundary: ExerciseErrorBoundary,
+}
+```
+
+### Página
+
+```tsx
+export function EditExercisePage() {
+  const { exercise } = useLoaderData<typeof exerciseLoader>();
+
+  return (
+    <Suspense fallback={<ExerciseFormSkeleton />}>
+      <Await resolve={exercise} errorElement={<ExerciseLoadError />}>
+        {(resolvedExercise) => (
+          <EditExerciseContent exercise={resolvedExercise} />
+        )}
+      </Await>
+    </Suspense>
+  );
+}
+```
+
+Cuando los datos existen:
+
+```tsx
+function EditExerciseContent({ exercise }: { exercise: ExerciseResponse }) {
+  const navigate = useNavigate();
+
+  async function handleUpdate(values: ExerciseFormValues) {
+    await updateExercise(exercise.id, values);
+
+    navigate("/gym/exercises");
+  }
+
+  return (
+    <ExerciseForm
+      defaultValues={{
+        name: exercise.name,
+        muscleGroup: exercise.muscleGroup,
+      }}
+      submitLabel="Guardar cambios"
+      onSubmit={handleUpdate}
+    />
+  );
+}
+```
+
+### Flujo completo
+
+```text
+Link "Editar"
+ ↓
+/exercises/:id/edit
+ ↓
+exerciseLoader
+ ↓
+getExercise(id, signal)
+ ↓
+GET /api/exercises/:id
+ ↓
+skeleton
+ ↓
+datos resueltos
+ ↓
+ExerciseForm(defaultValues)
+ ↓
+usuario modifica
+ ↓
+updateExercise(id, values)
+ ↓
+PUT /api/exercises/:id
+ ↓
+navigate("/gym/exercises")
+ ↓
+loader del catálogo
+ ↓
+lista actualizada
+```
+
+### Regla importante
+
+No hagas esto:
+
+```tsx
+useEffect(() => {
+  getExercise(id).then(setExercise);
+}, [id]);
+```
+
+La página de edición existe para un recurso identificado por la URL.
+
+Por lo tanto, esa lectura pertenece a la ruta.
+
+---
+
+# DELETE: `action` + `useFetcher`
+
+Eliminar desde una tarjeta del listado es diferente.
+
+Queremos:
+
+```text
+eliminar
++
+quedarnos en el listado
++
+refrescar los datos
+```
+
+No queremos una nueva página.
+
+Ese es un caso natural para:
+
+```text
+action
++
+useFetcher
+```
+
+---
+
+## 1. Action de eliminación
+
+La ruta del catálogo puede definir:
+
+```tsx
+{
+  path: "gym/exercises",
+  loader: exercisesLoader,
+  action: deleteExerciseAction,
+  Component: ExercisesPage,
+}
+```
+
+La action recibe la intención HTTP:
+
+```ts
+export async function deleteExerciseAction({ request }: ActionFunctionArgs) {
+  if (request.method !== "DELETE") {
+    return data({ ok: false, error: "Método no permitido." }, { status: 405 });
+  }
+
+  const formData = await request.formData();
+  const exerciseId = formData.get("exerciseId");
+
+  if (typeof exerciseId !== "string") {
+    return data(
+      {
+        ok: false,
+        error: "Exercise id requerido.",
+      },
+      { status: 400 },
+    );
+  }
+
+  await deleteExercise(exerciseId);
+
+  return {
+    ok: true,
+    exerciseId,
+  };
+}
+```
+
+### Responsabilidad de la action
+
+La action traduce:
+
+```text
+request del router
+ ↓
+intención de mutación
+ ↓
+datos necesarios
+ ↓
+feature service
+```
+
+No debería contener detalles de presentación del componente.
+
+---
+
+## 2. Ejecutarla con `useFetcher`
+
+```tsx
+function ExerciseCard({ exercise }: ExerciseCardProps) {
+  const fetcher = useFetcher<DeleteExerciseActionData>();
+
+  const isDeleting = fetcher.state !== "idle";
+
+  return (
+    <fetcher.Form method="delete" action="/gym/exercises">
+      <input type="hidden" name="exerciseId" value={exercise.id} />
+
+      <button type="submit" disabled={isDeleting}>
+        {isDeleting ? "Eliminando..." : "Eliminar"}
+      </button>
+    </fetcher.Form>
+  );
+}
+```
+
+### ¿Por qué `useFetcher`?
+
+Porque queremos ejecutar una interacción con la ruta **sin navegar**.
+
+```text
+ExerciseCard
+ ↓
+fetcher.Form
+ ↓
+DELETE /gym/exercises   ← request del router
+ ↓
+deleteExerciseAction
+ ↓
+deleteExercise
+ ↓
+DELETE /api/exercises/:id
+ ↓
+action termina
+ ↓
+React Router revalida loaders activos
+ ↓
+exercisesLoader
+ ↓
+GET /api/exercises
+ ↓
+lista actualizada
+```
+
+La URL nunca cambió.
+
+---
+
+## Revalidación: la pieza que conecta mutation con read
+
+Una de las ideas más importantes de este modelo es:
+
+```text
+action modifica
+ ↓
+loader vuelve a leer
+```
+
+La action no tiene que reconstruir manualmente todo el estado de la página.
+
+Después de una submission exitosa, React Router puede revalidar los loaders activos para sincronizar la UI con el servidor.
+
+Por eso eliminar puede ser:
+
+```text
+DELETE
+ ↓
+action
+ ↓
+revalidation
+ ↓
+GET actualizado
+```
+
+en lugar de:
+
+```text
+DELETE
+ ↓
+setItems(items.filter(...))
+```
+
+La segunda opción puede funcionar, pero introduce una copia local que después tenés que mantener sincronizada.
+
+---
+
+# `Form` vs `useFetcher`
+
+Una regla práctica:
+
+## Usá `<Form>` cuando la submission forma parte de una navegación
+
+Ejemplos:
+
+```text
+crear recurso
+→ guardar
+→ ir al detalle
+
+login
+→ autenticar
+→ ir al dashboard
+```
+
+## Usá `useFetcher` cuando la interacción debe permanecer en la ruta actual
+
+Ejemplos:
+
+```text
+eliminar una tarjeta
+activar/desactivar
+marcar favorito
+cambiar estado
+actualizar una fila
+```
+
+Pensalo así:
+
+```text
+¿quiero que esta interacción cambie de página?
+
+sí
+→ Form / navigate
+
+no
+→ fetcher
+```
+
+---
+
+# `useRevalidator`: reintentar una lectura
+
+A veces un loader falla por red y queremos un botón:
+
+```text
+Reintentar
+```
+
+No llamamos manualmente al service desde el componente de error.
+
+Pedimos al router volver a ejecutar la lectura:
+
+```tsx
+const revalidator = useRevalidator();
+
+function handleRetry() {
+  void revalidator.revalidate();
+}
+```
+
+### Por qué
+
+Incorrecto:
+
+```text
+error
+ ↓
+componente llama getExercise()
+ ↓
+ahora existen dos caminos distintos para cargar
+```
+
+Correcto:
+
+```text
+error
+ ↓
+revalidate()
+ ↓
+mismo loader original
+ ↓
+mismo service
+ ↓
+misma política de carga
+```
+
+La ruta conserva un solo punto de entrada para sus lecturas.
+
+---
+
+# Errores: distinguir dónde ocurrieron
+
+## Error del loader
+
+Ejemplo:
+
+```text
+GET /exercise/:id
+→ 404
+```
+
+Es un error de lectura de la ruta.
+
+Puede manejarse con:
+
+- `Await.errorElement`;
+- `useAsyncError`;
+- `ErrorBoundary` de ruta.
+
+## Error de action
+
+Ejemplo:
+
+```text
+DELETE /exercise/:id
+→ 409 Conflict
+```
+
+Es el resultado de una mutación.
+
+Con `useFetcher` puede exponerse en:
+
+```tsx
+fetcher.data;
+```
+
+y mostrarse junto al elemento afectado.
+
+## Error del formulario
+
+Ejemplo:
+
+```text
+POST /exercise
+→ validación del servidor
+```
+
+Puede mostrarse dentro del formulario porque el usuario todavía está interactuando con él.
+
+---
+
+# Estado local: cuándo sí usarlo
+
+Evitar estado duplicado no significa evitar `useState`.
+
+Este uso es correcto:
+
+```tsx
+const [submitError, setSubmitError] = useState<string | null>(null);
+```
+
+porque representa UI temporal.
+
+También puede ser válido:
+
+```tsx
+const [retryingError, setRetryingError] = useState<unknown>(null);
+```
+
+si únicamente decide si mostrar un skeleton mientras el router revalida.
+
+Lo que queremos evitar es:
+
+```tsx
+const [exercise, setExercise] = useState(...);
+const [exercises, setExercises] = useState(...);
+```
+
+cuando esos datos ya pertenecen a loaders.
+
+---
+
+# Formulario reusable para Create y Edit
+
+Create y Edit normalmente comparten los mismos campos.
+
+No dupliques:
+
+```text
+CreateExerciseForm
+EditExerciseForm
+```
+
+si solo cambia:
+
+```text
+defaultValues
+submitLabel
+onSubmit
+```
+
+Ejemplo:
+
+```tsx
+interface ExerciseFormProps {
+  defaultValues?: ExerciseFormValues;
+  submitLabel: string;
+  onSubmit: (values: ExerciseFormValues) => Promise<void>;
+}
+```
+
+Create:
+
+```tsx
+<ExerciseForm submitLabel="Crear ejercicio" onSubmit={handleCreate} />
+```
+
+Edit:
+
+```tsx
+<ExerciseForm
+  defaultValues={{
+    name: exercise.name,
+    muscleGroup: exercise.muscleGroup,
+  }}
+  submitLabel="Guardar cambios"
+  onSubmit={handleUpdate}
+/>
+```
+
+El formulario conoce:
+
+```text
+campos
+validación
+isSubmitting
+errores de submit
+```
+
+La página conoce:
+
+```text
+qué operación ejecutar
+qué ID usar
+a dónde navegar
+```
+
+---
+
+# Arquitectura recomendada de la feature
+
+```text
+feature/
+├─ actions/
+│  └─ deleteItemAction.ts
+├─ components/
+│  ├─ ItemCard.tsx
+│  ├─ ItemForm.tsx
+│  ├─ ItemFormSkeleton.tsx
+│  └─ ItemLoadError.tsx
+├─ loaders/
+│  ├─ itemLoader.ts
+│  └─ itemsLoader.ts
+├─ pages/
+│  ├─ ItemsPage.tsx
+│  ├─ CreateItemPage.tsx
+│  └─ EditItemPage.tsx
+├─ schemas/
+│  └─ itemSchema.ts
+├─ services/
+│  └─ itemService.ts
+└─ types/
+   └─ item.ts
+```
+
+No crees carpetas adicionales si la feature todavía no las necesita.
+
+La estructura existe para expresar responsabilidades, no para alcanzar un número determinado de capas.
+
+---
+
+# Mapa CRUD resumido
+
+## Listar
+
+```text
+route
+ ↓
+loader
+ ↓
+listService(signal)
+ ↓
+GET
+ ↓
+Await
+ ↓
+UI
+```
+
+## Ver detalle
+
+```text
+route :id
+ ↓
+loader(params.id, signal)
+ ↓
+getService
+ ↓
+GET /:id
+ ↓
+UI
+```
+
+## Crear
+
+```text
+form
+ ↓
+validación
+ ↓
+createService
+ ↓
+POST
+ ↓
+navigate(list)
+ ↓
+list loader
+```
+
+También puede implementarse con route `action` si la ruta debe poseer la submission.
+
+## Editar
+
+```text
+edit route
+ ↓
+loader
+ ↓
+GET /:id
+ ↓
+form(defaultValues)
+ ↓
+updateService
+ ↓
+PUT /:id
+ ↓
+navigate(list)
+ ↓
+list loader
+```
+
+## Eliminar sin navegar
+
+```text
+fetcher.Form
+ ↓
+action
+ ↓
+deleteService
+ ↓
+DELETE /:id
+ ↓
+action success
+ ↓
+router revalidation
+ ↓
+list loader
+ ↓
+UI actualizada
+```
+
+---
+
+# Árbol de decisión
+
+Cuando tengas una nueva pantalla, preguntate en este orden:
+
+### 1. ¿La ruta necesita estos datos para renderizar?
+
+```text
+sí → loader
+no → seguí
+```
+
+### 2. ¿Es una mutación del servidor?
+
+```text
+sí → action o feature service desde el flujo de submit
+no → probablemente estado/UI local
+```
+
+### 3. ¿La mutación debe mantener al usuario en la misma ruta?
+
+```text
+sí → action + useFetcher
+no → Form/useSubmit o mutación + navigate
+```
+
+### 4. ¿Después de mutar necesito volver a consultar datos?
+
+```text
+action exitosa
+→ preferir revalidación del router
+
+navegación a otra ruta
+→ dejar que el loader de destino haga la lectura
+```
+
+### 5. ¿Estoy copiando datos del loader a estado local?
+
+```text
+sí
+→ detenerse y justificar por qué
+
+si es solo para "tenerlos":
+→ no hacerlo
+```
+
+---
+
+# Lo que NO debería hacer
+
+## ❌ Fetch inicial con `useEffect`
+
+```tsx
+useEffect(() => {
+  listItems().then(setItems);
+}, []);
+```
+
+si los datos pertenecen a la ruta.
+
+## ❌ Tener una segunda copia del catálogo
+
+```tsx
+const loaderItems = useLoaderData();
+const [items, setItems] = useState(loaderItems);
+```
+
+sin una necesidad real.
+
+## ❌ Después de Delete actualizar manualmente todo
+
+```tsx
+setItems(items.filter((item) => item.id !== id));
+```
+
+si una action + revalidación puede obtener el estado real del servidor.
+
+## ❌ Ignorar `request.signal`
+
+```ts
+export function loader() {
+  return getItem();
+}
+```
+
+cuando el service puede aceptar cancelación.
+
+## ❌ Hacer fetch de Edit dentro del formulario
+
+```tsx
+<ItemForm id={id} />
+```
+
+y que el formulario decida cargar su propio recurso.
+
+El formulario debería recibir los datos ya resueltos.
+
+## ❌ Poner reglas HTTP en componentes
+
+```tsx
+if (error.response.status === 409) ...
+```
+
+Preferí que la capa API/service produzca un error de aplicación entendible y que la action/página decida cómo presentarlo.
+
+---
+
+# Checklist para implementar otro CRUD
+
+## Lecturas
+
+- [ ] El listado tiene loader
+- [ ] El detalle/edit tiene loader si necesita datos existentes
+- [ ] `request.signal` llega hasta el cliente HTTP
+- [ ] La página consume datos mediante `useLoaderData`
+- [ ] No existe un `useEffect` duplicando la lectura
+- [ ] Hay loading representativo
+- [ ] Hay empty state cuando aplica
+- [ ] Hay manejo de error
+- [ ] Retry ejecuta el mismo loader mediante revalidación
+
+## Create
+
+- [ ] Formulario reusable
+- [ ] Validación cliente
+- [ ] Validación servidor sigue siendo autoridad
+- [ ] Doble submit bloqueado
+- [ ] Después de éxito se navega/revalida
+- [ ] No se agrega una copia global del recurso
+
+## Edit
+
+- [ ] ID viene de params de ruta
+- [ ] Datos iniciales vienen del loader
+- [ ] Form recibe `defaultValues`
+- [ ] PUT/PATCH vive en service
+- [ ] Después de éxito se navega/revalida
+- [ ] 404 está manejado
+
+## Delete
+
+- [ ] Confirmación explícita si la operación es destructiva
+- [ ] Action asociada a la ruta responsable
+- [ ] `useFetcher` si no debe existir navegación
+- [ ] Estado pending evita clicks duplicados
+- [ ] Error de conflicto se muestra cerca del recurso
+- [ ] Éxito produce revalidación del loader
+
+---
+
+# Cómo pensar el flujo en seis meses
+
+Si olvidaste todo, recordá solamente esto:
+
+```text
+loader = leer para una ruta
+
+action = cambiar datos desde una ruta
+
+useLoaderData = consumir la lectura
+
+useFetcher = hablar con loader/action sin navegar
+
+revalidation = volver a preguntar al servidor después de cambiar algo
+
+useState = UI temporal, no copia automática de datos del servidor
+```
+
+Y para un CRUD:
+
+```text
+VER
+route → loader → service → API → UI
+
+CREAR
+form → service/action → API → navigate/revalidate → loader
+
+EDITAR
+loader → form → service/action → API → navigate/revalidate
+
+ELIMINAR
+fetcher → action → service → API → revalidate → loader
+```
+
+---
+
+## Errores comunes
+
+| Problema                                           | Causa                                 | Solución                            |
+| -------------------------------------------------- | ------------------------------------- | ----------------------------------- |
+| La página hace el GET dos veces                    | Loader + `useEffect`                  | Dejar una sola lectura en el loader |
+| Datos viejos después de una mutación               | Se actualizó backend pero no la ruta  | Navegar o revalidar                 |
+| Delete cambia de página sin querer                 | Se usó submission con navegación      | Usar `useFetcher`                   |
+| Request viejo termina después de abandonar la ruta | No se propagó `request.signal`        | Pasar signal hasta Axios/fetch      |
+| Edit aparece vacío y luego “salta”                 | Fetch iniciado desde el componente    | Cargar desde loader + skeleton      |
+| Dos formularios casi iguales                       | Create/Edit duplicados                | Reutilizar un único formulario      |
+| UI y backend divergen                              | Array local actualizado manualmente   | Releer mediante loader              |
+| Reintento tiene lógica distinta a carga inicial    | Componente llama service directamente | `useRevalidator().revalidate()`     |
+
+---
+
+## Qué revisar la próxima vez
+
+- [ ] Cuándo conviene mover Create/Update a route actions
+- [ ] Diferencia práctica entre `<Form>`, `useSubmit` y `useFetcher`
+- [ ] `shouldRevalidate` y cuándo realmente hace falta optimizar
+- [ ] Manejo de optimistic UI con fetchers
+- [ ] Cómo funcionan loaders/actions anidados entre rutas padre e hijas
+- [ ] Cómo combinar middleware de autenticación con loaders protegidos
+
+---
+
+## Links útiles
+
+- [React Router — Data Loading](https://reactrouter.com/start/data/data-loading)
+- [React Router — Actions](https://reactrouter.com/start/data/actions)
+- [React Router — Using Fetchers](https://reactrouter.com/how-to/fetchers)
+- [React Router — Revalidation Optimization](https://reactrouter.com/how-to/optimize-revalidation)
+- [Ceres — PR #72: Exercise CRUD](https://github.com/yesiddn/ceres/pull/72)
